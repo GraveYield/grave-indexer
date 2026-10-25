@@ -19,7 +19,7 @@
   "scripts": {
     "build:sdk": "pnpm --filter @graveyield/sdk build",
     "build": "pnpm run build:sdk && tsc -p tsconfig.json",
-    "typecheck": "pnpm run build:sdk && tsc -p tsconfig.json --noEmit",
+    "typecheck": "pnpm run build:sdk && tsc -p tsconfig.typecheck.json --noEmit",
     "test": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec --test-name-pattern='.*' 'test/**/*.test.ts'",
     "test:offline": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec 'test/*.test.ts'",
     "smoke:devnet": "node --test --import tsx/esm --test-reporter=spec --test-name-pattern='devnet' 'test/devnetSmoke.test.ts'",

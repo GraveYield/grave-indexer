@@ -28,6 +28,7 @@ function makeRecord(seed: number, fingerprintSalt = 0): DiscoveredPoolRecord {
     },
     wsolSide: { memecoinMint: synth(0x13), coinIsWsol: false },
     raw: {
+      mode: "full",
       dataLen: data.length,
       fingerprint: accountFingerprint(poolAddress, data),
       owner: synth(0x99).toBase58(),

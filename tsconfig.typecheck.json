@@ -1,0 +1,9 @@
+{
+  "extends": "./vendor/protocol/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["src/**/*", "test/**/*"],
+  "exclude": ["node_modules", "dist", "vendor"]
+}

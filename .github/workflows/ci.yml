@@ -30,7 +30,7 @@ jobs:
       - name: Build vendored SDK (pinned protocol submodule)
         run: pnpm run build:sdk
       - name: Typecheck
-        run: pnpm exec tsc -p tsconfig.json --noEmit
+        run: pnpm exec tsc -p tsconfig.typecheck.json --noEmit
       - name: Offline test battery (unit + integration)
         run: pnpm run test:offline
 

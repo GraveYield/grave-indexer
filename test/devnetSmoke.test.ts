@@ -17,11 +17,13 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { Connection, PublicKey } from "@solana/web3.js";
 import {
-  DEVNET_SCANNER_PROGRAM_ID,
-  DEVNET_VAULT_PROGRAM_ID,
   fetchScannerProtocolConfig,
   scannerProtocolConfigPda,
 } from "@graveyield/sdk";
+// The SDK exports its default program ids as base58 STRINGS (client.ts);
+// the indexer's config module owns the PublicKey forms. Do not pass the
+// SDK string constants where PublicKey is required.
+import { DEVNET_SCANNER_PROGRAM_ID, DEVNET_VAULT_PROGRAM_ID } from "../src/config.js";
 import { runEvidencePathVerification } from "../src/evidencePath.js";
 
 const DEVNET_RPC = process.env.DEVNET_RPC_URL;

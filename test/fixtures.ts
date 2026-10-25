@@ -67,7 +67,13 @@ function buildAmmIdentity(opts?: {
   coinVault?: PublicKey;
   pcVault?: PublicKey;
   lpMint?: PublicKey;
-}): Record<string, Uint8Array> {
+}): {
+  coinVault: Uint8Array;
+  pcVault: Uint8Array;
+  baseMint: Uint8Array;
+  quoteMint: Uint8Array;
+  lpMint: Uint8Array;
+} {
   return {
     coinVault: (opts?.coinVault ?? synth(0x11)).toBytes(),
     pcVault: (opts?.pcVault ?? synth(0x12)).toBytes(),

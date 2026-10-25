@@ -15,7 +15,7 @@ import {
   type EvidenceBundle,
 } from "../src/evidence.js";
 import { signAttestationMessage } from "../src/sign.js";
-import { verifyEvidenceBundle, summarizeVerifyResult } from "../src/verify.js";
+import { verifyEvidenceBundle, summarizeVerifyResult, type VerificationCheckId } from "../src/verify.js";
 import { ReplayJournal } from "../src/journal.js";
 import { synth, testOracle } from "./fixtures.js";
 
@@ -116,7 +116,7 @@ describe("evidence verifier — acceptance", () => {
       "ATTESTATION_STALE",
       "ATTESTATION_SLOT_HASH",
       "ATTESTATION_REPLAY",
-    ]) {
+    ] as VerificationCheckId[]) {
       assert.ok(ids.includes(required), `missing check ${required}`);
     }
   });
