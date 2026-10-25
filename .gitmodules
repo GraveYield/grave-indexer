@@ -1,0 +1,3 @@
+[submodule "vendor/protocol"]
+	path = vendor/protocol
+	url = https://github.com/GraveYield/graveyield-protocol.git

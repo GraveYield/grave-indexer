@@ -1,0 +1,49 @@
+{
+  "name": "@graveyield/grave-indexer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Phase 2 — Raydium V4 pool discovery and evidence pipeline for GraveScanner: provenance-preserving discovery, duplicate/conflict/staleness handling, operational health, and oracle evidence-path verification against the on-chain GraveScanner attestation contract (ORACLE-002).",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GraveYield/grave-indexer.git"
+  },
+  "homepage": "https://***REMOVED***",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "bin": {
+    "grave-indexer": "./bin/grave-indexer.mjs"
+  },
+  "scripts": {
+    "build:sdk": "pnpm --filter @graveyield/sdk build",
+    "build": "pnpm run build:sdk && tsc -p tsconfig.json",
+    "typecheck": "pnpm run build:sdk && tsc -p tsconfig.json --noEmit",
+    "test": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec --test-name-pattern='.*' 'test/**/*.test.ts'",
+    "test:offline": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec 'test/*.test.ts'",
+    "smoke:devnet": "node --test --import tsx/esm --test-reporter=spec --test-name-pattern='devnet' 'test/devnetSmoke.test.ts'",
+    "collect": "tsx src/cli.ts collect",
+    "verify-path": "tsx src/cli.ts verify-path",
+    "cli": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@graveyield/sdk": "workspace:*",
+    "@solana/web3.js": "^3.1.1",
+    "@solana/spl-token": "^0.4.6",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@solana/web3.js": "3.1.1",
+      "@types/node": "^24.19.2",
+      "@types/bn.js": "^5.1.5"
+    }
+  }
+}
