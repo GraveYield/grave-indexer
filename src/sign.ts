@@ -24,6 +24,7 @@ import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
+import { LAUNCH_PRICE_MSG_LEN } from "@graveyield/sdk";
 
 import { parseOracleSeedFromEnv, parseOracleSeedFromFilePayload } from "./config.js";
 
@@ -106,6 +107,24 @@ export async function resolvePayerKeypair(opts?: {
 export function signAttestationMessage(signer: OracleSigner, message: Uint8Array): Uint8Array {
   if (message.length !== 112) {
     throw new Error(`attestation message must be exactly 112 bytes, got ${message.length}`);
+  }
+  return nacl.sign.detached(message, signer.keypair.secretKey);
+}
+
+/**
+ * Sign the canonical 168-byte C2 launch-price attestation message
+ * (`buildLaunchPriceMessage` output). Separate from the C1 signer so
+ * each function stays fail-closed on the exact wire format it serves:
+ * a C1 message handed here (or vice versa) throws instead of producing
+ * a signature the on-chain pinned-offset check would reject downstream.
+ * Length is imported from the SDK (`LAUNCH_PRICE_MSG_LEN`) so the two
+ * never drift.
+ */
+export function signLaunchPriceMessage(signer: OracleSigner, message: Uint8Array): Uint8Array {
+  if (message.length !== LAUNCH_PRICE_MSG_LEN) {
+    throw new Error(
+      `launch-price attestation message must be exactly ${LAUNCH_PRICE_MSG_LEN} bytes, got ${message.length}`,
+    );
   }
   return nacl.sign.detached(message, signer.keypair.secretKey);
 }

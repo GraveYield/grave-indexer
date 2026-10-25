@@ -64,6 +64,7 @@ import {
   buildRecordLaunchPriceIx,
   buildLaunchPriceEd25519VerifyInstruction,
   decodeGraveYieldError,
+  decodeGraveYieldErrorCode,
   fetchScannerProtocolConfig,
   scannerProtocolConfigPda,
   ATTESTATION_MSG_LEN,
@@ -83,6 +84,7 @@ import {
   publicKeyFingerprint,
   resolvePayerKeypair,
   signAttestationMessage,
+  signLaunchPriceMessage,
   type OracleSigner,
 } from "./sign.js";
 import type { Cluster } from "./provenance.js";
@@ -138,6 +140,47 @@ interface SimOutcome {
   decoded: DecodedGraveYieldError | undefined;
 }
 
+/**
+ * web3.js 3.x returns simulation errors as STRUCTURED objects with BigInt
+ * fields (e.g. `{InstructionError: [0n, {Custom: 6024n}]}`), so the
+ * `String(err)` form used under 1.x/1.99 ("custom program error: 0x1788")
+ * no longer exists. Serialize structurally (BigInt-safe) for the report,
+ * and extract the custom program code directly from the structure.
+ */
+function simErrToString(err: unknown): string | null {
+  if (err === null || err === undefined) return null;
+  if (typeof err === "string") return err;
+  try {
+    return JSON.stringify(err, (_k, v: unknown) => (typeof v === "bigint" ? v.toString() : v));
+  } catch {
+    return String(err);
+  }
+}
+
+/** Depth-first search for a `{Custom: N}` / `{custom: N}` node (numbers or BigInts). */
+function decodeCustomCode(err: unknown): number | undefined {
+  const walk = (v: unknown): number | undefined => {
+    if (Array.isArray(v)) {
+      for (const x of v) {
+        const hit = walk(x);
+        if (hit !== undefined) return hit;
+      }
+      return undefined;
+    }
+    if (v && typeof v === "object") {
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if ((k === "Custom" || k === "custom") && (typeof val === "number" || typeof val === "bigint")) {
+          return Number(val);
+        }
+        const hit = walk(val);
+        if (hit !== undefined) return hit;
+      }
+    }
+    return undefined;
+  };
+  return walk(err);
+}
+
 async function simulateTx(
   connection: Connection,
   tx: Transaction,
@@ -148,9 +191,19 @@ async function simulateTx(
   tx.feePayer = signers[0]?.publicKey ?? (await Keypair.generate()).publicKey;
   tx.sign(...signers);
   const sim = await connection.simulateTransaction(tx);
-  const err = sim.value.err === null ? null : String(sim.value.err);
+  const rawErr: unknown = sim.value.err;
+  const err = simErrToString(rawErr);
   const logs = sim.value.logs ?? [];
-  return { err, logs, decoded: err ? decodeGraveYieldError(err) : undefined };
+  // Decode order: (1) structured `{Custom: N}` from the error object,
+  // (2) thrown-style message string, (3) program logs ("custom program
+  // error: 0x…"). decodeGraveYieldErrorCode only recognizes codes in the
+  // GraveYield tables, so unrelated custom codes stay `undefined`.
+  const customCode = rawErr ? decodeCustomCode(rawErr) : undefined;
+  const decoded =
+    (customCode !== undefined ? decodeGraveYieldErrorCode(customCode) : undefined) ??
+    (err ? decodeGraveYieldError(err) : undefined) ??
+    (logs.length > 0 ? decodeGraveYieldError(logs.join("\n")) : undefined);
+  return { err, logs, decoded };
 }
 
 function classifySim(outcome: SimOutcome): { family: "custom" | "precompile" | "anchor-decode" | "none" } {
@@ -628,7 +681,7 @@ async function runProgramLevelCases(ctx: {
     launchPriceQ64x64,
     issuedSlot: issuedSlotHint,
   });
-  const c2Sig = signAttestationMessage(oracle, c2Msg);
+  const c2Sig = signLaunchPriceMessage(oracle, c2Msg);
 
   const recordIx = buildRecordLaunchPriceIx({
     scannerProgramId,
@@ -688,23 +741,30 @@ async function runProgramLevelCases(ctx: {
     ],
   );
 
-  // 3. non-canonical-offsets → 6025. The signature is REAL but covers the
-  //    byte span one slot earlier (data[151..319)); the precompile accepts
-  //    (offsets are runtime-consistent) while the program's pinned
-  //    placement check rejects → InvalidAttestationOffsets.
-  const shiftedOffset = LAUNCH_PRICE_MSG_OFFSET - 1;
-  const shiftedSpan = recordIx.data.subarray(shiftedOffset, shiftedOffset + 168);
-  const shiftedSig = nacl.sign.detached(shiftedSpan, oracle.keypair.secretKey);
+  // 3. non-canonical-offsets → 6025. The signature is GENUINE and the
+  //    message span canonical, but the signature itself sits at a shifted
+  //    offset inside the precompile instruction data (56 instead of the
+  //    pinned 48) — runtime-valid (the precompile verifies whatever sits
+  //    at the declared offset), and the program's sig-placement pin fires
+  //    InvalidAttestationOffsets BEFORE the oracle-equality check
+  //    (attestation.rs verify_ed25519_offsets_at: sig/pk pins at lines
+  //    288–307 precede the oracle check at 310). This makes the offset pin
+  //    observable on devnet TODAY, independent of open item 9.5. Note the
+  //    as-implemented order: a shifted MESSAGE span (data[151..324)) is
+  //    instead gated behind the oracle equality — it reverts 6026 while
+  //    the signing key is unregistered, and 6025 only post-9.5.
+  const shiftedSigOffset = 56; // canonical is 48; zones stay disjoint (pk@16..48, sig@56..120)
   const shiftedPrecompile = buildCustomPrecompileIx({
-    signature: shiftedSig,
+    signature: c2Sig, // GENUINE signature over the canonical message span
     oraclePublicKey: oracle.publicKey.toBytes(),
-    messageDataOffset: shiftedOffset,
+    messageDataOffset: LAUNCH_PRICE_MSG_OFFSET,
     messageDataSize: 168,
     messageInstructionIndex: 1,
+    signatureOffset: shiftedSigOffset,
   });
   await runCase(
     "non-canonical-offsets",
-    "A runtime-valid precompile instruction whose message span is shifted one byte off the pinned canonical placement reverts InvalidAttestationOffsets (6025) — the fail-closed offset pin",
+    "A runtime-valid precompile instruction whose SIGNATURE sits at a non-pinned offset (56 ≠ 48, genuine signature, canonical message span) reverts InvalidAttestationOffsets (6025) — the fail-closed sig-offset pin precedes oracle authorization",
     { result: "reject", errorCode: 6025, errorName: "InvalidAttestationOffsets" },
     [shiftedPrecompile, recordIx],
   );
@@ -797,6 +857,9 @@ async function runProgramLevelCases(ctx: {
  * (used by the non-canonical case). Layout: 1B count + 1B pad + 7×u16 LE
  * offsets at byte 2 + pubkey@16 + signature@48 — byte-identical to the
  * runtime's own builder (mirrored by attestation.rs / lastSwapAttestation.ts).
+ * `signatureOffset` relocates the signature (default 48) so the case can
+ * present a runtime-valid but program-non-canonical placement; the data
+ * buffer grows to cover it and the sig/pk zones stay disjoint.
  */
 function buildCustomPrecompileIx(opts: {
   signature: Uint8Array;
@@ -804,23 +867,31 @@ function buildCustomPrecompileIx(opts: {
   messageDataOffset: number;
   messageDataSize: number;
   messageInstructionIndex: number;
+  signatureOffset?: number;
 }): TransactionInstruction {
   if (opts.signature.length !== 64) throw new Error("signature must be 64 bytes");
   if (opts.oraclePublicKey.length !== 32) throw new Error("oracle pubkey must be 32 bytes");
-  // 16-byte header + 32-byte pubkey + 64-byte signature = 112 bytes
-  const data = Buffer.alloc(16 + 32 + 64);
+  const signatureOffset = opts.signatureOffset ?? 48;
+  if (signatureOffset < 16 + 32 || signatureOffset + 64 > 0xffff) {
+    throw new Error("signatureOffset must sit past the pubkey zone and fit u16");
+  }
+  if (signatureOffset < 48 && signatureOffset + 64 > 16 + 32) {
+    throw new Error("sig zone would overlap the pubkey zone");
+  }
+  const dataLen = Math.max(16 + 32 + 64, signatureOffset + 64);
+  const data = Buffer.alloc(dataLen);
   data[0] = 1;
   data[1] = 0;
   const w = (off: number, v: number) => data.writeUInt16LE(v, off);
-  w(2, 48); // signature_offset (canonical placement)
+  w(2, signatureOffset); // signature_offset (case-controlled; canonical 48)
   w(4, 0xffff); // signature_instruction_index = this instruction
   w(6, 16); // public_key_offset (canonical placement)
   w(8, 0xffff); // public_key_instruction_index = this instruction
-  w(10, opts.messageDataOffset); // message_data_offset — the non-canonical part
+  w(10, opts.messageDataOffset);
   w(12, opts.messageDataSize);
   w(14, opts.messageInstructionIndex);
   Buffer.from(opts.oraclePublicKey).copy(data, 16);
-  Buffer.from(opts.signature).copy(data, 48);
+  Buffer.from(opts.signature).copy(data, signatureOffset);
   return new TransactionInstruction({
     programId: new PublicKey("Ed25519SigVerify111111111111111111111111111"),
     keys: [],

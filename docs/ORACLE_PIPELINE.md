@@ -65,21 +65,34 @@ requires an existing LaunchPrice PDA).
 ### 2.3 Authorization and on-chain check order
 
 ```
-(0) ProtocolConfig.paused?                → 6010 ProtocolPaused
-(1) precompile present immediately prior  → 6024 AttestationMissing
-(2) precompile offsets pinned/canonical   → 6025 InvalidAttestationOffsets
-(3) covered pubkey == configured oracle   → 6026 AttestationOracleMismatch
-(4) msg binding echoes instruction params → 6027 AttestationBindingMismatch
-(5) 0 < last_swap_unix_ts <= now          → 6028 AttestationTimestampInvalid
-(6) 0 < issued_slot <= now_slot           → 6031 AttestationSlotInvalid
-(7) issued_slot resolves in SlotHashes    → 6029 AttestationStale
-(8) hash byte-equals msg[80..112]         → 6030 AttestationSlotHashMismatch
+(0)  ProtocolConfig.paused?                     → 6010 ProtocolPaused
+(1)  precompile present immediately prior       → 6024 AttestationMissing
+(2)  precompile data len / sig count == 1 /     → 6025 InvalidAttestationOffsets
+     SIG + PK placement pins
+(3)  covered pubkey == configured oracle        → 6026 AttestationOracleMismatch
+(4)  MESSAGE-span pins (msg ix index,           → 6025 InvalidAttestationOffsets
+     msg offset 152 / size 168, scanner data len)
+(5)  msg binding echoes instruction params      → 6027 AttestationBindingMismatch
+(6)  0 < last_swap_unix_ts <= now               → 6028 AttestationTimestampInvalid
+(7)  0 < issued_slot <= now_slot                → 6031 AttestationSlotInvalid
+(8)  issued_slot resolves in SlotHashes         → 6029 AttestationStale
+(9)  hash byte-equals msg[80..112]              → 6030 AttestationSlotHashMismatch
 ```
 
-Steps 0–3 are SHARED by the phase-1 and launch-price paths (the same
+Steps 0–4 are SHARED by the phase-1 and launch-price paths (the same
 `verify_ed25519_offsets_at` prologue), so live evidence about one transfers to
 the other. The runtime verifies the Ed25519 signature itself before any program
 code runs.
+
+**As-implemented check order (confirmed live 2026-10-26, devnet):** the SIG/PK
+placement pins (step 2) precede the oracle equality (step 3), which precedes
+the MESSAGE-span pins (step 4) — `attestation.rs::verify_ed25519_offsets_at`
+lines 288–307 → 310 → 319–329. Consequence observed live: a shifted MESSAGE
+span reverts 6026 while the signing key is unregistered (the oracle check
+fires first), and 6025 for that mutation becomes observable only once a
+dedicated oracle key is registered (open item 9.5). A shifted SIGNATURE
+placement with a genuine signature, however, reverts 6025 today — the
+harness's `non-canonical-offsets` case uses exactly that construction.
 
 ### 2.4 Configured oracles on the live devnet deployment (DR-001, verified 2026-10-26)
 
@@ -182,13 +195,17 @@ report: `examples/verify-path-report.live.json`.
 | 4 | stale-slot | verifier | 6029 analogue | `ATTESTATION_STALE` | PASS |
 | 5 | slot-hash-mismatch | verifier | 6030 analogue | `ATTESTATION_SLOT_HASH` | PASS |
 | 6 | replayed-evidence | journal | `ATTESTATION_REPLAY` | rejected on 2nd observation | PASS |
-| 7 | missing-precompile | program (sim) | 6024 | skipped — unfunded payer (faucet 429) | SKIPPED |
-| 8 | tampered-signature | program (sim) | precompile rejection | skipped — unfunded payer | SKIPPED |
-| 9 | non-canonical-offsets | program (sim) | 6025 | skipped — unfunded payer | SKIPPED |
-| 10 | unauthorized-signer | program (sim) | 6026 | skipped — unfunded payer | SKIPPED |
-| 11 | malformed-msg-length | program (sim) | Anchor decode failure | skipped — unfunded payer | SKIPPED |
-| 12 | canonical-bundle-program | program (sim) | 6026 (or accept if oracle registered) | skipped — unfunded payer | SKIPPED |
-| 13 | phase1-precondition | program (sim) | account-validation failure | skipped — unfunded payer | SKIPPED |
+| 7 | missing-precompile | program (sim) | 6024 | `AttestationMissing` 0x1788 (attestation.rs:440) | PASS |
+| 8 | tampered-signature | program (sim) | precompile rejection | runtime precompile abort, no custom code | PASS |
+| 9 | non-canonical-offsets | program (sim) | 6025 | `InvalidAttestationOffsets` — genuine sig at offset 56 ≠ pinned 48 | PASS |
+| 10 | unauthorized-signer | program (sim) | 6026 | `AttestationOracleMismatch` 0x178a (attestation.rs:310) | PASS |
+| 11 | malformed-msg-length | program (sim) | Anchor decode failure | non-custom anchor/decode abort | PASS |
+| 12 | canonical-bundle-program | program (sim) | 6026 (or accept if oracle registered) | `AttestationOracleMismatch` — the 9.5 gate, reached end-to-end | PASS |
+| 13 | phase1-precondition | program (sim) | account-validation failure | fails at validation, before attestation | PASS |
+
+All 13 cases PASS live (2026-10-26, program-level run with the owner-funded
+payer `8G6nsm…odcP6L`, 0.05 SOL devnet; full report:
+`examples/verify-path-report.live.json`, `allPass: true`, 0 skipped).
 
 Notes.
 
@@ -199,9 +216,9 @@ Notes.
   against the live configured oracle and reports the real deployment gate.
 * Cases 7–13 need a FUNDED payer because `record_launch_price`'s `init`
   executes during account validation (before the handler), and simulation
-  enforces real balances. Devnet faucet: HTTP 429 (rate-limited, quota
-  exhausted per IP — the handoff §8 behavior). Owner funding flow: write a
-  solana-keygen JSON to a 0600 file OUTSIDE any repository, fund that
+  enforces real balances. Executed 2026-10-26 with the owner-funded payer
+  (0.05 SOL devnet). Reproducibility flow (also the faucet-outage fallback):
+  write a solana-keygen JSON to a 0600 file OUTSIDE any repository, fund that
   address with ≥ 0.01 SOL, export `PAYER_KEY_FILE=<path>`, rerun
   `verify-path`. The harness loads it (same custody rules as the oracle
   key), skips the faucet when the balance is positive, and reports the

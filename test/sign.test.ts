@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { buildEvidenceMessage } from "../src/evidence.js";
+import { buildLaunchPriceMessage } from "@graveyield/sdk";
 import {
   generateDisposableOracleSigner,
   oracleSignerFromSeed,
@@ -19,6 +20,7 @@ import {
   resolveOracleSigner,
   resolvePayerKeypair,
   signAttestationMessage,
+  signLaunchPriceMessage,
   verifyAttestationSignature,
 } from "../src/sign.js";
 import { parseOracleSeedFromFilePayload, parseOracleSeedFromEnv } from "../src/config.js";
@@ -77,6 +79,37 @@ describe("oracle signing", () => {
     const oracle = await testOracle();
     assert.throws(() => signAttestationMessage(oracle, new Uint8Array(111)), /112/);
     assert.throws(() => signAttestationMessage(oracle, new Uint8Array(113)), /112/);
+  });
+
+  test("C2 launch-price signer: signs the canonical 168-byte message; cross-format use throws", async () => {
+    const oracle = await testOracle();
+    const c2Msg = buildLaunchPriceMessage({
+      ammProgramId: AMM,
+      poolAddress: synth(0xc2),
+      baseMint: synth(0xc3),
+      quoteMint: new PublicKey("So11111111111111111111111111111111111111112"),
+      firstSwapSlot: 1,
+      firstSwapUnixTs: 1_700_000_000,
+      launchPriceQ64x64: (1n << 64n) / 1000n,
+      issuedSlot: 5_000_000,
+    });
+    assert.equal(c2Msg.length, 168, "canonical C2 message length");
+    const sig = signLaunchPriceMessage(oracle, c2Msg);
+    assert.equal(sig.length, 64);
+    assert.ok(verifyAttestationSignature(sig, c2Msg, oracle.publicKey.toBytes()));
+
+    assert.throws(() => signLaunchPriceMessage(oracle, new Uint8Array(167)), /168/);
+    assert.throws(() => signLaunchPriceMessage(oracle, new Uint8Array(169)), /168/);
+    // The two signers are NOT interchangeable — each is fail-closed on its
+    // own wire format (C1 112 vs C2 168; the on-chain offset pins differ).
+    assert.throws(() => signLaunchPriceMessage(oracle, buildEvidenceMessage({
+      ammProgramId: AMM,
+      poolAddress: synth(0xa1),
+      lastSwapUnixTs: 1_700_000_000,
+      issuedSlot: 5_000_000,
+      slotHash: new Uint8Array(32).fill(7),
+    })), /168/);
+    assert.throws(() => signAttestationMessage(oracle, c2Msg), /112/);
   });
 
   test("seed parsers: key files (32/64-byte JSON) and base58 env", async () => {
