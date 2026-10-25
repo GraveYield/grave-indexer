@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "destination": {
+    "cluster": "devnet",
+    "scannerProgramId": "CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54",
+    "protocolConfigPda": "Fb6uvYyRAKFRCuab44imZ6YAVAEfGLoAPDxFpwVXQdiD"
+  },
+  "poolIdentity": {
+    "ammProgramId": "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+    "poolAddress": "1736ptDt7UAQbcPbVkSkLZBppScurDGo9o8BePHuTeP",
+    "baseMint": "FDRFdZksDYZP8ekRvohXafQUFvaQJtoKzj6vHsoS4V54",
+    "quoteMint": "So11111111111111111111111111111111111111112",
+    "lpMint": "A6f6eouHGnzoZg6esYw2FwX55S1gbKd1LQdbxs9h3qba",
+    "coinVault": "5Gm9FTHKHzbjEa1TVoSFRhvDoGUy2RGt8jU46ZEsJ9GF",
+    "pcVault": "JEJH3Kuk4NadPj97F3UFBDqgXWQUCUpFL2WYkmLH1XH1"
+  },
+  "activity": {
+    "lastSwapUnixTs": 1745058406,
+    "lastSwapSlot": 334477560,
+    "lastSwapSignature": "5zUBtKNkbMiZD4Q6xkHZZyehdtdDVDSHQc1QTfGLwZS6pSdnAazuxEhL61TXamgyEy3szVtMG6wxW3xJ9GEHYAEZ",
+    "derivationCluster": "mainnet-beta"
+  },
+  "issuance": {
+    "issuedSlot": 515069575,
+    "slotHashHex": "13ca714acddc0876c75b49325c54f9503df6502ba805c9d056ffd06cfa1e503a",
+    "issuedAtUnixMs": 1792955035738
+  },
+  "attestation": {
+    "msgHex": "4bd949c43602c33f207790ed16a3524ca1b9975cf121a2a90cffec7df8b68acd0006d33e4ecd720045b136331d59a8b04abb37bdcf95b7141653ea80acd91e40667a0368000000008756b31e0000000013ca714acddc0876c75b49325c54f9503df6502ba805c9d056ffd06cfa1e503a",
+    "signatureHex": "c2225fea332ce488b5171c799e2b1047eb1fbc67f8a5472910b0938f6a33671292118d2aa6e70fb53f5d8ebe6b2ac6198ede69c008596e4b456c9408933b5c06",
+    "oraclePublicKey": "2px1fKCRNmkXNJ1ZnJKqGP8WTp9S2chb5nRX1HXCaL6Z"
+  },
+  "discoveryFingerprint": null,
+  "createdAtUnixMs": 1792955035738
+}

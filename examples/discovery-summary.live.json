@@ -1,0 +1,35 @@
+{
+  "generatedAtUnixMs": 1792954517421,
+  "discovery": {
+    "rawAccounts": 706002,
+    "parsedPools": 400,
+    "malformedSkipped": 0,
+    "unsupportedPairs": 8,
+    "duplicatesInBatch": 0,
+    "slotLowerBound": 461366519,
+    "slotUpperBound": 461366611,
+    "durationMs": 20249,
+    "distinctPools": 400
+  },
+  "ingest": {
+    "counts": {
+      "new": 0,
+      "duplicate-unchanged": 400,
+      "changed": 0,
+      "conflict": 0
+    },
+    "ledgerSize": 400,
+    "conflicts": 0
+  },
+  "staleness": {
+    "currentSlot": 461366611,
+    "policyMaxAgeSlots": 400,
+    "staleEntries": 0,
+    "blockedEntries": 0
+  },
+  "provenancePolicy": {
+    "endpointKind": "public-rpc|private-rpc (URLs never recorded)",
+    "fingerprint": "sha256(pool address bytes ‖ raw 752-byte account payload)",
+    "ordering": "ascending base58 pool address (reproducible)"
+  }
+}

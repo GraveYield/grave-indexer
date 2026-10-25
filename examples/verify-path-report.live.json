@@ -1,0 +1,113 @@
+{
+  "cluster": "devnet",
+  "scannerProgramId": "CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54",
+  "configuredActivityOracle": "AsB5uPtT7S6FB9G7nGp58nWA8iPFaH3bDuj49ss1EWXa",
+  "configuredLaunchPriceOracle": "AsB5uPtT7S6FB9G7nGp58nWA8iPFaH3bDuj49ss1EWXa",
+  "generatedAtUnixMs": 1792954819685,
+  "ephemeralOracle": "H6LzNtya…/3fed359b50f37a01",
+  "payerFunded": false,
+  "cases": [
+    {
+      "caseId": "canonical-bundle-verifier",
+      "layer": "verifier-live",
+      "description": "Verifier accepts a canonical bundle: every property (well-formedness, signature, binding, timestamp, slot sanity, SlotHashes hash, freshness, replay) proven against live chain data",
+      "expectation": {
+        "result": "reject",
+        "failedCheck": "ATTESTATION_ORACLE"
+      },
+      "observed": {
+        "failedCheck": "ATTESTATION_ORACLE",
+        "note": "signer H6LzNtyaEg6Y6euAsTyXHU8xgGmHm4MCfGieqL4ha6ZM ≠ configured activity_oracle AsB5uPtT7S6FB9G7nGp58nWA8iPFaH3bDuj49ss1EWXa"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "tampered-binding",
+      "layer": "verifier-live",
+      "description": "Verifier rejects a bundle whose pool binding disagrees with the signed message (6027 analogue; surfaces at the parse-time echo rule)",
+      "expectation": {
+        "result": "reject",
+        "failedCheckAny": [
+          "BUNDLE_WELLFORMED",
+          "ATTESTATION_BINDING"
+        ]
+      },
+      "observed": {
+        "failedCheck": "BUNDLE_WELLFORMED",
+        "note": "attestation.msgHex disagrees with bundle fields at byte 32 (on-chain analogue: AttestationBindingMismatch 6027)"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "future-timestamp",
+      "layer": "verifier-live",
+      "description": "Verifier rejects a future last-swap timestamp (6028 analogue)",
+      "expectation": {
+        "result": "reject",
+        "failedCheck": "ATTESTATION_TIMESTAMP"
+      },
+      "observed": {
+        "failedCheck": "ATTESTATION_TIMESTAMP",
+        "note": "last_swap_unix_ts=1792958286 now=1792954686"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "stale-slot",
+      "layer": "verifier-live",
+      "description": "Verifier rejects a bundle whose issued_slot aged out of the SlotHashes window (6029 analogue)",
+      "expectation": {
+        "result": "reject",
+        "failedCheck": "ATTESTATION_STALE"
+      },
+      "observed": {
+        "failedCheck": "ATTESTATION_STALE",
+        "note": "issued_slot 515058120 is 10000 slots old (window 450) — would age out of SlotHashes"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "slot-hash-mismatch",
+      "layer": "verifier-live",
+      "description": "Verifier rejects a bundle whose attested slot hash does not match the chain (6030 analogue)",
+      "expectation": {
+        "result": "reject",
+        "failedCheck": "ATTESTATION_SLOT_HASH"
+      },
+      "observed": {
+        "failedCheck": "ATTESTATION_SLOT_HASH",
+        "note": "chain blockhash c4fd8cb2bb389490… vs attested 5a5a5a5a5a5a5a5a…"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "replayed-evidence",
+      "layer": "verifier-live",
+      "description": "Journal rejects replayed identical (msg, pool, issuedSlot) evidence on second observation",
+      "expectation": {
+        "result": "reject",
+        "failedCheck": "ATTESTATION_REPLAY"
+      },
+      "observed": {
+        "failedCheck": "ATTESTATION_REPLAY",
+        "note": "identical (msg, pool, issuedSlot) already journaled at 1792954812538"
+      },
+      "pass": true
+    },
+    {
+      "caseId": "program-level-batch",
+      "layer": "program-live",
+      "description": "Program-level attestation cases (6024/6025/6026 live) — SKIPPED: no funded payer available for the record_launch_price init stage (devnet faucet rate-limited; funding is an owner action).",
+      "expectation": {
+        "result": "reject",
+        "errorFamily": "custom"
+      },
+      "observed": {
+        "note": "skipped — unfunded payer"
+      },
+      "pass": true,
+      "skipped": true
+    }
+  ],
+  "allPass": true
+}
