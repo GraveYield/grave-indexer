@@ -1,0 +1,106 @@
+name: scheduled-evidence-smoke
+
+# Scheduled read-only evidence smoke (queue item 9.3 shape, scoped to the
+# Phase 2 pipeline). The point of THIS workflow is the gap between pushes:
+# a degraded devnet deployment, a drifted oracle registration, or an RPC
+# regression is caught daily instead of at the next push.
+#
+# Gating: the jobs no-op cleanly when their secret is absent (forks,
+# untrusted PRs, environments without endpoints). Failures are LOUD
+# (the matrix runner exits non-zero) — a silently broken smoke is worse
+# than no smoke. Read-only + simulation only: no key material, no state-
+# mutating transactions, no funding required.
+
+on:
+  schedule:
+    # Daily at 06:11 UTC (off the protocol repo's 06:37 smoke so failures
+    # are attributable to one pipeline).
+    - cron: "11 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-evidence-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  devnet-evidence-path:
+    name: devnet evidence-path matrix (read-only)
+    runs-on: ubuntu-latest
+    env:
+      DEVNET_RPC_URL: ${{ secrets.DEVNET_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: No-op when the DEVNET_RPC_URL secret is absent
+        if: env.DEVNET_RPC_URL == ''
+        run: |
+          echo "DEVNET_RPC_URL secret is not set — no-op (forks and untrusted contexts skip cleanly)."
+      - name: Run the evidence-path matrix
+        if: env.DEVNET_RPC_URL != ''
+        run: |
+          node --import tsx/esm src/cli.ts verify-path | tee verify-path-report.txt
+        env:
+          DATA_DIR: ./data
+      - name: Publish the report to the job summary
+        if: env.DEVNET_RPC_URL != ''
+        run: |
+          {
+            echo "## verify-path report"
+            echo '```'
+            cat verify-path-report.txt
+            echo '```'
+            echo '```json'
+            cat data/verify-path-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mainnet-discovery:
+    name: mainnet discovery smoke (read-only)
+    runs-on: ubuntu-latest
+    env:
+      MAINNET_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: No-op when the MAINNET_RPC_URL secret is absent
+        if: env.MAINNET_RPC_URL == ''
+        run: |
+          echo "MAINNET_RPC_URL secret is not set — no-op (a private mainnet endpoint should be attached before relying on this job)."
+      - name: Run one discovery cycle
+        if: env.MAINNET_RPC_URL != ''
+        run: |
+          node --import tsx/esm src/cli.ts discover | tee discovery-report.txt
+        env:
+          DATA_DIR: ./data
+          DISCOVERY_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+          MAX_POOLS_PER_SCAN: 400
+      - name: Publish the summary to the job summary
+        if: env.MAINNET_RPC_URL != ''
+        run: |
+          {
+            echo "## discovery summary"
+            echo '```json'
+            cat data/discovery-summary.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
