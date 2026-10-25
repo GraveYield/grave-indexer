@@ -333,6 +333,7 @@ Usage:
 Key env (see docs/ORACLE_PIPELINE.md):
   ORACLE_KEY_FILE              Oracle key file (0600, outside any repo) — never logged
   ACTIVITY_ORACLE_KEY          Base58 32-byte oracle seed (discouraged; file preferred)
+  PAYER_KEY_FILE               Fee-payer key file (0600, outside any repo) — fund ≥0.01 SOL devnet for program-level cases
   DISCOVERY_RPC_URL            Discovery endpoint (default https://api.mainnet-beta.solana.com)
   DEVNET_RPC_URL               Verification endpoint (default https://api.devnet.solana.com)
   ORACLE_IS_REGISTERED         true once a dedicated oracle key is registered on chain (9.5)`);

@@ -80,6 +80,24 @@ export async function resolveOracleSigner(opts?: {
 }
 
 /**
+ * Resolve the fee payer for simulation-bearing runs (evidence-path
+ * program-level cases). Prefers `PAYER_KEY_FILE` (solana-keygen JSON,
+ * 0600, outside any repository — same custody rules as the oracle key);
+ * returns null when unset so callers fall back to an ephemeral payer.
+ * Throws when the variable is set but the file is unreadable or invalid
+ * (fail-loud). Key material is parsed into memory and never logged.
+ */
+export async function resolvePayerKeypair(opts?: {
+  payerKeyFile?: string | null;
+}): Promise<Keypair | null> {
+  const keyFile = opts?.payerKeyFile ?? process.env.PAYER_KEY_FILE ?? null;
+  if (!keyFile) return null;
+  const payload = readFileSync(keyFile, "utf8");
+  // web3.js 3.x: every Keypair constructor is async (kit-backed).
+  return Keypair.fromSeed(parseOracleSeedFromFilePayload(payload));
+}
+
+/**
  * Sign the canonical 112-byte attestation message with the oracle key.
  * Uses tweetnacl detached signing — the same primitive the monorepo
  * indexer/submit.ts and the SDK's test vectors use, so signature bytes

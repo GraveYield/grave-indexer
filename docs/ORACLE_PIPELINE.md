@@ -200,8 +200,12 @@ Notes.
 * Cases 7–13 need a FUNDED payer because `record_launch_price`'s `init`
   executes during account validation (before the handler), and simulation
   enforces real balances. Devnet faucet: HTTP 429 (rate-limited, quota
-  exhausted per IP — the handoff §8 behavior). Funding prerequisite: 0.01 SOL
-  to the ephemeral payer is sufficient; rerun `verify-path` after funding.
+  exhausted per IP — the handoff §8 behavior). Owner funding flow: write a
+  solana-keygen JSON to a 0600 file OUTSIDE any repository, fund that
+  address with ≥ 0.01 SOL, export `PAYER_KEY_FILE=<path>`, rerun
+  `verify-path`. The harness loads it (same custody rules as the oracle
+  key), skips the faucet when the balance is positive, and reports the
+  payer's PUBLIC address in `payerAddress`.
 * The shared prologue argument (cases 7–11 exercise 6024/6025/6026, which are
   the SAME code path phase-1 uses) plus the protocol repo's Rust fork suite
   (which executes the full positive path against a real VM with the oracle key
@@ -216,7 +220,7 @@ Notes.
 |-----|------|---------|-------|
 | Activity oracle (Ed25519 seed) | signs C1 attestations | `ORACLE_KEY_FILE` (solana-keygen JSON, `chmod 600`), stored OUTSIDE any repository (e.g. an encrypted operator secret store); `ACTIVITY_ORACLE_KEY` env form exists but is discouraged | logged, echoed, committed, serialized into bundles/journals/reports |
 | Launch-price oracle (Ed25519 seed) | signs C2 attestations | same rules; MUST be a DIFFERENT key from the activity oracle (protocol separation, D9) | shared with the activity oracle |
-| Writer (Solana keypair) | pays rent + submits phase-1 txs | operator wallet, funded deliberately | held by the pipeline between runs |
+| Writer (Solana keypair) | pays rent + submits phase-1 txs | operator wallet, funded deliberately; harness loads it via `PAYER_KEY_FILE` (solana-keygen JSON, `chmod 600`, outside any repo) | held by the pipeline between runs |
 | Disposable devnet verification key | Phase 2 evidence-path runs | generated IN MEMORY per run (`--use-ephemeral-oracle`), dies with the process | persisted anywhere by the pipeline |
 
 Red lines (enforced in code, tested): key material is read into memory, used,
@@ -263,7 +267,7 @@ constant, 32 × 0x2a).
 |-----------|--------------------|--------|
 | Devnet RPC degraded (429s) | `rpc-verification` degraded | retry with backoff (built in); scheduled smoke FAILS LOUD rather than silently passing |
 | Mainnet RPC degraded | `rpc-discovery` degraded | discovery cycle exits 1; ledger retains prior state; staleness policy flags entries older than 400 slots |
-| Faucet unavailable | verify-path reports payer unfunded | program-level batch SKIPS (marked, not faked); fund the ephemeral payer 0.01 SOL as an owner action |
+| Faucet unavailable | verify-path reports payer unfunded | program-level batch SKIPS (marked, not faked); owner funds a payer key file (`PAYER_KEY_FILE`, ≥0.01 SOL devnet) and reruns |
 | Oracle key missing | collect refuses to run (fails closed) | discovery-only mode still works; no evidence is issued |
 | ProtocolConfig paused | smoke case reports 6010 | operator unpauses after triage (Phase-1 drill runbook) |
 | Pipeline offline entirely | scheduled smoke fails (06:11 UTC daily) | salvage submissions halt automatically — a stale pipeline cannot produce fresh evidence, and the chain rejects stale evidence (6029) |
@@ -302,8 +306,9 @@ constant, 32 × 0x2a).
 
 ## 8. Known limitations and follow-ups
 
-1. **Program-level cases need a funded payer** (faucet rate-limited). Funding
-   prerequisite and exact rerun instructions: §5 note + §6.4.
+1. **Program-level cases need a funded payer** (faucet rate-limited).
+   Resolution path: `PAYER_KEY_FILE` (owner-funded, ≥0.01 SOL devnet) —
+   §5 note + §6.4 custody rules.
 2. **Positive-path acceptance on devnet is owner-gated (9.5):** until a
    dedicated oracle key is registered (or the deployment is refreshed under
    new keys, DR-001 style), every valid bundle is `oracle-gated` at 6026.

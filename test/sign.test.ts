@@ -6,7 +6,10 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { PublicKey } from "@solana/web3.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Keypair, PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { buildEvidenceMessage } from "../src/evidence.js";
 import {
@@ -14,6 +17,7 @@ import {
   oracleSignerFromSeed,
   publicKeyFingerprint,
   resolveOracleSigner,
+  resolvePayerKeypair,
   signAttestationMessage,
   verifyAttestationSignature,
 } from "../src/sign.js";
@@ -102,6 +106,33 @@ describe("oracle signing", () => {
     } finally {
       if (savedFile !== undefined) process.env.ORACLE_KEY_FILE = savedFile;
       if (savedEnv !== undefined) process.env.ACTIVITY_ORACLE_KEY = savedEnv;
+    }
+  });
+
+  test("resolvePayerKeypair: unset → null (ephemeral fallback); key file → matching keypair", async () => {
+    const saved = process.env.PAYER_KEY_FILE;
+    delete process.env.PAYER_KEY_FILE;
+    const dir = mkdtempSync(join(tmpdir(), "payer-test-"));
+    try {
+      assert.equal(await resolvePayerKeypair(), null, "unset env → null");
+
+      const seed = new Uint8Array(32).fill(0x7e); // public test bytes
+      const expected = await Keypair.fromSeed(seed);
+      const file = join(dir, "payer.json");
+      // 64-byte solana-keygen layout: seed(32) + pubkey(32)
+      writeFileSync(file, JSON.stringify([...expected.secretKey]));
+      const loaded = await resolvePayerKeypair({ payerKeyFile: file });
+      assert.ok(loaded, "key file resolves to a keypair");
+      assert.equal(loaded.publicKey.toBase58(), expected.publicKey.toBase58(), "same address");
+
+      await assert.rejects(
+        () => resolvePayerKeypair({ payerKeyFile: join(dir, "missing.json") }),
+        /ENOENT|no such file/i,
+        "set-but-unreadable fails loud",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      if (saved !== undefined) process.env.PAYER_KEY_FILE = saved;
     }
   });
 

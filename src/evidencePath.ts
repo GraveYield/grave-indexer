@@ -41,6 +41,10 @@
 // All signatures are produced by EPHEMERAL devnet keys generated inside
 // the run; no key material is serialized into the report (reports carry
 // public keys and signatures only). Simulations never persist state.
+// The fee payer is loaded from PAYER_KEY_FILE when provided (owner-funded
+// devnet key — custody rules in docs/ORACLE_PIPELINE.md); otherwise it is
+// ephemeral and dies with the run. Reports carry only the payer's PUBLIC
+// address.
 // Real submission stays opt-in (SUBMIT=1) and is NOT exercised by the
 // default run — see the "no live salvage until verified" gate.
 
@@ -77,6 +81,7 @@ import {
 import {
   generateDisposableOracleSigner,
   publicKeyFingerprint,
+  resolvePayerKeypair,
   signAttestationMessage,
   type OracleSigner,
 } from "./sign.js";
@@ -121,6 +126,8 @@ export interface EvidencePathReport {
   /** Public fingerprint of the ephemeral devnet oracle used for signing. */
   ephemeralOracle: string;
   payerFunded: boolean;
+  /** Public devnet address of the fee payer (public data, never a secret). */
+  payerAddress: string;
   cases: EvidencePathCaseReport[];
   allPass: boolean;
 }
@@ -201,7 +208,11 @@ export async function runEvidencePathVerification(opts: {
   scannerProgramId: PublicKey;
   vaultProgramId: PublicKey;
   oracle?: OracleSigner;
-  /** Attempt to fund the ephemeral payer via devnet airdrop. */
+  /** Pre-funded fee payer (e.g. loaded from PAYER_KEY_FILE by the caller).
+   *  When absent, the harness resolves PAYER_KEY_FILE from the env and
+   *  falls back to an ephemeral payer (+ optional faucet airdrop). */
+  payer?: Keypair;
+  /** Attempt to fund the payer via devnet airdrop (no-op when pre-funded). */
   allowFaucet?: boolean;
   /** Injected clock for deterministic verifier tests. */
   nowUnixSeconds?: number;
@@ -246,7 +257,10 @@ export async function runEvidencePathVerification(opts: {
   // record_launch_price (account validation precedes the handler, so even
   // failing cases pay rent from the payer inside simulation).
   // =====================================================================
-  const payer = await Keypair.generate();
+  const payer =
+    opts.payer ??
+    (await resolvePayerKeypair()) ??
+    (await Keypair.generate());
   let payerFunded = (await connection.getBalance(payer.publicKey)) > 0;
   if (!payerFunded && opts.allowFaucet !== false) {
     try {
@@ -262,7 +276,7 @@ export async function runEvidencePathVerification(opts: {
       caseId: "program-level-batch",
       layer: "program-live",
       description:
-        "Program-level attestation cases (6024/6025/6026 live) — SKIPPED: no funded payer available for the record_launch_price init stage (devnet faucet rate-limited; funding is an owner action).",
+        "Program-level attestation cases (6024/6025/6026 live) — SKIPPED: no funded payer available for the record_launch_price init stage (owner action: fund a payer key file and export PAYER_KEY_FILE, then rerun).",
       expectation: { result: "reject", errorFamily: "custom" },
       observed: { note: "skipped — unfunded payer" },
       pass: true, // a skip is not a failure; the report marks it explicitly
@@ -281,6 +295,7 @@ export async function runEvidencePathVerification(opts: {
     generatedAtUnixMs: Date.now(),
     ephemeralOracle: publicKeyFingerprint(oracle.publicKey),
     payerFunded,
+    payerAddress: payer.publicKey.toBase58(),
     cases,
     allPass: nonSkipped.every((c) => c.pass),
   };

@@ -56,7 +56,7 @@ describe("devnet evidence-path smoke (read-only + simulation)", { skip: SKIP }, 
     }
     console.log(`  configured activity_oracle:      ${report.configuredActivityOracle ?? "(unavailable)"}`);
     console.log(`  configured launch_price_oracle:  ${report.configuredLaunchPriceOracle ?? "(unavailable)"}`);
-    console.log(`  payer funded: ${report.payerFunded}`);
+    console.log(`  payer: ${report.payerAddress} (funded: ${report.payerFunded})`);
     const failures = report.cases.filter((c) => !c.pass);
     assert.deepEqual(
       failures.map((c) => c.caseId),
