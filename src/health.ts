@@ -23,7 +23,8 @@ export type HealthComponentId =
   | "activity"
   | "evidence"
   | "verifier"
-  | "journal";
+  | "journal"
+  | "enrich";
 
 export interface HealthComponentReport {
   component: HealthComponentId;

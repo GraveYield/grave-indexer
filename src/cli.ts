@@ -11,9 +11,10 @@
 //   health        — print the latest health snapshot from the data dir
 
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { Connection, PublicKey } from "@solana/web3.js";
-import { fetchV4Pool } from "@graveyield/sdk";
+import { fetchV4Pool, decodeScannerProtocolConfig } from "@graveyield/sdk";
 
 import { loadPipelineConfig, type PipelineConfig } from "./config.js";
 import { discoverRaydiumV4Pools } from "./discovery.js";
@@ -25,7 +26,14 @@ import { issueEvidenceBundle } from "./issue.js";
 import { verifyEvidenceBundle, summarizeVerifyResult } from "./verify.js";
 import { ReplayJournal } from "./journal.js";
 import { generateDisposableOracleSigner, resolveOracleSigner, publicKeyFingerprint } from "./sign.js";
-import type { Cluster } from "./provenance.js";
+import {
+  buildConsoleSnapshot,
+  CONSOLE_SNAPSHOT_SCHEMA_VERSION,
+  type ConsoleSnapshotFailure,
+  type PoolEnrichment,
+  type SnapshotThresholds,
+} from "./consoleSnapshot.js";
+import { endpointKindFor, type Cluster } from "./provenance.js";
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
@@ -302,6 +310,133 @@ export function cmdHealth(config: PipelineConfig): number {
   return 0;
 }
 
+function indexerGitHead(): string | null {
+  try {
+    return execSync("git rev-parse HEAD", { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `console-snapshot` — produce the typed, secret-free console artifact
+ * (P3-A Task 3.1). Real mainnet Raydium V4 facts + deployed-ProtocolConfig
+ * thresholds, fail-closed. Read-only; no keys involved.
+ */
+export async function cmdConsoleSnapshot(
+  config: PipelineConfig,
+  opts: { maxPools: number; enrich: number; maxAgeHours: number },
+): Promise<number> {
+  const conn = new Connection(config.discoveryRpcUrl, "confirmed");
+  const health = new HealthRegistry();
+  const failures: ConsoleSnapshotFailure[] = [];
+
+  // ---- Thresholds: read from the DEPLOYED ProtocolConfig — never hardcoded.
+  const [configPda] = await PublicKey.findProgramAddress(
+    [Buffer.from("protocol_config")],
+    config.scannerProgramId,
+  );
+  const cfgInfo = await conn.getAccountInfo(configPda);
+  if (!cfgInfo) {
+    console.error(`console-snapshot: ProtocolConfig ${configPda.toBase58()} not found on ${config.discoveryCluster} — refusing to fall back to defaults`);
+    return 1;
+  }
+  const deployedCfg = decodeScannerProtocolConfig(cfgInfo.data);
+  const thresholds: SnapshotThresholds = {
+    inactivitySeconds: deployedCfg.inactivitySeconds,
+    minTvlLamports: deployedCfg.minTvlLamports,
+  };
+  console.log(
+    `thresholds (deployed ProtocolConfig): inactivity=${thresholds.inactivitySeconds}s minTvl=${thresholds.minTvlLamports} lamports`,
+  );
+
+  // ---- Discovery cycle (identity-slice, mainnet-safe).
+  const t0 = Date.now();
+  const run = await discoverRaydiumV4Pools(conn, {
+    cluster: config.discoveryCluster,
+    rpcUrl: config.discoveryRpcUrl,
+    maxPools: opts.maxPools,
+    mode: "identity-slice",
+  });
+  health.recordSuccess("rpc-discovery", Date.now() - t0);
+  const supported = run.records
+    .filter((r) => r.wsolSide !== null)
+    .sort((a, b) => (a.poolAddress.toBase58() < b.poolAddress.toBase58() ? -1 : 1));
+  const targets = supported.slice(0, opts.enrich);
+  console.log(
+    `discovery: ${run.stats.parsedPools} parsed, ${supported.length} WSOL-supported, enriching ${targets.length}`,
+  );
+
+  // ---- Per-pool enrichment: vault reserves, LP supply, memecoin decimals, last swap.
+  const activityIndexer = new ActivityIndexerLive({
+    cluster: config.discoveryCluster,
+    rpcUrl: config.discoveryRpcUrl,
+  });
+  const enrichments = new Map<string, PoolEnrichment>();
+  for (const record of targets) {
+    const address = record.poolAddress.toBase58();
+    const fetchedAt = Date.now();
+    try {
+      const wsolVault = record.wsolSide!.coinIsWsol ? record.pool.coinVault : record.pool.pcVault;
+      const memecoinVault = record.wsolSide!.coinIsWsol ? record.pool.pcVault : record.pool.coinVault;
+      const memecoinMint = record.wsolSide!.memecoinMint;
+      const [wsolBal, memecoinBal, memecoinSupply, lpSupply, activity] = await Promise.all([
+        conn.getTokenAccountBalance(wsolVault),
+        conn.getTokenAccountBalance(memecoinVault),
+        conn.getTokenSupply(memecoinMint),
+        conn.getTokenSupply(record.pool.lpMint),
+        activityIndexer
+          .indexActivity(conn, record.poolAddress, { scanLimit: config.signatureScanLimit })
+          .catch((err) => {
+            failures.push({ stage: "activity", pool: address, reason: String((err as Error).message ?? err).slice(0, 120) });
+            return null;
+          }),
+      ]);
+      const lastSwap =
+        activity && !activity.noSwapFound && activity.lastSwapUnixTs > 0
+          ? { unixTs: activity.lastSwapUnixTs, slot: activity.lastSwapSlot, signature: activity.lastSwapSignature }
+          : null;
+      enrichments.set(address, {
+        wsolReserveLamports: wsolBal.value.amount,
+        memecoinReserveRaw: memecoinBal.value.amount,
+        memecoinDecimals: memecoinSupply.value.decimals,
+        lpSupplyRaw: lpSupply.value.amount,
+        lastSwap,
+        fetchedAtUnixMs: fetchedAt,
+      });
+      health.recordSuccess("enrich", 0);
+    } catch (err) {
+      failures.push({ stage: "enrich", pool: address, reason: String((err as Error).message ?? err).slice(0, 120) });
+      health.recordFailure("enrich", err);
+    }
+  }
+
+  const snapshot = buildConsoleSnapshot(supported.filter((r) => enrichments.has(r.poolAddress.toBase58())), enrichments, {
+    generatedAtUnixMs: Date.now(),
+    cluster: config.discoveryCluster as Cluster,
+    endpointKind: endpointKindFor(config.discoveryRpcUrl),
+    indexerGitHead: indexerGitHead(),
+    maxAgeMs: opts.maxAgeHours * 3_600_000,
+    thresholds,
+    counts: {
+      rawAccounts: run.stats.rawAccounts,
+      parsedPools: run.stats.parsedPools,
+      supportedWsolPairs: supported.length,
+    },
+    failures,
+    slotLowerBound: run.stats.slotLowerBound,
+    slotUpperBound: run.stats.slotUpperBound,
+  });
+  const out = join(config.dataDir, "console-snapshot.json");
+  mkdirSync(config.dataDir, { recursive: true });
+  writeJson(out, snapshot);
+  writeJson(join(config.dataDir, HEALTH_FILE), health.snapshot());
+  console.log(
+    `console-snapshot: v${CONSOLE_SNAPSHOT_SCHEMA_VERSION}, ${snapshot.counts.enriched} pool(s) enriched, ${failures.length} failure(s) → ${out}`,
+  );
+  return snapshot.counts.enriched > 0 ? 0 : 1;
+}
+
 async function main(): Promise<number> {
   const config = loadPipelineConfig();
   const command = process.argv[2] ?? "help";
@@ -319,6 +454,21 @@ async function main(): Promise<number> {
     }
     case "verify-path":
       return cmdVerifyPath(config);
+    case "console-snapshot": {
+      const args = process.argv.slice(3);
+      const num = (flag: string, fallback: number): number => {
+        const i = args.indexOf(flag);
+        if (i < 0) return fallback;
+        const v = Number(args[i + 1]);
+        if (!Number.isInteger(v) || v <= 0) throw new Error(`${flag} must be a positive integer`);
+        return v;
+      };
+      return cmdConsoleSnapshot(config, {
+        maxPools: num("--max-pools", 120),
+        enrich: num("--enrich", 24),
+        maxAgeHours: num("--max-age-hours", 24),
+      });
+    }
     case "health":
       return cmdHealth(config);
     default:
@@ -328,6 +478,9 @@ Usage:
   grave-indexer discover       Run one Raydium V4 discovery cycle (DISCOVERY_RPC_URL, default mainnet-beta)
   grave-indexer collect        Issue + verify evidence bundles for live pools (from the discovery ledger)
   grave-indexer verify-path    Run the devnet evidence-path verification matrix
+  grave-indexer console-snapshot
+                               Produce the typed secret-free console artifact
+                               [--max-pools 120] [--enrich 24] [--max-age-hours 24]
   grave-indexer health         Print the latest health snapshot
 
 Key env (see docs/ORACLE_PIPELINE.md):
