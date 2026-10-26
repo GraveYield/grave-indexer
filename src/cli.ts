@@ -332,13 +332,16 @@ export async function cmdConsoleSnapshot(
   const failures: ConsoleSnapshotFailure[] = [];
 
   // ---- Thresholds: read from the DEPLOYED ProtocolConfig — never hardcoded.
+  // The deployed scanner lives on the VERIFICATION cluster (devnet); the
+  // discovery corpus is mainnet. Two connections, one artifact.
+  const devnetConn = new Connection(config.verificationRpcUrl, "confirmed");
   const [configPda] = await PublicKey.findProgramAddress(
     [Buffer.from("protocol_config")],
     config.scannerProgramId,
   );
-  const cfgInfo = await conn.getAccountInfo(configPda);
+  const cfgInfo = await devnetConn.getAccountInfo(configPda);
   if (!cfgInfo) {
-    console.error(`console-snapshot: ProtocolConfig ${configPda.toBase58()} not found on ${config.discoveryCluster} — refusing to fall back to defaults`);
+    console.error(`console-snapshot: ProtocolConfig ${configPda.toBase58()} not found on the verification cluster — refusing to fall back to defaults`);
     return 1;
   }
   const deployedCfg = decodeScannerProtocolConfig(cfgInfo.data);
