@@ -61,3 +61,11 @@ Expected: the canonical positive case flips `6026` → accepted, matrix goes
 Re-run step 2 with the new (or old) pubkey and update `ORACLE_KEY_FILE`.
 On key compromise: generate a replacement (step 1), register it (step 2),
 rotate the env var (step 3), re-verify (step 4).
+
+## Full illustrated guide
+
+The complete walkthrough volume (executive summary, Route A vs Route B
+decision tree, borsh-exact `register_oracle.mjs` listing with dry-run and
+read-back verification, rotation/rollback) is preserved alongside this
+document: [`GraveYield_Oracle-Custody_Registration_Guide_2026-10-26.docx`](GraveYield_Oracle-Custody_Registration_Guide_2026-10-26.docx).
+This markdown is the operational quick path; the docx is the full guide.
