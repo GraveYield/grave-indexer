@@ -20,7 +20,7 @@ import { signAttestationMessage } from "../src/sign.js";
 import { synth, testOracle } from "./fixtures.js";
 
 const AMM = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-const SCANNER = new PublicKey("CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54");
+const SCANNER = new PublicKey("EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL");
 
 async function canonicalBundle() {
   const oracle = await testOracle();

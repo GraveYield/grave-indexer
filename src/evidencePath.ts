@@ -3,8 +3,11 @@
 // Evidence-path verification — the Phase 2 acceptance harness.
 //
 // Runs the full verification matrix against the DEPLOYED devnet
-// GraveScanner (DR-001: CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54)
-// and against live chain data, producing a structured pass/fail report.
+// GraveScanner (NS-3, assigned per DR-002:
+// EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL — deployment pending until
+// the owner executes it; the NS-2 deployment CuQZes…Ao54 is a preserved
+// legacy record) and against live chain data, producing a structured
+// pass/fail report.
 //
 // LIVE PROGRAM-LEVEL CASES (via record_launch_price — the attestation
 // prologue — precompile presence, precompile offset pinning and oracle

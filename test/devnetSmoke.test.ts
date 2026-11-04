@@ -4,12 +4,20 @@
 // smoke, gated on DEVNET_RPC_URL so `pnpm test` stays green offline.
 //
 //   1. Decode the deployed GraveScanner ProtocolConfig and assert the
-//      DR-001 PDA coordinates and the bump-255 invariant.
+//      NS-3 PDA coordinates (pre-deployment derivation) and the
+//      bump-255 invariant.
 //   2. Record the configured activity / launch-price oracles (public
 //      keys — logged intentionally; these are authorization anchors).
 //   3. Run the full evidence-path verification matrix against the
 //      deployed program (live program-level cases where the payer could
 //      be funded, verifier-level cases always) and require allPass.
+//
+// Deployment: NS-3 (DR-002) — the program IDs are ASSIGNED but NOT yet
+// deployed or initialized. Until the owner executes the NS-3 deployment
+// (graveyield-protocol docs/DEVNET.md), the config-decode test below
+// reports "deployment pending" (explicit skip) instead of failing; the
+// matrix test exercises the same pending path honestly. The NS-2
+// deployment is a preserved legacy record — do NOT re-point at it.
 //
 // Mirrors sdk/test/devnetSmoke.test.ts conventions.
 
@@ -32,19 +40,28 @@ const SKIP = !DEVNET_RPC;
 describe("devnet evidence-path smoke (read-only + simulation)", { skip: SKIP }, () => {
   const connection = new Connection(DEVNET_RPC ?? "http://localhost:8899", "confirmed");
 
-  test("GraveScanner ProtocolConfig matches the DR-001 deployment with bump 255", async () => {
+  test("GraveScanner ProtocolConfig matches the NS-3 derivation with bump 255", async (t) => {
     const pda = scannerProtocolConfigPda(DEVNET_SCANNER_PROGRAM_ID);
-    assert.equal(pda.toBase58(), "Fb6uvYyRAKFRCuab44imZ6YAVAEfGLoAPDxFpwVXQdiD");
+    assert.equal(pda.toBase58(), "5PK9pz4FcmiWGG3h81WquD2QpwuEj2GeAXxLGGMJkKKe");
     const cfg = await fetchScannerProtocolConfig(connection, pda);
-    assert.ok(cfg, "ProtocolConfig must be initialized on devnet");
-    assert.equal(cfg.bump, 255, "bump-255 invariant from the handoff");
+    if (!cfg) {
+      t.skip(
+        "NS-3 deployment pending: scanner ProtocolConfig not initialized on devnet yet " +
+          "(owner executes deployment per graveyield-protocol docs/DEVNET.md)",
+      );
+      return;
+    }
+    assert.equal(cfg.bump, 255, "bump-255 invariant (['protocol_config'], canonical bump)");
     assert.equal(cfg.paused, false, "program must not be paused for the evidence path");
     // The configured oracles are PUBLIC keys — recorded for the report.
+    // Under NS-3 these must be the dedicated oracle keys after registration:
+    //   activity       2ZygwHNXUBm3ESuvzxqL8ywdqKo8pkkcS6XfXQoZqf8o
+    //   launch price   97JVKVd6E8Tmax8AciUNA4U92hwEQxN9MpeAessQBcee
     console.log(`  configured activity_oracle:      ${cfg.activityOracle.toBase58()}`);
     console.log(`  configured launch_price_oracle:  ${cfg.launchPriceOracle.toBase58()}`);
   });
 
-  test("evidence-path verification matrix passes against the deployed program", async () => {
+  test("evidence-path verification matrix passes against the deployed program", async (t) => {
     const report = await runEvidencePathVerification({
       connection,
       cluster: "devnet",
@@ -65,5 +82,6 @@ describe("devnet evidence-path smoke (read-only + simulation)", { skip: SKIP }, 
       [],
       `evidence-path failures: ${JSON.stringify(failures, null, 2)}`,
     );
+    void t;
   });
 });

@@ -110,6 +110,37 @@ unverified. **Consequence:** a valid attestation from any other key reverts 6026
 — the pipeline's `oracle-gated` outcome. Registering a dedicated oracle key
 (`update_protocol_config`, authority-signed) is an owner-gated action; see §6.4.
 
+### 2.5 NS-3 oracle identity arrangement (assigned 2026-11-04, deployment PENDING)
+
+The NS-3 identities (owner-generated, owner-held keypairs; DR-002) separate
+every privileged role — the single-key concentration that ended NS-1 and NS-2
+does not recur:
+
+```
+GraveScanner (NS-3)     EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL
+ProtocolConfig PDA      5PK9pz4FcmiWGG3h81WquD2QpwuEj2GeAXxLGGMJkKKe (bump 255)
+governance authority    BMnrpx9mSZDzCmM8aJipnzgfLzfxa5tfFgWi3ZvBUwf5
+activity_oracle         2ZygwHNXUBm3ESuvzxqL8ywdqKo8pkkcS6XfXQoZqf8o   (after registration)
+launch_price_oracle     97JVKVd6E8Tmax8AciUNA4U92hwEQxN9MpeAessQBcee   (after registration)
+deployer / fee payer    cfJKAzSpYhoKheLWzx7miTHp6HCt46E3oeU3CBo4831    (NOT a config authority)
+```
+
+Sequencing on devnet (owner-executed; `graveyield-protocol
+scripts/devnet/protocol_admin.mjs`):
+
+1. `initialize` starts BOTH oracle fields at the governance authority
+   (on-chain `initialize` semantics are unchanged) — attestations do not
+   verify against the dedicated keys yet.
+2. `register-oracle` (the `update_protocol_config` instruction) re-points
+   `activity_oracle` and `launch_price_oracle` to the dedicated keys —
+   signed by the governance authority, fee paid by the deployer
+   (`--fee-payer`), readback-asserted.
+3. Only then does the evidence path attest against NS-3 end-to-end.
+
+Until step 1 exists on chain, nothing on devnet answers at the NS-3
+addresses; the read-only smoke suites report the pending state explicitly.
+§2.4 above remains the historical NS-2 record, preserved verbatim.
+
 ## 3. Architecture
 
 ```
