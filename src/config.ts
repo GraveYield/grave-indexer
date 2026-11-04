@@ -32,6 +32,20 @@ export const DEVNET_VAULT_PROGRAM_ID = new PublicKey(
 );
 
 /**
+ * NS-3 ProtocolConfig authority — the dedicated GOVERNANCE authority,
+ * initial and permanent config authority for BOTH programs (DR-002
+ * arrangement). The deployer `cfJKAz…4831` pays fees and holds the
+ * upgrade authority but is NOT the config authority. Public key only.
+ */
+export const NS3_GOVERNANCE_AUTHORITY = "BMnrpx9mSZDzCmM8aJipnzgfLzfxa5tfFgWi3ZvBUwf5";
+
+/** NS-3 dedicated GraveScanner activity (C1) oracle signer — public key only. */
+export const NS3_ACTIVITY_ORACLE = "2ZygwHNXUBm3ESuvzxqL8ywdqKo8pkkcS6XfXQoZqf8o";
+
+/** NS-3 dedicated GraveScanner launch-price (C2) oracle signer — public key only. */
+export const NS3_LAUNCH_PRICE_ORACLE = "97JVKVd6E8Tmax8AciUNA4U92hwEQxN9MpeAessQBcee";
+
+/**
  * SlotHashes holds ~512 entries; the on-chain freshness check fails once
  * issued_slot ages out. Evidence issuance must complete within this
  * window. Pipeline policy keeps a safety margin under the window.

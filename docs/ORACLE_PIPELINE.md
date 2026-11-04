@@ -1,7 +1,9 @@
 # ORACLE_PIPELINE.md — Phase 2: Raydium V4 discovery + evidence pipeline
 
-Repository: `GraveYield/grave-indexer` · Ground truth: `graveyield-protocol @ 5b84440`
-(vendored, pinned as a git submodule at `vendor/protocol`)
+Repository: `GraveYield/grave-indexer` · Ground truth: `graveyield-protocol @ d526699`
+(vendored, pinned as a git submodule at `vendor/protocol`; NS-3 identity sync — the
+wire-format layout documentation below was originally verified at `5b84440` and
+re-verified unchanged at the NS-3 pin: identities moved, layouts did not)
 Status: Phase 2 complete · All on-chain coordinates are devnet + mainnet PUBLIC data.
 This document intentionally contains NO key material — see §6.
 
@@ -22,7 +24,7 @@ re-orders, or "fixes" a wire format.
 
 ## 2. The actual on-chain oracle interface (as implemented — inspected, not invented)
 
-Everything below was read from `graveyield-protocol` source at `5b84440`
+Everything below was read from `graveyield-protocol` source (originally at `5b84440`, re-verified at the NS-3 pin `d526699`)
 (`programs/grave-scanner/src/attestation.rs`, `instructions/evaluate_pool_phase1.rs`,
 `instructions/record_launch_price.rs`, `state/protocol_config.rs`) and cross-checked
 against the SDK mirror (`sdk/src/lastSwapAttestation.ts`, `sdk/src/launchPriceAttestation.ts`).

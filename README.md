@@ -16,7 +16,7 @@ revocation / monitoring / downtime runbook.
 ## Layout
 
 ```
-vendor/protocol/     git submodule → GraveYield/graveyield-protocol @ 5b84440
+vendor/protocol/     git submodule → GraveYield/graveyield-protocol @ d526699 (NS-3)
                      (the SDK inside it is the single source of truth for
                       every wire format; this repo never forks one)
 src/
