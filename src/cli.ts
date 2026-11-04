@@ -119,17 +119,22 @@ export async function cmdDiscover(config: PipelineConfig): Promise<number> {
 }
 
 /** `verify-path` — run the devnet evidence-path matrix and persist the report. */
-export async function cmdVerifyPath(config: PipelineConfig): Promise<number> {
+export async function cmdVerifyPath(
+  config: PipelineConfig,
+  opts: { allowFaucet?: boolean } = {},
+): Promise<number> {
   const connection = new Connection(config.verificationRpcUrl, "confirmed");
   mkdirSync(config.dataDir, { recursive: true });
 
   console.log(`verify-path: cluster=${"devnet"} scanner=${config.scannerProgramId.toBase58()}`);
+  if (opts.allowFaucet) console.log("verify-path: faucet OPT-IN — an unfunded payer may request a devnet airdrop");
+  else console.log("verify-path: read-only faucet policy — no airdrop will be requested");
   const report = await runEvidencePathVerification({
     connection,
     cluster: "devnet" as Cluster,
     scannerProgramId: config.scannerProgramId,
     vaultProgramId: config.vaultProgramId,
-    allowFaucet: true,
+    allowFaucet: opts.allowFaucet === true,
   });
 
   const reportPath = join(config.dataDir, REPORT_FILE);
@@ -146,8 +151,17 @@ export async function cmdVerifyPath(config: PipelineConfig): Promise<number> {
   }
   console.log(`configured activity_oracle:  ${report.configuredActivityOracle ?? "(unavailable)"}`);
   console.log(`configured launch_price_oracle: ${report.configuredLaunchPriceOracle ?? "(unavailable)"}`);
+  console.log(`deployment: ${report.deployment.classification}${report.deployment.problems.length > 0 ? ` — ${report.deployment.problems.join("; ")}` : ""}`);
   console.log(`report: ${reportPath}`);
-  console.log(`all-pass: ${report.allPass}${report.payerFunded ? "" : " (program-level batch skipped — unfunded payer)"}`);
+  console.log(
+    `all-pass: ${report.allPass}${
+      report.deployment.classification !== "ready"
+        ? " (program-level batch NOT RUN — deployment state: " + report.deployment.classification + ")"
+        : report.payerFunded
+          ? ""
+          : " (program-level batch skipped — unfunded payer; rerun with --allow-faucet or PAYER_KEY_FILE)"
+    }`,
+  );
   return report.allPass ? 0 : 1;
 }
 
@@ -456,7 +470,13 @@ async function main(): Promise<number> {
       });
     }
     case "verify-path":
-      return cmdVerifyPath(config);
+      // Faucet policy (review-enforced): the faucet is STRICT opt-in via
+      // `--allow-faucet`. A default `verify-path` run never requests an
+      // airdrop — an unfunded payer skips the program-level batch with an
+      // actionable note instead of mutating external state.
+      return cmdVerifyPath(config, {
+        allowFaucet: process.argv.slice(3).includes("--allow-faucet"),
+      });
     case "console-snapshot": {
       const args = process.argv.slice(3);
       const num = (flag: string, fallback: number): number => {

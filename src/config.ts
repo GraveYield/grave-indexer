@@ -21,15 +21,29 @@
 import { PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 
-/** Devnet GraveScanner program ID (DR-001 fresh deployment, 2026-10-25). */
+/** NS-3 GraveScanner program ID (assigned, DR-002; deployment pending). */
 export const DEVNET_SCANNER_PROGRAM_ID = new PublicKey(
-  "CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54",
+  "EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL",
 );
 
-/** Devnet GraveVault program ID (DR-001 fresh deployment, 2026-10-25). */
+/** NS-3 GraveVault program ID (assigned, DR-002; deployment pending). */
 export const DEVNET_VAULT_PROGRAM_ID = new PublicKey(
-  "Bd5smhQgMrvcRw9j659MNTKySpBJsKZLBKtinCAGs7rg",
+  "7VxUGJNgi1bZ8x4rTtLBNdgLs9sCLmUTpVE3on1nshya",
 );
+
+/**
+ * NS-3 ProtocolConfig authority — the dedicated GOVERNANCE authority,
+ * initial and permanent config authority for BOTH programs (DR-002
+ * arrangement). The deployer `cfJKAz…4831` pays fees and holds the
+ * upgrade authority but is NOT the config authority. Public key only.
+ */
+export const NS3_GOVERNANCE_AUTHORITY = "BMnrpx9mSZDzCmM8aJipnzgfLzfxa5tfFgWi3ZvBUwf5";
+
+/** NS-3 dedicated GraveScanner activity (C1) oracle signer — public key only. */
+export const NS3_ACTIVITY_ORACLE = "2ZygwHNXUBm3ESuvzxqL8ywdqKo8pkkcS6XfXQoZqf8o";
+
+/** NS-3 dedicated GraveScanner launch-price (C2) oracle signer — public key only. */
+export const NS3_LAUNCH_PRICE_ORACLE = "97JVKVd6E8Tmax8AciUNA4U92hwEQxN9MpeAessQBcee";
 
 /**
  * SlotHashes holds ~512 entries; the on-chain freshness check fails once

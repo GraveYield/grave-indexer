@@ -20,7 +20,7 @@ import { ReplayJournal } from "../src/journal.js";
 import { synth, testOracle } from "./fixtures.js";
 
 const AMM = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-const SCANNER = new PublicKey("CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54");
+const SCANNER = new PublicKey("EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL");
 
 // Mock chain state: current slot 5_000_000; blocks resolvable for a
 // window of slots with deterministic blockhashes (sha-like filler).

@@ -3,8 +3,23 @@
 // Evidence-path verification — the Phase 2 acceptance harness.
 //
 // Runs the full verification matrix against the DEPLOYED devnet
-// GraveScanner (DR-001: CuQZesHk8eHvaoNTFiTr1hUjfVKGCqDZHTTe8HkJAo54)
-// and against live chain data, producing a structured pass/fail report.
+// GraveScanner (NS-3, assigned per DR-002:
+// EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL — deployment pending until
+// the owner executes it; the NS-2 deployment CuQZes…Ao54 is a preserved
+// legacy record) and against live chain data, producing a structured
+// pass/fail report.
+//
+// DEPLOYMENT GATING (review-enforced): the harness resolves the actual
+// program-account existence FIRST (src/deploymentState.ts). Program-level
+// simulations run ONLY when both programs are deployed and initialized;
+// a pending deployment yields an explicit skip, a partial deployment or
+// a mis-initialized configuration surfaces the exact problems and never
+// silently masquerades as "pending". A missing config account alone is
+// never treated as proof a program is undeployed.
+//
+// FAUCET POLICY (review-enforced): `allowFaucet` is strict opt-in. The
+// default run is read-only — no airdrop is ever requested and no external
+// state is mutated; funding-dependent runs explicitly opt in.
 //
 // LIVE PROGRAM-LEVEL CASES (via record_launch_price — the attestation
 // prologue — precompile presence, precompile offset pinning and oracle
@@ -72,6 +87,11 @@ import {
   type DecodedGraveYieldError,
 } from "@graveyield/sdk";
 import { verifyEvidenceBundle, type VerificationCheckId, type VerifyResult } from "./verify.js";
+import {
+  resolveDeploymentState,
+  type DeploymentClassification,
+  type DeploymentState,
+} from "./deploymentState.js";
 import { ReplayJournal } from "./journal.js";
 import {
   buildEvidenceBundle,
@@ -128,8 +148,16 @@ export interface EvidencePathReport {
   /** Public fingerprint of the ephemeral devnet oracle used for signing. */
   ephemeralOracle: string;
   payerFunded: boolean;
-  /** Public devnet address of the fee payer (public data, never a secret). */
+  /** Public devnet address of the fee payer (public data, never a secret).
+   *  Empty string when the program-level stage never ran (non-ready
+   *  deployment state) and no payer was resolved. */
   payerAddress: string;
+  /** Explicit deployment-state classification backing the run (see
+   *  deploymentState.ts — program-level stages run ONLY when "ready"). */
+  deployment: {
+    classification: DeploymentClassification;
+    problems: string[];
+  };
   cases: EvidencePathCaseReport[];
   allPass: boolean;
 }
@@ -254,6 +282,19 @@ function synthAddress(seed: number): PublicKey {
  * the case catalogue. `oracle` (optional) supplies the devnet oracle
  * signer; when absent, an ephemeral key is generated for the run
  * (recommended — the key never leaves memory).
+ *
+ * Deployment gating: the matrix resolves the ACTUAL deployment state
+ * FIRST (program-account existence — never inferred from a missing
+ * config account). Program-level cases run ONLY when BOTH programs are
+ * deployed AND initialized ("ready"); for a genuinely pending deployment
+ * they are reported as an explicit skip, and a partial or inconsistent
+ * deployment surfaces the exact problems in `report.deployment`.
+ *
+ * Faucet policy: `allowFaucet` is STRICT opt-in. A default run never
+ * requests an airdrop and never mutates external state; funding-dependent
+ * runs explicitly pass `allowFaucet: true` (or provide a pre-funded
+ * `payer`). An unfunded payer skips the program-level batch with an
+ * actionable note instead of triggering an airdrop.
  */
 export async function runEvidencePathVerification(opts: {
   connection: Connection;
@@ -263,9 +304,10 @@ export async function runEvidencePathVerification(opts: {
   oracle?: OracleSigner;
   /** Pre-funded fee payer (e.g. loaded from PAYER_KEY_FILE by the caller).
    *  When absent, the harness resolves PAYER_KEY_FILE from the env and
-   *  falls back to an ephemeral payer (+ optional faucet airdrop). */
+   *  falls back to an ephemeral payer. */
   payer?: Keypair;
-  /** Attempt to fund the payer via devnet airdrop (no-op when pre-funded). */
+  /** STRICT opt-in: request a devnet airdrop for an unfunded payer.
+   *  Default false — read-only runs never mutate external state. */
   allowFaucet?: boolean;
   /** Injected clock for deterministic verifier tests. */
   nowUnixSeconds?: number;
@@ -274,6 +316,10 @@ export async function runEvidencePathVerification(opts: {
   const scannerProgramId = opts.scannerProgramId;
   const vaultProgramId = opts.vaultProgramId;
   const oracle = opts.oracle ?? (await generateDisposableOracleSigner());
+
+  // ---- Deployment state FIRST: program-account existence decides whether
+  // program-level simulations may run at all.
+  const deploymentState = await resolveDeploymentState(connection, scannerProgramId, vaultProgramId);
 
   // ---- Live on-chain configuration context
   let configuredActivityOracle: string | null = null;
@@ -306,37 +352,47 @@ export async function runEvidencePathVerification(opts: {
   cases.push(...verifierCases);
 
   // =====================================================================
-  // Program-level cases — need a funded payer for the `init` stage of
-  // record_launch_price (account validation precedes the handler, so even
-  // failing cases pay rent from the payer inside simulation).
+  // Program-level cases — need BOTH programs deployed AND initialized,
+  // plus a funded payer for the `init` stage of record_launch_price
+  // (account validation precedes the handler, so even failing cases pay
+  // rent from the payer inside simulation). Nothing here runs against a
+  // partially-deployed or pending cluster.
   // =====================================================================
-  const payer =
-    opts.payer ??
-    (await resolvePayerKeypair()) ??
-    (await Keypair.generate());
-  let payerFunded = (await connection.getBalance(payer.publicKey)) > 0;
-  if (!payerFunded && opts.allowFaucet !== false) {
-    try {
-      await connection.requestAirdrop(payer.publicKey, 0.5 * 1_000_000_000);
-      payerFunded = (await connection.getBalance(payer.publicKey)) > 0;
-    } catch {
-      payerFunded = false;
-    }
-  }
-
-  if (!payerFunded) {
+  let payerFunded = false;
+  let payerAddress = "";
+  if (deploymentState.classification !== "ready") {
+    const reason = deploymentNotReadyReason(deploymentState);
     cases.push({
       caseId: "program-level-batch",
       layer: "program-live",
-      description:
-        "Program-level attestation cases (6024/6025/6026 live) — SKIPPED: no funded payer available for the record_launch_price init stage (owner action: fund a payer key file and export PAYER_KEY_FILE, then rerun).",
+      description: `Program-level attestation cases (6024/6025/6026 live) — NOT RUN: ${reason} (program-level simulations never execute against programs that are absent or inconsistent).`,
       expectation: { result: "reject", errorFamily: "custom" },
-      observed: { note: "skipped — unfunded payer" },
-      pass: true, // a skip is not a failure; the report marks it explicitly
+      observed: { note: `skipped — ${reason}` },
+      pass: true, // a skip is not a failure; the classification carries the signal
       skipped: true,
     });
   } else {
-    cases.push(...(await runProgramLevelCases({ connection, scannerProgramId, vaultProgramId, oracle, payer })));
+    const { payer, funded } = await resolveFundedPayer(connection, {
+      ...(opts.payer ? { payer: opts.payer } : {}),
+      allowFaucet: opts.allowFaucet === true,
+    });
+    payerFunded = funded;
+    payerAddress = payer.publicKey.toBase58();
+
+    if (!payerFunded) {
+      cases.push({
+        caseId: "program-level-batch",
+        layer: "program-live",
+        description:
+          "Program-level attestation cases (6024/6025/6026 live) — SKIPPED: no funded payer for the record_launch_price init stage. No faucet was requested (read-only default). Owner action: fund a payer key file, export PAYER_KEY_FILE, and rerun — or explicitly opt in with allowFaucet: true.",
+        expectation: { result: "reject", errorFamily: "custom" },
+        observed: { note: "skipped — unfunded payer (no airdrop requested; faucet is strict opt-in)" },
+        pass: true, // a skip is not a failure; the report marks it explicitly
+        skipped: true,
+      });
+    } else {
+      cases.push(...(await runProgramLevelCases({ connection, scannerProgramId, vaultProgramId, oracle, payer })));
+    }
   }
 
   const nonSkipped = cases.filter((c) => !c.skipped);
@@ -348,10 +404,56 @@ export async function runEvidencePathVerification(opts: {
     generatedAtUnixMs: Date.now(),
     ephemeralOracle: publicKeyFingerprint(oracle.publicKey),
     payerFunded,
-    payerAddress: payer.publicKey.toBase58(),
+    payerAddress,
+    deployment: {
+      classification: deploymentState.classification,
+      problems: deploymentState.problems,
+    },
     cases,
     allPass: nonSkipped.every((c) => c.pass),
   };
+}
+
+/** Human-exact reason string for a non-ready deployment classification. */
+function deploymentNotReadyReason(state: DeploymentState): string {
+  switch (state.classification) {
+    case "deployment-pending":
+      return "NS-3 deployment pending — neither program account exists on this cluster yet (owner executes the deployment per graveyield-protocol docs/DEVNET.md)";
+    case "partial-deployment":
+      return `partial deployment — ${state.problems.join("; ")}`;
+    case "inconsistent":
+      return `deployed programs present but configuration inconsistent — ${state.problems.join("; ")}`;
+    case "ready":
+      return "ready";
+  }
+}
+
+/**
+ * Resolve the fee payer for program-level simulation stages.
+ *
+ * Funding policy (review-enforced): the faucet is STRICT opt-in. A
+ * default run NEVER requests an airdrop — a missing balance skips the
+ * funding-dependent work instead of mutating external state. Explicit
+ * `allowFaucet: true` (or a pre-funded payer / PAYER_KEY_FILE) is the
+ * only way an airdrop is attempted.
+ */
+export async function resolveFundedPayer(
+  connection: Pick<Connection, "getBalance" | "requestAirdrop">,
+  opts: { payer?: Keypair; allowFaucet?: boolean },
+): Promise<{ payer: Keypair; funded: boolean; airdropAttempted: boolean }> {
+  const payer = opts.payer ?? (await resolvePayerKeypair()) ?? (await Keypair.generate());
+  let funded = (await connection.getBalance(payer.publicKey)) > 0;
+  let airdropAttempted = false;
+  if (!funded && opts.allowFaucet === true) {
+    airdropAttempted = true;
+    try {
+      await connection.requestAirdrop(payer.publicKey, 0.5 * 1_000_000_000);
+      funded = (await connection.getBalance(payer.publicKey)) > 0;
+    } catch {
+      funded = false;
+    }
+  }
+  return { payer, funded, airdropAttempted };
 }
 
 // ======================================================================
