@@ -2,9 +2,9 @@
 //
 // Live activity derivation with provenance + conflict detection.
 //
-// Wraps the SDK's `deriveLastSwapV4` (the authoritative derivation the
-// on-chain oracle contract expects) and adds what the operational
-// pipeline needs on top:
+// Wraps the SDK's `deriveLastSwapEvidenceV4` (the canonical D4/D5
+// derivation the on-chain oracle contract expects) and adds what the
+// operational pipeline needs on top:
 //
 //   * PROVENANCE — when the derivation ran, over how many signatures,
 //     against which cluster/endpoint kind.
@@ -21,8 +21,19 @@
 //     enough to require a re-scan before it seeds an attestation.
 
 import { Connection, type PublicKey } from "@solana/web3.js";
-import { deriveLastSwapV4, RAYDIUM_V4_PROGRAM_ID } from "@graveyield/sdk";
+import { deriveLastSwapEvidenceV4, RAYDIUM_V4_PROGRAM_ID } from "@graveyield/sdk";
 import { endpointKindFor, type Cluster, type EndpointKind } from "./provenance.js";
+
+/**
+ * Explicit D4/D5 evidence status (IMPL-001, Deliverable 3 §8):
+ *   verified       — the newest finalized, verified economic swap is established;
+ *   no_swap_in_scan— the pool's full available signature history was covered and
+ *                    every candidate is provably not an economic swap;
+ *   incomplete     — unresolved evidence present (or an empty/bounded scan):
+ *                    NO inactivity determination may be derived, and this state
+ *                    must never be reported as complete.
+ */
+export type ActivityEvidenceStatus = "verified" | "no_swap_in_scan" | "incomplete";
 
 /** Live last-swap activity record with provenance. */
 export interface ActivityEvidence {
@@ -33,15 +44,31 @@ export interface ActivityEvidence {
   lastSwapSlot: number;
   /** Signature of that swap tx ("" = none found) — the audit anchor. */
   lastSwapSignature: string;
+  /** True when no verified swap exists in the covered evidence (legacy
+   *  field semantics: no usable last-swap record). For `incomplete`
+   *  evidence this is false with zeroed last-swap fields — the honest
+   *  state is "unknown", not "no swap". */
   noSwapFound: boolean;
+  /** Explicit D4/D5 completeness status of this derivation. */
+  evidenceStatus: ActivityEvidenceStatus;
+  /** True when this record is a sound basis for an inactivity claim. */
+  definitive: boolean;
+  /** Transitional derivation labeling per Deliverable 3 §7: the record
+   *  reflects a verified economic swap (never a bare amm-touch). */
+  derivationKind: "swap";
   /** Derivation context. */
   derivation: {
     cluster: Cluster;
     endpointKind: EndpointKind;
     scanLimit: number;
+    /** Actual number of signatures returned and classified by the scan
+     *  (not the requested limit — Deliverable 3 §8 flags the old
+     *  limit-as-count as a defect). */
     signaturesScanned: number;
+    /** True when the scan covered the pool's full available history. */
+    scanReachedHistoryEnd: boolean;
     derivedAtUnixMs: number;
-    source: "deriveLastSwapV4";
+    source: "deriveLastSwapEvidenceV4";
   };
   /** Set when a re-derivation returned an older swap than the cache. */
   regressionDetected: boolean;
@@ -78,6 +105,14 @@ export class ActivityIndexerLive {
   /**
    * Derive (or fetch from cache) the last-swap record for a pool.
    * Throws through on RPC failure — the caller records health.
+   *
+   * Evidence handling (IMPL-001): the derivation consumes the SDK's
+   * canonical `deriveLastSwapEvidenceV4`; incomplete evidence is
+   * represented explicitly (`evidenceStatus: "incomplete"`, zeroed
+   * last-swap fields, `noSwapFound: false`) and can never be reported as
+   * a complete determination. When a cached VERIFIED record exists and a
+   * refresh comes back incomplete, the cached record stays authoritative
+   * (Deliverable 3 §8 regression rule) and is returned unchanged.
    */
   async indexActivity(
     connection: Connection,
@@ -93,43 +128,49 @@ export class ActivityIndexerLive {
       return cached.evidence;
     }
 
-    const derivation = await deriveLastSwapV4(connection, RAYDIUM_V4_PROGRAM_ID, poolAddress, {
+    const result = await deriveLastSwapEvidenceV4(connection, RAYDIUM_V4_PROGRAM_ID, poolAddress, {
       scanLimit,
     });
 
-    const evidence: ActivityEvidence = derivation
-      ? {
-          poolAddress,
-          lastSwapUnixTs: derivation.lastSwapUnixTs,
-          lastSwapSlot: derivation.slot,
-          lastSwapSignature: derivation.signature,
-          noSwapFound: false,
-          derivation: {
-            cluster: this.cluster,
-            endpointKind: endpointKindFor(this.rpcUrl),
-            scanLimit,
-            signaturesScanned: scanLimit,
-            derivedAtUnixMs: now,
-            source: "deriveLastSwapV4",
-          },
-          regressionDetected: false,
-        }
-      : {
-          poolAddress,
-          lastSwapUnixTs: 0,
-          lastSwapSlot: 0,
-          lastSwapSignature: "",
-          noSwapFound: true,
-          derivation: {
-            cluster: this.cluster,
-            endpointKind: endpointKindFor(this.rpcUrl),
-            scanLimit,
-            signaturesScanned: scanLimit,
-            derivedAtUnixMs: now,
-            source: "deriveLastSwapV4",
-          },
-          regressionDetected: false,
-        };
+    const buildEvidence = (): ActivityEvidence => ({
+      poolAddress,
+      lastSwapUnixTs: result.lastSwap?.lastSwapUnixTs ?? 0,
+      lastSwapSlot: result.lastSwap?.slot ?? 0,
+      lastSwapSignature: result.lastSwap?.signature ?? "",
+      noSwapFound: result.status === "no_swap_in_scan",
+      evidenceStatus: result.status,
+      definitive: result.definitive,
+      derivationKind: "swap",
+      derivation: {
+        cluster: this.cluster,
+        endpointKind: endpointKindFor(this.rpcUrl),
+        scanLimit,
+        signaturesScanned: result.scan.signaturesReturned,
+        scanReachedHistoryEnd: result.scan.reachedHistoryEnd,
+        derivedAtUnixMs: now,
+        source: "deriveLastSwapEvidenceV4",
+      },
+      regressionDetected: false,
+    });
+
+    const evidence = buildEvidence();
+
+    // Incomplete refresh with an authoritative cached record: the cache
+    // wins (its determination was verified; the refresh failed closed).
+    if (
+      cached &&
+      cached.evidence.evidenceStatus === "verified" &&
+      evidence.evidenceStatus === "incomplete"
+    ) {
+      return cached.evidence;
+    }
+    if (
+      cached &&
+      cached.evidence.evidenceStatus === "no_swap_in_scan" &&
+      evidence.evidenceStatus === "incomplete"
+    ) {
+      return cached.evidence;
+    }
 
     // Conflict rule: a refreshed derivation that lands OLDER than the
     // cached one means the history we are looking at shrank — a signature

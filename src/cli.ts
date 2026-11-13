@@ -241,7 +241,13 @@ export async function cmdCollect(
       continue;
     }
     if (activity.noSwapFound || activity.lastSwapUnixTs <= 0) {
-      console.log(`[skip] ${poolStr}: no swap found in the last ${config.signatureScanLimit} signatures — cannot attest a last-swap time`);
+      // IMPL-001: incomplete evidence is reported as such — it must never
+      // be presented as an observed "no swap" fact (Deliverable 3 §8).
+      const reason =
+        activity.evidenceStatus === "incomplete"
+          ? `incomplete evidence (${activity.derivation.signaturesScanned} signatures scanned, ${activity.derivation.scanReachedHistoryEnd ? "history end reached" : "bounded scan"}, unresolved candidates present) — cannot attest a last-swap time`
+          : `no swap found in the last ${config.signatureScanLimit} signatures — cannot attest a last-swap time`;
+      console.log(`[skip] ${poolStr}: ${reason}`);
       continue;
     }
 
