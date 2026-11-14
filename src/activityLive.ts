@@ -24,11 +24,16 @@
 //     diagnostics/observability only (`lastKnownDefinitiveEvidence`); it
 //     is never served as current.
 //   * CONFLICT DETECTION — a re-derivation that returns an OLDER
-//     last-swap than the cached record is flagged as an activity
-//     regression (pruned history / untrusted RPC) and surfaced instead of
-//     silently overwriting the cache. The CACHED record remains
-//     authoritative for attestation; the regression is reported for the
-//     operator and recorded in health.
+//     last-swap than the newest KNOWN verified anchor is flagged as an
+//     activity regression (pruned history / untrusted RPC) and surfaced
+//     instead of silently overwriting the cache. The known-anchor
+//     baseline spans BOTH the current cache AND the last-known definitive
+//     record retained across incomplete refreshes: after an incomplete
+//     refresh the cache is empty, but the retained anchor still bounds
+//     what a trustworthy re-derivation may return (Correction 004). A
+//     regressed record is never promoted to current evidence and is
+//     rejected by the attestation gate (`regressed_evidence`), so it can
+//     support neither an attestation nor a C1 anchor.
 //   * STALENESS — `isActivityStale` decides whether a derivation is old
 //     enough to require a re-scan before it seeds an attestation.
 //   * ATTESTATION GATE (IMPL-001 Correction 002) — `evaluateAttestationGate`
@@ -97,7 +102,12 @@ export interface ActivityEvidence {
     derivedAtUnixMs: number;
     source: "deriveLastSwapEvidenceV4";
   };
-  /** Set when a re-derivation returned an older swap than the cache. */
+  /** Set when a re-derivation returned an older last-swap than the
+   *  newest known verified anchor (the current cached record OR the
+   *  last-known definitive record retained across incomplete refreshes).
+   *  A regressed record is never promoted to current evidence and the
+   *  attestation gate rejects it — it can never support an inactivity
+   *  claim. */
   regressionDetected: boolean;
 }
 
@@ -148,7 +158,12 @@ export class ActivityIndexerLive {
   private readonly cache = new Map<string, CacheEntry>();
   /** Last-known DEFINITIVE record per pool, retained across incomplete
    *  refreshes for diagnostics/observability ONLY (Correction 002 §1.3/
-   *  §1.6). Never served as the current result by `indexActivity`. */
+   *  §1.6). Never served as the current result by `indexActivity`.
+   *  It also bounds the regression check (Correction 004): when the
+   *  current cache holds no verified anchor (e.g. right after an
+   *  incomplete refresh), the retained anchor is still the newest swap
+   *  the pipeline has verified, so a re-derivation older than it is a
+   *  regression — never promoted as current. */
   private readonly lastKnownDefinitive = new Map<string, CacheEntry>();
   private readonly ttlMs: number;
   private readonly cluster: Cluster;
@@ -247,15 +262,49 @@ export class ActivityIndexerLive {
 
     // Conflict rule (definitive-vs-definitive only since Correction 002:
     // incomplete results no longer reach this point and are never
-    // cached): a refreshed derivation that lands OLDER than the cached
-    // one means the history we are looking at shrank — a signature of an
-    // untrusted/pruned RPC. Keep the cached (older, larger-window)
-    // derivation as authoritative and flag the regression.
-    if (cached && !cached.evidence.noSwapFound && !evidence.noSwapFound) {
-      if (evidence.lastSwapUnixTs < cached.evidence.lastSwapUnixTs) {
-        evidence.regressionDetected = true;
+    // cached): a refreshed derivation that lands OLDER than the newest
+    // KNOWN verified anchor means the history we are looking at shrank —
+    // a signature of an untrusted/pruned RPC. The baseline spans the
+    // current cached record AND the last-known definitive record
+    // retained across incomplete refreshes (Correction 004): after an
+    // incomplete refresh the cache is empty, but the retained anchor is
+    // still the newest swap the pipeline has verified — without it, an
+    // older (possibly pruned) derivation would be promoted to current
+    // evidence here and pass the attestation gate on its fresh derivation
+    // timestamp alone. Keep the known (larger-window) derivation
+    // authoritative and flag the regression.
+    const priorDefinitive = this.lastKnownDefinitive.get(key);
+    const knownAnchorTs = (
+      e: ActivityEvidence | undefined,
+    ): number =>
+      e !== undefined &&
+      e.evidenceStatus === "verified" &&
+      !e.noSwapFound &&
+      e.lastSwapUnixTs > 0
+        ? e.lastSwapUnixTs
+        : 0;
+    const baselineTs = Math.max(
+      knownAnchorTs(cached?.evidence),
+      knownAnchorTs(priorDefinitive?.evidence),
+    );
+    const incomingTs = evidence.noSwapFound ? 0 : evidence.lastSwapUnixTs;
+    if (incomingTs < baselineTs) {
+      evidence.regressionDetected = true;
+      const cachedIsAuthoritative = cached !== undefined && knownAnchorTs(cached.evidence) > 0;
+      if (cachedIsAuthoritative) {
+        // A current authoritative record exists: it stays authoritative
+        // and is returned unchanged; the regressed derivation is
+        // discarded.
         return cached.evidence;
       }
+      // No current definitive record (post-incomplete): the regressed
+      // record is surfaced to the caller flagged — it is NEVER cached,
+      // never promoted to current evidence, and it never overwrites the
+      // retained diagnostic record. The attestation gate rejects
+      // regressed records, so it can support neither an attestation nor
+      // a C1 anchor; the current determination stays unresolved until a
+      // trustworthy re-derivation lands a newer-or-equal anchor.
+      return evidence;
     }
 
     this.cache.set(key, { evidence, cachedAtUnixMs: now });
@@ -304,6 +353,12 @@ export class ActivityIndexerLive {
 //   * incomplete evidence (never a basis for inactivity),
 //   * non-definitive evidence (no_swap_in_scan and anything else that is
 //     not a verified last swap),
+//   * regressed evidence (a re-derivation that landed OLDER than the
+//     newest known verified anchor — flagged `regressionDetected` by the
+//     indexer; untrusted pruned history is never a sound basis for an
+//     inactivity claim),
+//   * future-dated evidence (a derivation timestamp later than the
+//     evaluation clock — a negative age is not "fresh", it is invalid),
 //   * stale evidence (a derivation older than the caller's freshness
 //     policy — not successfully refreshed).
 // The gate is flow control, not logging: callers must skip issuance on
@@ -317,6 +372,7 @@ export type AttestationGateRejection =
   | "incomplete_evidence"
   | "not_verified"
   | "not_definitive"
+  | "regressed_evidence"
   | "stale_evidence";
 
 export interface AttestationGateOptions {
@@ -354,8 +410,9 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * `derivationKind` (which must mirror `evidenceStatus` — Correction 003).
  * A record passes only when it is present, well-formed,
  * `evidenceStatus === "verified"`, `definitive === true`, labeled
- * `derivationKind === "swap"`, carries a real last-swap anchor, and is
- * fresh under `opts.maxAgeMs`.
+ * `derivationKind === "swap"`, carries a real last-swap anchor, is not
+ * flagged as a regression against the indexer's known anchor, and is
+ * neither future-dated nor stale under `opts.maxAgeMs`.
  */
 export function evaluateAttestationGate(
   activity: ActivityEvidence | null | undefined,
@@ -484,7 +541,30 @@ export function evaluateAttestationGate(
     return reject("not_definitive", "evidence is not definitive — not a sound basis for an inactivity claim");
   }
 
+  // Regression flag (Correction 004): a record the indexer flagged as a
+  // regression (its re-derivation landed OLDER than the newest known
+  // verified anchor — pruned/untrusted history) can never support an
+  // inactivity claim, no matter how fresh its derivation timestamp is.
+  if (a.regressionDetected === true) {
+    return reject(
+      "regressed_evidence",
+      "the derivation regressed against the indexer's known anchor (an older last-swap than the retained definitive evidence) — untrusted re-derivation",
+    );
+  }
+
   const now = opts.nowUnixMs ?? Date.now();
+
+  // Future-dated derivation (negative age): a timestamp later than the
+  // evaluation clock is not "fresh" — it is invalid evidence. The old
+  // freshness check alone (`age > maxAgeMs`) let future-dated records
+  // pass with a negative age.
+  if ((d.derivedAtUnixMs as number) > now) {
+    return reject(
+      "malformed_evidence",
+      `derivation.derivedAtUnixMs ${JSON.stringify(d.derivedAtUnixMs)} is later than the evaluation clock ${now} — a future-dated derivation is not valid current evidence`,
+    );
+  }
+
   const age = now - (d.derivedAtUnixMs as number);
   if (age > opts.maxAgeMs) {
     return reject(

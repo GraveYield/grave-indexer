@@ -675,6 +675,160 @@ describe("Correction 002 §2 — attestation gate", () => {
     assert.ok(!staleDiagnosticGate.ok);
     assert.equal(staleDiagnosticGate.reason, "stale_evidence");
   });
+
+  test("rejects a future-dated derivation timestamp (a negative age is not fresh)", async () => {
+    // The freshness check used to reject only `age > maxAgeMs`, so a
+    // record derived "in the future" relative to the evaluation clock
+    // passed with a negative age. A future-dated derivation is invalid
+    // evidence, not fresh evidence.
+    const verified = await indexer().indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(verified.evidenceStatus, "verified");
+    const gate = evaluateAttestationGate(verified, {
+      maxAgeMs: DEFAULT_ACTIVITY_TTL_MS,
+      nowUnixMs: verified.derivation.derivedAtUnixMs - 60_000,
+    });
+    assert.equal(gate.ok, false);
+    assert.ok(!gate.ok);
+    assert.equal(gate.reason, "malformed_evidence");
+    assert.ok(gate.detail.includes("later than the evaluation clock"), gate.detail);
+
+    // Boundary: a record derived exactly AT the evaluation clock (age 0)
+    // is still fresh.
+    const atClock = evaluateAttestationGate(verified, {
+      maxAgeMs: DEFAULT_ACTIVITY_TTL_MS,
+      nowUnixMs: verified.derivation.derivedAtUnixMs,
+    });
+    assert.equal(atClock.ok, true, "age exactly 0 is fresh");
+  });
+});
+
+// ─── Correction 004 — regression detection survives an incomplete refresh ───
+
+describe("Correction 004 — regression detection spans the retained definitive anchor", () => {
+  test("verified → incomplete → older verified: the older result is rejected, never promoted", async () => {
+    const ix = indexer();
+    const first = await ix.indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(first.evidenceStatus, "verified");
+    assert.equal(first.lastSwapUnixTs, 1_700_000_100);
+
+    const refresh = await ix.indexActivity(incompleteRpc().asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(refresh.evidenceStatus, "incomplete", "precondition: the incomplete refresh is the current result");
+    assert.equal(ix.size, 0, "the current cache is empty after the incomplete refresh");
+
+    // A later refresh lands OLDER than the retained anchor — the history
+    // we are looking at shrank (pruned / untrusted RPC).
+    const olderRpc = new FakeRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), blockTime: 1_699_000_000 },
+    ]);
+    const third = await ix.indexActivity(olderRpc.asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(third.lastSwapUnixTs, 1_699_000_000, "the older derivation is surfaced honestly");
+    assert.equal(third.regressionDetected, true, "the older result is flagged as a regression");
+    assert.equal(ix.size, 0, "the older result is NOT promoted to current evidence");
+    assert.equal(
+      ix.isActivityStale(POOL, DEFAULT_ACTIVITY_TTL_MS),
+      true,
+      "no current record exists after the rejection",
+    );
+
+    // The previous definitive record is retained for diagnostics,
+    // untouched by the regressed refresh.
+    const diagnostics = ix.lastKnownDefinitiveEvidence(POOL);
+    assert.notEqual(diagnostics, null, "the previous definitive record is retained");
+    assert.equal(diagnostics!.lastSwapUnixTs, 1_700_000_100, "the retained anchor was not overwritten");
+    assert.equal(
+      diagnostics!.derivation.derivedAtUnixMs,
+      first.derivation.derivedAtUnixMs,
+      "the retained record keeps its original derivation provenance",
+    );
+
+    // The older result cannot pass the attestation gate — and therefore
+    // can never seed an attestation or a C1 anchor (same gate).
+    const gate = evaluateAttestationGate(third, { maxAgeMs: DEFAULT_ACTIVITY_TTL_MS });
+    assert.equal(gate.ok, false);
+    assert.ok(!gate.ok);
+    assert.equal(gate.reason, "regressed_evidence");
+  });
+
+  test("verified → incomplete → genuinely newer verified: the newer result is still promoted", async () => {
+    const ix = indexer();
+    const first = await ix.indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(first.lastSwapUnixTs, 1_700_000_100);
+    await ix.indexActivity(incompleteRpc().asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+
+    const newerRpc = new FakeRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), blockTime: 1_700_100_000 },
+    ]);
+    const third = await ix.indexActivity(newerRpc.asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(third.evidenceStatus, "verified");
+    assert.equal(third.lastSwapUnixTs, 1_700_100_000, "the newer anchor is accepted");
+    assert.equal(third.regressionDetected, false);
+    assert.equal(ix.size, 1, "the newer definitive result is cached as current");
+    assert.equal(
+      ix.lastKnownDefinitiveEvidence(POOL)!.lastSwapUnixTs,
+      1_700_100_000,
+      "the diagnostics view tracks the promoted record",
+    );
+
+    const gate = evaluateAttestationGate(third, { maxAgeMs: DEFAULT_ACTIVITY_TTL_MS });
+    assert.equal(gate.ok, true, "the accepted result remains gate-passable");
+  });
+
+  test("verified → incomplete → same-anchor verified: a confirming re-derivation is promoted", async () => {
+    const ix = indexer();
+    await ix.indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    await ix.indexActivity(incompleteRpc().asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+
+    const third = await ix.indexActivity(verifiedRpc().asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(third.evidenceStatus, "verified");
+    assert.equal(third.lastSwapUnixTs, 1_700_000_100);
+    assert.equal(third.regressionDetected, false, "an equal anchor is not a regression");
+    assert.equal(ix.size, 1);
+  });
+
+  test("verified → incomplete → definitive no-swap: the contradiction is a regression and the retained anchor survives", async () => {
+    // A definitive no-swap determination contradicts a known verified
+    // anchor: the only way a full-coverage scan finds no economic swap
+    // after a swap was VERIFIED is that the available history shrank.
+    const ix = indexer();
+    await ix.indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    await ix.indexActivity(incompleteRpc().asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+
+    const noSwapRpc = new FakeRpc([
+      { signature: failedSwap.signature, response: responseFrom(failedSwap) },
+    ]);
+    const third = await ix.indexActivity(noSwapRpc.asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(third.evidenceStatus, "no_swap_in_scan");
+    assert.equal(third.regressionDetected, true, "a no-swap result against a known anchor is a regression");
+    assert.equal(ix.size, 0, "the contradictory no-swap is not promoted to current");
+    assert.equal(
+      ix.lastKnownDefinitiveEvidence(POOL)!.lastSwapUnixTs,
+      1_700_000_100,
+      "the verified diagnostic anchor is retained",
+    );
+
+    // The gate rejects it regardless of the flag (not_verified) — no
+    // anchor, no attestation, no C1 seed.
+    const gate = evaluateAttestationGate(third, { maxAgeMs: DEFAULT_ACTIVITY_TTL_MS });
+    assert.equal(gate.ok, false);
+    assert.ok(!gate.ok);
+    assert.equal(gate.reason, "not_verified");
+  });
+
+  test("a cached verified record followed by a definitive no-swap refresh keeps the cached anchor authoritative", async () => {
+    // The same regression rule with the CURRENT cache as baseline: a
+    // full-coverage no-swap scan cannot displace a known verified anchor.
+    const ix = indexer();
+    const first = await ix.indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(first.evidenceStatus, "verified");
+
+    const noSwapRpc = new FakeRpc([
+      { signature: failedSwap.signature, response: responseFrom(failedSwap) },
+    ]);
+    const second = await ix.indexActivity(noSwapRpc.asConnection(), POOL, { forceRefresh: true, scanLimit: 50 });
+    assert.equal(second.evidenceStatus, "verified", "the cached verified record stays authoritative");
+    assert.equal(second.lastSwapUnixTs, first.lastSwapUnixTs);
+    assert.equal(ix.size, 1);
+  });
 });
 
 // ─── Collect path end-to-end (IMPL-001 Correction 002 §2) ──────────────────

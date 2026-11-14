@@ -24,7 +24,11 @@
 //   * mislabeled evidence (both Correction-003 directions) is excluded;
 //   * verified claims without a real last-swap anchor are excluded;
 //   * diagnostic (last-known definitive) evidence is never treated as
-//     current verified evidence.
+//     current verified evidence;
+//   * a regressed (older) re-derivation after an incomplete refresh is
+//     flagged by the indexer and rejected by the shared gate — the older
+//     anchor never becomes a C1 last-swap record (Correction 004);
+//   * future-dated evidence (negative derivation age) is excluded.
 //
 // Evidence sources follow the repository's testing conventions: the REAL
 // ActivityIndexerLive over the REAL mainnet fixture corpus (the same
@@ -670,5 +674,70 @@ describe("C1 console-snapshot evidence boundary (shared attestation gate)", () =
     const failure = poolFailure(artifact);
     assert.ok(failure, "the incomplete CURRENT result is recorded");
     assert.ok(failure!.reason.includes("incomplete_evidence"), failure!.reason);
+  });
+
+  test("a regressed (older) re-derivation after an incomplete refresh cannot seed C1", async () => {
+    // REAL indexer, REAL Correction-004 sequence: a verified derivation is
+    // followed by an incomplete refresh (cache emptied, anchor retained
+    // for diagnostics), and a later refresh lands OLDER than the retained
+    // anchor — pruned/untrusted history. The indexer flags the regressed
+    // record; the shared gate must reject it, so the older anchor can
+    // never become a C1 last-swap record.
+    const ix = realIndexer();
+    const first = await ix.indexActivity(new SnapshotRpc([swapCandidate()]).asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(first.evidenceStatus, "verified");
+    assert.equal(first.lastSwapUnixTs, 1_700_000_100);
+    const current = await ix.indexActivity(
+      new SnapshotRpc([nonFinalizedCandidate()]).asConnection(),
+      POOL,
+      { forceRefresh: true, scanLimit: 50 },
+    );
+    assert.equal(current.evidenceStatus, "incomplete", "the incomplete refresh is the current result");
+
+    const older = await ix.indexActivity(
+      new SnapshotRpc([swapCandidate(1_699_000_000)]).asConnection(),
+      POOL,
+      { forceRefresh: true, scanLimit: 50 },
+    );
+    assert.equal(older.lastSwapUnixTs, 1_699_000_000, "the later refresh landed OLDER than the retained anchor");
+    assert.equal(older.regressionDetected, true, "the older re-derivation is flagged as a regression");
+    assert.equal(ix.size, 0, "the older result was not promoted to current evidence");
+
+    // The console run consumes the indexer's CURRENT result: the fresh
+    // derivation against this discovery RPC regresses again and the
+    // shared gate rejects the flagged record — no C1 anchor is seeded.
+    const artifact = await runConsoleSnapshot({
+      discovery: new SnapshotRpc([swapCandidate(1_699_000_000)]),
+      fetchPools: [POOL],
+      activityIndexer: ix,
+    });
+    const pool = artifact.pools[0]!;
+    assert.equal(pool.lastSwap, null, "the regressed older anchor never becomes the C1 last-swap record");
+    assert.equal(pool.criteria.c1Inactivity, "pending", "C1 cannot evaluate on regressed evidence");
+    const failure = poolFailure(artifact);
+    assert.ok(failure, "the regressed rejection is recorded for observability");
+    assert.ok(failure!.reason.includes("regressed_evidence"), failure!.reason);
+  });
+
+  test("future-dated evidence is excluded: a negative derivation age cannot pass the shared gate", async () => {
+    // SYNTHETIC (labeled): a REAL verified derivation whose derivation
+    // timestamp is pushed past the evaluation clock. The freshness check
+    // used to pass such records with a negative age; a future-dated
+    // derivation is invalid evidence, so C1 must never seed from it.
+    const verified = await deriveVerified();
+    const future: ActivityEvidence = {
+      ...verified,
+      derivation: { ...verified.derivation, derivedAtUnixMs: Date.now() + 3_600_000 },
+    };
+    const artifact = await runConsoleSnapshot({
+      fetchPools: [POOL],
+      activityIndexer: stubIndexer(new Map([[POOL.toBase58(), future]])),
+    });
+    const pool = artifact.pools[0]!;
+    assert.equal(pool.lastSwap, null, "future-dated evidence cannot seed a C1 anchor");
+    assert.equal(pool.criteria.c1Inactivity, "pending");
+    const failure = poolFailure(artifact);
+    assert.ok(failure, "the future-dated rejection is recorded");
+    assert.ok(failure!.reason.includes("malformed_evidence"), failure!.reason);
   });
 });
