@@ -19,6 +19,13 @@
 //   * the explicit attestation gate rejects missing, malformed,
 //     incomplete, non-definitive and stale evidence — including at the
 //     real `cmdCollect` issuance path (no bundle, no devnet contact).
+//
+// Correction 003 coverage (on top of the corrected canonical SDK pin):
+//   * derivationKind mirrors the evidence state — verified → "swap",
+//     no_swap_in_scan → "no_swap", incomplete → "unresolved"; a no-swap
+//     or unresolved record is never represented as a verified economic
+//     swap, and the attestation gate rejects mislabeled records in both
+//     directions.
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -244,6 +251,31 @@ describe("ActivityIndexerLive × canonical SDK evidence (IMPL-001)", () => {
     assert.equal(evidence.derivation.source, "deriveLastSwapEvidenceV4");
     assert.equal(evidence.derivation.signaturesScanned, 1, "records the ACTUAL scan size");
     assert.equal(evidence.derivation.scanReachedHistoryEnd, true);
+  });
+
+  test("derivationKind mirrors the evidence state (never a verified-swap label otherwise)", async () => {
+    // Verified economic swap: labeled "swap" — the canonical economic-swap
+    // derivation, never a bare amm-touch.
+    const verified = await indexer().indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(verified.evidenceStatus, "verified");
+    assert.equal(verified.derivationKind, "swap");
+
+    // Definitive no-swap in a complete scan: NOT represented as a swap.
+    const depositResponse = withTag(swapV2Outer, 3); // Deposit
+    const noSwap = await indexer().indexActivity(
+      new FakeRpc([{ signature: swapV2Outer.signature, response: depositResponse }]).asConnection(),
+      POOL,
+      { scanLimit: 50 },
+    );
+    assert.equal(noSwap.evidenceStatus, "no_swap_in_scan");
+    assert.equal(noSwap.derivationKind, "no_swap", "a definitive no-swap is labeled no_swap");
+    assert.notEqual(noSwap.derivationKind, "swap");
+
+    // Incomplete evidence: unresolved — never represented as a swap.
+    const incomplete = await indexer().indexActivity(incompleteRpc().asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(incomplete.evidenceStatus, "incomplete");
+    assert.equal(incomplete.derivationKind, "unresolved", "incomplete evidence is labeled unresolved");
+    assert.notEqual(incomplete.derivationKind, "swap");
   });
 
   test("liquidity operation does not reset inactivity (explicit no-swap, not a swap)", async () => {
@@ -568,6 +600,36 @@ describe("Correction 002 §2 — attestation gate", () => {
       ],
     ];
     for (const [record, what] of malformed) {
+      const gate = evaluateAttestationGate(record, { maxAgeMs: DEFAULT_ACTIVITY_TTL_MS });
+      assert.equal(gate.ok, false, `gate must reject: ${what}`);
+      assert.ok(!gate.ok);
+      assert.equal(gate.reason, "malformed_evidence", what);
+    }
+  });
+
+  test("rejects evidence whose derivationKind misrepresents the state (Correction 003)", async () => {
+    const verified = await indexer().indexActivity(verifiedRpc().asConnection(), POOL, { scanLimit: 50 });
+    const incomplete = await indexer().indexActivity(incompleteRpc().asConnection(), POOL, { scanLimit: 50 });
+    const depositResponse = withTag(swapV2Outer, 3);
+    const noSwap = await indexer().indexActivity(
+      new FakeRpc([{ signature: swapV2Outer.signature, response: depositResponse }]).asConnection(),
+      POOL,
+      { scanLimit: 50 },
+    );
+    assert.equal(noSwap.evidenceStatus, "no_swap_in_scan");
+
+    // Both mislabeling directions are malformed: a non-verified record
+    // labeled "swap" would present no-swap or unresolved evidence as a
+    // verified economic swap; a verified record carrying another label is
+    // equally inconsistent with its own state.
+    const mislabeled: Array<[ActivityEvidence, string]> = [
+      [{ ...incomplete, derivationKind: "swap" }, "incomplete labeled as swap"],
+      [{ ...noSwap, derivationKind: "swap" }, "definitive no-swap labeled as swap"],
+      [{ ...verified, derivationKind: "unresolved" }, "verified labeled as unresolved"],
+      [{ ...verified, derivationKind: "no_swap" }, "verified labeled as no_swap"],
+      [{ ...verified, derivationKind: "unknown" as unknown as ActivityEvidence["derivationKind"] }, "unknown label"],
+    ];
+    for (const [record, what] of mislabeled) {
       const gate = evaluateAttestationGate(record, { maxAgeMs: DEFAULT_ACTIVITY_TTL_MS });
       assert.equal(gate.ok, false, `gate must reject: ${what}`);
       assert.ok(!gate.ok);

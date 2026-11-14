@@ -71,9 +71,18 @@ export interface ActivityEvidence {
   evidenceStatus: ActivityEvidenceStatus;
   /** True when this record is a sound basis for an inactivity claim. */
   definitive: boolean;
-  /** Transitional derivation labeling per Deliverable 3 §7: the record
-   *  reflects a verified economic swap (never a bare amm-touch). */
-  derivationKind: "swap";
+  /** Derivation labeling per Deliverable 3 §7 (IMPL-001 Correction 003):
+   *  what this record's derivation ACTUALLY established — it mirrors the
+   *  evidence state and never misrepresents it:
+   *    "swap"       — a verified economic swap anchor (never a bare
+   *                   amm-touch); the record carries a last-swap anchor;
+   *    "no_swap"    — a definitive scan that established no economic swap
+   *                   in the covered history (no swap anchor exists);
+   *    "unresolved" — incomplete evidence; no swap determination exists.
+   *  Only `evidenceStatus === "verified"` records are labeled "swap" —
+   *  a no-swap or unresolved record is never represented as a verified
+   *  swap. */
+  derivationKind: "swap" | "no_swap" | "unresolved";
   /** Derivation context. */
   derivation: {
     cluster: Cluster;
@@ -90,6 +99,27 @@ export interface ActivityEvidence {
   };
   /** Set when a re-derivation returned an older swap than the cache. */
   regressionDetected: boolean;
+}
+
+/**
+ * Derivation labeling for a D4/D5 evidence status (Deliverable 3 §7,
+ * IMPL-001 Correction 003): the label mirrors the evidence state —
+ * "swap" ONLY for verified evidence, "no_swap" for a definitive
+ * no_swap_in_scan determination, "unresolved" for incomplete evidence.
+ * Exhaustive over `ActivityEvidenceStatus`: a future status literal
+ * cannot silently inherit the verified-swap label.
+ */
+export function derivationKindFor(
+  status: ActivityEvidenceStatus,
+): ActivityEvidence["derivationKind"] {
+  switch (status) {
+    case "verified":
+      return "swap";
+    case "no_swap_in_scan":
+      return "no_swap";
+    case "incomplete":
+      return "unresolved";
+  }
 }
 
 interface CacheEntry {
@@ -180,7 +210,7 @@ export class ActivityIndexerLive {
       noSwapFound: result.status === "no_swap_in_scan",
       evidenceStatus: result.status,
       definitive: result.definitive,
-      derivationKind: "swap",
+      derivationKind: derivationKindFor(result.status),
       derivation: {
         cluster: this.cluster,
         endpointKind: endpointKindFor(this.rpcUrl),
@@ -267,8 +297,10 @@ export class ActivityIndexerLive {
 // inactivity criterion (console snapshot). The gate rejects:
 //   * missing evidence (no record at all),
 //   * malformed evidence (wrong types, invalid status literals, a
-//     verified claim without a last-swap anchor, or a non-verified record
-//     carrying a smuggled last-swap timestamp),
+//     verified claim without a last-swap anchor, a non-verified record
+//     carrying a smuggled last-swap timestamp, or a record whose
+//     derivationKind does not mirror its evidenceStatus — a non-verified
+//     record is never labeled as a verified economic swap),
 //   * incomplete evidence (never a basis for inactivity),
 //   * non-definitive evidence (no_swap_in_scan and anything else that is
 //     not a verified last swap),
@@ -318,10 +350,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
  * Evaluate the attestation gate for a last-swap evidence record
  * (Correction 002 §2). Property names and shapes are validated against
  * the ACTUAL `ActivityEvidence` implementation:
- * `evidenceStatus: ActivityEvidenceStatus` and `definitive: boolean`.
+ * `evidenceStatus: ActivityEvidenceStatus`, `definitive: boolean` and
+ * `derivationKind` (which must mirror `evidenceStatus` — Correction 003).
  * A record passes only when it is present, well-formed,
- * `evidenceStatus === "verified"`, `definitive === true`, carries a real
- * last-swap anchor, and is fresh under `opts.maxAgeMs`.
+ * `evidenceStatus === "verified"`, `definitive === true`, labeled
+ * `derivationKind === "swap"`, carries a real last-swap anchor, and is
+ * fresh under `opts.maxAgeMs`.
  */
 export function evaluateAttestationGate(
   activity: ActivityEvidence | null | undefined,
@@ -420,6 +454,20 @@ export function evaluateAttestationGate(
     return reject(
       "malformed_evidence",
       `non-verified evidence must carry zeroed last-swap fields, got ts=${JSON.stringify(a.lastSwapUnixTs)} sig=${JSON.stringify(a.lastSwapSignature)}`,
+    );
+  }
+
+  // Derivation-label consistency (IMPL-001 Correction 003): the record's
+  // derivationKind must mirror its evidenceStatus. A non-verified record
+  // labeled "swap" is the exact misrepresentation that would present
+  // no-swap or unresolved evidence as a verified economic swap; the
+  // reverse mislabeling is equally malformed. The gate rejects both
+  // directions — the label can never imply a verified swap that the
+  // evidence state does not establish.
+  if (a.derivationKind !== derivationKindFor(status as ActivityEvidenceStatus)) {
+    return reject(
+      "malformed_evidence",
+      `derivationKind ${JSON.stringify(a.derivationKind)} does not match evidenceStatus ${JSON.stringify(status)} (expected ${JSON.stringify(derivationKindFor(status as ActivityEvidenceStatus))})`,
     );
   }
 
