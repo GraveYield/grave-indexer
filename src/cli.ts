@@ -20,7 +20,11 @@ import { loadPipelineConfig, type PipelineConfig } from "./config.js";
 import { discoverRaydiumV4Pools } from "./discovery.js";
 import { IngestLedger } from "./ingest.js";
 import { HealthRegistry } from "./health.js";
-import { ActivityIndexerLive } from "./activityLive.js";
+import {
+  ActivityIndexerLive,
+  DEFAULT_ACTIVITY_TTL_MS,
+  evaluateAttestationGate,
+} from "./activityLive.js";
 import { runEvidencePathVerification } from "./evidencePath.js";
 import { issueEvidenceBundle } from "./issue.js";
 import { verifyEvidenceBundle, summarizeVerifyResult } from "./verify.js";
@@ -39,6 +43,12 @@ const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
 const REPORT_FILE = "verify-path-report.json";
 const HEALTH_FILE = "health-snapshot.json";
+
+/** Attestation freshness policy for the collect path (IMPL-001 Correction
+ *  002 §2): the same bound as the activity cache TTL — evidence older
+ *  than this has not been successfully refreshed under the existing
+ *  freshness policy and is rejected by the gate instead of attested. */
+const ATTESTATION_FRESHNESS_MAX_AGE_MS = DEFAULT_ACTIVITY_TTL_MS;
 
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8" });
@@ -165,14 +175,32 @@ export async function cmdVerifyPath(
   return report.allPass ? 0 : 1;
 }
 
-/** `collect` — issue + verify a real evidence bundle for a live pool. */
+/** `collect` — issue + verify a real evidence bundle for a live pool.
+ *
+ *  IMPL-001 Correction 002 §2: every pool's activity record must pass the
+ *  explicit attestation gate (`evaluateAttestationGate`) before issuance.
+ *  Only `evidenceStatus === "verified" && definitive === true` records
+ *  that are well-formed and fresh pass; incomplete, non-definitive,
+ *  missing, malformed and stale evidence skips the pool with no bundle
+ *  issued and no fallback to any previous timestamp.
+ */
 export async function cmdCollect(
   config: PipelineConfig,
-  opts: { pool?: string | undefined; useEphemeralOracle?: boolean | undefined; maxCandidates?: number | undefined },
+  opts: {
+    pool?: string | undefined;
+    useEphemeralOracle?: boolean | undefined;
+    maxCandidates?: number | undefined;
+    /** Test/diagnostic seam: inject connections instead of dialing the
+     *  configured endpoints. Production callers never pass these. */
+    discoveryConnection?: Connection | undefined;
+    verificationConnection?: Connection | undefined;
+  },
 ): Promise<number> {
   const health = new HealthRegistry();
-  const discoveryConn = new Connection(config.discoveryRpcUrl, "confirmed");
-  const devnetConn = new Connection(config.verificationRpcUrl, "confirmed");
+  const discoveryConn =
+    opts.discoveryConnection ?? new Connection(config.discoveryRpcUrl, "confirmed");
+  const devnetConn =
+    opts.verificationConnection ?? new Connection(config.verificationRpcUrl, "confirmed");
   mkdirSync(config.dataDir, { recursive: true });
   mkdirSync(join(config.dataDir, "evidence"), { recursive: true });
 
@@ -240,14 +268,17 @@ export async function cmdCollect(
       console.log(`[skip] ${poolStr}: activity derivation failed — ${String((err as Error).message ?? err).slice(0, 80)}`);
       continue;
     }
-    if (activity.noSwapFound || activity.lastSwapUnixTs <= 0) {
-      // IMPL-001: incomplete evidence is reported as such — it must never
-      // be presented as an observed "no swap" fact (Deliverable 3 §8).
-      const reason =
-        activity.evidenceStatus === "incomplete"
-          ? `incomplete evidence (${activity.derivation.signaturesScanned} signatures scanned, ${activity.derivation.scanReachedHistoryEnd ? "history end reached" : "bounded scan"}, unresolved candidates present) — cannot attest a last-swap time`
-          : `no swap found in the last ${config.signatureScanLimit} signatures — cannot attest a last-swap time`;
-      console.log(`[skip] ${poolStr}: ${reason}`);
+    // IMPL-001 Correction 002 §2 — explicit attestation gate (flow
+    // control, not logging): only VERIFIED, DEFINITIVE, well-formed,
+    // fresh evidence can support an inactivity attestation. Incomplete,
+    // non-definitive, missing, malformed and stale records are rejected
+    // here; the pool is skipped and NOTHING is issued — the failure path
+    // never falls back to a previous timestamp.
+    const gate = evaluateAttestationGate(activity, {
+      maxAgeMs: ATTESTATION_FRESHNESS_MAX_AGE_MS,
+    });
+    if (!gate.ok) {
+      console.log(`[skip] ${poolStr}: attestation gate rejected the evidence (${gate.reason}) — ${gate.detail}`);
       continue;
     }
 
@@ -416,9 +447,22 @@ export async function cmdConsoleSnapshot(
           }),
       ]);
       const lastSwap =
-        activity && !activity.noSwapFound && activity.lastSwapUnixTs > 0
+        activity &&
+        activity.evidenceStatus === "verified" &&
+        activity.definitive === true &&
+        activity.lastSwapUnixTs > 0
           ? { unixTs: activity.lastSwapUnixTs, slot: activity.lastSwapSlot, signature: activity.lastSwapSignature }
           : null;
+      if (activity && activity.evidenceStatus === "incomplete") {
+        // Correction 002 §1.5: incomplete evidence can never seed the C1
+        // inactivity criterion — the pool stays without a lastSwap and the
+        // gap is recorded for observability instead of being papered over.
+        failures.push({
+          stage: "activity",
+          pool: address,
+          reason: `incomplete evidence — inactivity (C1) not evaluable from this derivation (${activity.derivation.signaturesScanned} signatures scanned)`,
+        });
+      }
       enrichments.set(address, {
         wsolReserveLamports: wsolBal.value.amount,
         memecoinReserveRaw: memecoinBal.value.amount,

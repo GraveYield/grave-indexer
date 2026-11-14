@@ -22,6 +22,22 @@ export async function issueEvidenceBundle(
   oracle: OracleSigner,
   input: EvidenceIssuanceInput,
 ): Promise<EvidenceBundle> {
+  // IMPL-001 Correction 002 §2 — issuance-boundary guard (defense in
+  // depth behind the collect-path attestation gate): an inactivity
+  // attestation can only be anchored on a real, verified last swap.
+  // Missing/zeroed anchors are rejected here so no caller can issue an
+  // attestation without passing through the verified-evidence contract.
+  if (
+    !Number.isSafeInteger(input.lastSwapUnixTs) ||
+    (input.lastSwapUnixTs as number) <= 0 ||
+    typeof input.lastSwapSignature !== "string" ||
+    input.lastSwapSignature === ""
+  ) {
+    throw new Error(
+      "refusing to issue an inactivity attestation without a verified last-swap anchor " +
+        "(lastSwapUnixTs > 0 and a non-empty lastSwapSignature are required)",
+    );
+  }
   const issuedSlot =
     input.issuedSlot ?? Math.max(1, Number(await connection.getSlot("finalized")) - 4);
   const slotHash = await fetchSlotHash(connection, issuedSlot);
