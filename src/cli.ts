@@ -44,11 +44,32 @@ const SUMMARY_FILE = "discovery-summary.json";
 const REPORT_FILE = "verify-path-report.json";
 const HEALTH_FILE = "health-snapshot.json";
 
-/** Attestation freshness policy for the collect path (IMPL-001 Correction
- *  002 §2): the same bound as the activity cache TTL — evidence older
- *  than this has not been successfully refreshed under the existing
- *  freshness policy and is rejected by the gate instead of attested. */
-const ATTESTATION_FRESHNESS_MAX_AGE_MS = DEFAULT_ACTIVITY_TTL_MS;
+/** Evidence freshness policy shared by BOTH evidence-consuming paths
+ *  (IMPL-001 Correction 002 §2, and the C1 unification): a last-swap
+ *  derivation older than this is rejected as stale — by the shared
+ *  `evaluateAttestationGate` on the collect/attestation path AND by the
+ *  same gate on the C1 console-snapshot path. The bound is the
+ *  established activity-cache TTL (`DEFAULT_ACTIVITY_TTL_MS`); no
+ *  separate TTL is defined for C1.
+ *
+ *  Deliberately DISTINCT from two neighbouring concepts:
+ *    * CACHE RETENTION — how long a definitive result stays in the
+ *      indexer's TTL cache. The same constant, but a different concept:
+ *      retention governs when a re-derivation happens; freshness governs
+ *      whether a record may be used at all.
+ *    * ARTIFACT freshness — the console snapshot's `--max-age-hours`
+ *      budget (default 24 h) after which the console must label the
+ *      rendered artifact stale. That budget applies to the artifact as a
+ *      whole and can never admit evidence the evidence-freshness policy
+ *      rejects.
+ *  Diagnostic evidence (last-known definitive records retained across an
+ *  incomplete refresh) carries its ORIGINAL derivation timestamp, so it
+ *  ages out under this policy exactly like any other record — it cannot
+ *  bypass freshness validation on either path.
+ *
+ *  Exported so tests can pin the single shared threshold (no new TTL, and
+ *  the exact same bound on the collect and C1 paths). */
+export const EVIDENCE_FRESHNESS_MAX_AGE_MS = DEFAULT_ACTIVITY_TTL_MS;
 
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8" });
@@ -178,7 +199,7 @@ export async function cmdVerifyPath(
 /** `collect` — issue + verify a real evidence bundle for a live pool.
  *
  *  IMPL-001 Correction 002 §2: every pool's activity record must pass the
- *  explicit attestation gate (`evaluateAttestationGate`) before issuance.
+ *  explicit evidence gate (`evaluateAttestationGate`) before issuance.
  *  Only `evidenceStatus === "verified" && definitive === true` records
  *  that are well-formed and fresh pass; incomplete, non-definitive,
  *  missing, malformed and stale evidence skips the pool with no bundle
@@ -268,14 +289,16 @@ export async function cmdCollect(
       console.log(`[skip] ${poolStr}: activity derivation failed — ${String((err as Error).message ?? err).slice(0, 80)}`);
       continue;
     }
-    // IMPL-001 Correction 002 §2 — explicit attestation gate (flow
+    // IMPL-001 Correction 002 §2 — explicit evidence gate (flow
     // control, not logging): only VERIFIED, DEFINITIVE, well-formed,
     // fresh evidence can support an inactivity attestation. Incomplete,
     // non-definitive, missing, malformed and stale records are rejected
     // here; the pool is skipped and NOTHING is issued — the failure path
-    // never falls back to a previous timestamp.
+    // never falls back to a previous timestamp. This is the SAME gate the
+    // C1 console-snapshot path applies (single evidence-integrity
+    // standard across collection, attestation and snapshots).
     const gate = evaluateAttestationGate(activity, {
-      maxAgeMs: ATTESTATION_FRESHNESS_MAX_AGE_MS,
+      maxAgeMs: EVIDENCE_FRESHNESS_MAX_AGE_MS,
     });
     if (!gate.ok) {
       console.log(`[skip] ${poolStr}: attestation gate rejected the evidence (${gate.reason}) — ${gate.detail}`);
@@ -373,19 +396,45 @@ function indexerGitHead(): string | null {
  * `console-snapshot` — produce the typed, secret-free console artifact
  * (P3-A Task 3.1). Real mainnet Raydium V4 facts + deployed-ProtocolConfig
  * thresholds, fail-closed. Read-only; no keys involved.
+ *
+ * Evidence integrity (C1 unification): a derivation seeds the C1
+ * last-swap anchor ONLY when it passes the SAME shared
+ * `evaluateAttestationGate` the collect/attestation path applies — one
+ * evidence-integrity standard across collection, attestation and
+ * snapshots. Incomplete, non-verified (e.g. a definitive no-swap scan),
+ * mislabeled, malformed, missing and stale records never become a C1
+ * anchor; the pool renders with no lastSwap (C1 "pending") and the
+ * anomalous rejections are recorded in `failures` for observability.
+ * Freshness uses the shared `EVIDENCE_FRESHNESS_MAX_AGE_MS` bound — NOT
+ * the artifact's `--max-age-hours` budget, which only governs how long
+ * the console may render the artifact before labelling it stale.
  */
 export async function cmdConsoleSnapshot(
   config: PipelineConfig,
-  opts: { maxPools: number; enrich: number; maxAgeHours: number },
+  opts: {
+    maxPools: number;
+    enrich: number;
+    maxAgeHours: number;
+    /** Test/diagnostic seams (mirrors `cmdCollect`): inject the discovery
+     *  connection, the verification connection, the discovery
+     *  getProgramAccounts transport, or the activity indexer instead of
+     *  dialing the configured endpoints. Production callers never pass
+     *  these. */
+    discoveryConnection?: Connection | undefined;
+    verificationConnection?: Connection | undefined;
+    discoveryFetchImpl?: typeof fetch | undefined;
+    activityIndexer?: ActivityIndexerLive | undefined;
+  },
 ): Promise<number> {
-  const conn = new Connection(config.discoveryRpcUrl, "confirmed");
+  const conn = opts.discoveryConnection ?? new Connection(config.discoveryRpcUrl, "confirmed");
   const health = new HealthRegistry();
   const failures: ConsoleSnapshotFailure[] = [];
 
   // ---- Thresholds: read from the DEPLOYED ProtocolConfig — never hardcoded.
   // The deployed scanner lives on the VERIFICATION cluster (devnet); the
   // discovery corpus is mainnet. Two connections, one artifact.
-  const devnetConn = new Connection(config.verificationRpcUrl, "confirmed");
+  const devnetConn =
+    opts.verificationConnection ?? new Connection(config.verificationRpcUrl, "confirmed");
   const [configPda] = await PublicKey.findProgramAddress(
     [Buffer.from("protocol_config")],
     config.scannerProgramId,
@@ -411,6 +460,7 @@ export async function cmdConsoleSnapshot(
     rpcUrl: config.discoveryRpcUrl,
     maxPools: opts.maxPools,
     mode: "identity-slice",
+    ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
   });
   health.recordSuccess("rpc-discovery", Date.now() - t0);
   const supported = run.records
@@ -422,10 +472,12 @@ export async function cmdConsoleSnapshot(
   );
 
   // ---- Per-pool enrichment: vault reserves, LP supply, memecoin decimals, last swap.
-  const activityIndexer = new ActivityIndexerLive({
-    cluster: config.discoveryCluster,
-    rpcUrl: config.discoveryRpcUrl,
-  });
+  const activityIndexer =
+    opts.activityIndexer ??
+    new ActivityIndexerLive({
+      cluster: config.discoveryCluster,
+      rpcUrl: config.discoveryRpcUrl,
+    });
   const enrichments = new Map<string, PoolEnrichment>();
   for (const record of targets) {
     const address = record.poolAddress.toBase58();
@@ -446,21 +498,40 @@ export async function cmdConsoleSnapshot(
             return null;
           }),
       ]);
-      const lastSwap =
-        activity &&
-        activity.evidenceStatus === "verified" &&
-        activity.definitive === true &&
-        activity.lastSwapUnixTs > 0
-          ? { unixTs: activity.lastSwapUnixTs, slot: activity.lastSwapSlot, signature: activity.lastSwapSignature }
-          : null;
-      if (activity && activity.evidenceStatus === "incomplete") {
-        // Correction 002 §1.5: incomplete evidence can never seed the C1
-        // inactivity criterion — the pool stays without a lastSwap and the
-        // gap is recorded for observability instead of being papered over.
+      // Shared evidence gate (IMPL-001): the SAME `evaluateAttestationGate`
+      // the collect/attestation path applies decides whether a derivation
+      // may seed the C1 last-swap anchor. Only VERIFIED, DEFINITIVE,
+      // well-formed, FRESH evidence passes; incomplete, non-verified
+      // (e.g. a definitive no-swap scan), mislabeled, malformed, missing
+      // and stale records are excluded — the pool stays without a
+      // lastSwap anchor and C1 renders "pending" instead of evaluating on
+      // weak evidence. In particular, stale verified evidence (older than
+      // the shared freshness bound) can no longer enter C1 — the previous
+      // manual condition checked status/definitive/timestamp but had NO
+      // freshness check at all.
+      const gate = evaluateAttestationGate(activity, {
+        maxAgeMs: EVIDENCE_FRESHNESS_MAX_AGE_MS,
+      });
+      const lastSwap = gate.ok
+        ? {
+            unixTs: gate.activity.lastSwapUnixTs,
+            slot: gate.activity.lastSwapSlot,
+            signature: gate.activity.lastSwapSignature,
+          }
+        : null;
+      if (activity !== null && !gate.ok && gate.reason !== "not_verified") {
+        // Observability (Correction 002 §1.5): record WHY no anchor was
+        // established. A definitive no_swap_in_scan is an honest, complete
+        // determination that simply carries no swap anchor — not a
+        // pipeline failure — so it is excluded without a failure record
+        // (reason "not_verified"). Every other rejection is anomalous and
+        // recorded: incomplete (C1 not evaluable from this derivation),
+        // stale, malformed/mislabeled, non-definitive. Missing evidence
+        // (activity === null) was already recorded by the catch above.
         failures.push({
           stage: "activity",
           pool: address,
-          reason: `incomplete evidence — inactivity (C1) not evaluable from this derivation (${activity.derivation.signaturesScanned} signatures scanned)`,
+          reason: `evidence gate rejected the derivation (${gate.reason}) — ${gate.detail}`,
         });
       }
       enrichments.set(address, {
