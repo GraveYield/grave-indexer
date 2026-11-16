@@ -1,6 +1,6 @@
 # ORACLE_PIPELINE.md — Phase 2: Raydium V4 discovery + evidence pipeline
 
-Repository: `GraveYield/grave-indexer` · Ground truth: `graveyield-protocol @ d526699`
+Repository: `GraveYield/grave-indexer` · Ground truth: `graveyield-protocol @ 2a8aac19`
 (vendored, pinned as a git submodule at `vendor/protocol`; NS-3 identity sync — the
 wire-format layout documentation below was originally verified at `5b84440` and
 re-verified unchanged at the NS-3 pin: identities moved, layouts did not)
@@ -24,7 +24,7 @@ re-orders, or "fixes" a wire format.
 
 ## 2. The actual on-chain oracle interface (as implemented — inspected, not invented)
 
-Everything below was read from `graveyield-protocol` source (originally at `5b84440`, re-verified at the NS-3 pin `d526699`)
+Everything below was read from `graveyield-protocol` source (originally at `5b84440`, re-verified at the NS-3 pin `2a8aac19`)
 (`programs/grave-scanner/src/attestation.rs`, `instructions/evaluate_pool_phase1.rs`,
 `instructions/record_launch_price.rs`, `state/protocol_config.rs`) and cross-checked
 against the SDK mirror (`sdk/src/lastSwapAttestation.ts`, `sdk/src/launchPriceAttestation.ts`).
@@ -112,7 +112,7 @@ unverified. **Consequence:** a valid attestation from any other key reverts 6026
 — the pipeline's `oracle-gated` outcome. Registering a dedicated oracle key
 (`update_protocol_config`, authority-signed) is an owner-gated action; see §6.4.
 
-### 2.5 NS-3 oracle identity arrangement (assigned 2026-11-04, deployment PENDING)
+### 2.5 NS-3 oracle identity arrangement (assigned 2026-11-04; deployed and oracle-registered 2026-11-12)
 
 The NS-3 identities (owner-generated, owner-held keypairs; DR-002) separate
 every privileged role — the single-key concentration that ended NS-1 and NS-2
@@ -139,8 +139,10 @@ scripts/devnet/protocol_admin.mjs`):
    (`--fee-payer`), readback-asserted.
 3. Only then does the evidence path attest against NS-3 end-to-end.
 
-Until step 1 exists on chain, nothing on devnet answers at the NS-3
-addresses; the read-only smoke suites report the pending state explicitly.
+Steps 1–2 were executed on devnet on 2026-11-12 (deployment + oracle
+registration; transaction signatures recorded in `graveyield-protocol/docs/DEVNET.md`).
+Until the live oracle path is exercised end-to-end (step 3), the read-only
+smoke suites still report per their runtime deployment-state gating.
 §2.4 above remains the historical NS-2 record, preserved verbatim.
 
 ## 3. Architecture

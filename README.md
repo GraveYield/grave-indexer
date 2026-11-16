@@ -6,7 +6,9 @@ Enumerates the Raydium V4 AMM corpus (mainnet-beta, read-only), preserves
 provenance and timestamps end to end, handles duplicate ingestion, detects
 stale and conflicting data, exposes operational health, and produces oracle
 evidence that is byte-compatible with the on-chain GraveScanner attestation
-contract (ORACLE-002) — verified against the live devnet deployment.
+contract (ORACLE-002) — verified against the NS-2 devnet deployment (the
+committed live artifact records the NS-2 identities; the matrix re-runs
+against the NS-3 identities once the live oracle path is exercised).
 
 **Read `docs/ORACLE_PIPELINE.md` first** — it documents the as-implemented
 on-chain oracle interface (inspected from `graveyield-protocol` source, not
@@ -16,7 +18,7 @@ revocation / monitoring / downtime runbook.
 ## Layout
 
 ```
-vendor/protocol/     git submodule → GraveYield/graveyield-protocol @ d526699 (NS-3)
+vendor/protocol/     git submodule → GraveYield/graveyield-protocol @ 2a8aac19 (NS-3)
                      (the SDK inside it is the single source of truth for
                       every wire format; this repo never forks one)
 src/
@@ -32,8 +34,10 @@ src/
   journal.ts         operator-side replay guard (JSONL, append-only)
   evidencePath.ts    the live verification matrix vs the deployed scanner
   health.ts          per-stage health registry (ok/degraded/failing)
-  cli.ts             discover | collect | verify-path | health
-test/                49 offline tests + DEVNET_RPC_URL-gated live smoke
+  cli.ts             discover | collect | verify-path | health | console-snapshot
+                     (console-snapshot: typed, secret-free artifact for the
+                      console /api/gy/snapshot consumer)
+test/                126 offline tests + 3 DEVNET_RPC_URL-gated live smoke
 examples/            live artifacts (secret-free by construction)
 ```
 
@@ -41,7 +45,7 @@ examples/            live artifacts (secret-free by construction)
 
 ```bash
 pnpm install                 # workspace includes vendor/protocol/sdk
-pnpm test                    # build SDK + offline battery (49 tests)
+pnpm test                    # build SDK + offline battery (126 offline tests + 3 gated)
 pnpm run cli discover        # one Raydium V4 discovery cycle (mainnet)
 pnpm run cli collect --use-ephemeral-oracle   # issue + verify evidence
 pnpm run cli verify-path     # full devnet evidence-path matrix

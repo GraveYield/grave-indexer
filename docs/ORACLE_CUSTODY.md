@@ -30,7 +30,7 @@ canonical attestations verify. Until then every attestation fails closed with
 
 | Role | Public key | Role in `register-oracle` |
 | --- | --- | --- |
-| GraveScanner program | `EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL` | target of `update_protocol_config` (NS-3, DR-002 — **deployment pending**; this runbook applies once the owner executes the deployment recorded in `graveyield-protocol/docs/DEVNET.md`. The NS-2 deployment `CuQZes…Ao54` is a preserved legacy record — never re-point at it.) |
+| GraveScanner program | `EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL` | target of `update_protocol_config` (NS-3, DR-002 — **deployed and accepted on-chain 2026-11-12**; see `graveyield-protocol/docs/DEVNET.md` for the deployment + oracle-registration record this runbook applies to. The NS-2 deployment `CuQZes…Ao54` is a preserved legacy record — never re-point at it.) |
 | ProtocolConfig PDA | `5PK9pz4FcmiWGG3h81WquD2QpwuEj2GeAXxLGGMJkKKe` (`["protocol_config"]`, bump 255) | account updated by the instruction |
 | Governance authority | `BMnrpx9mSZDzCmM8aJipnzgfLzfxa5tfFgWi3ZvBUwf5` | initial and permanent ProtocolConfig authority (`has_one = authority`); the ONLY instruction-level signer |
 | Deployer | `cfJKAzSpYhoKheLWzx7miTHp6HCt46E3oeU3CBo4831` | transaction FEE PAYER only; holds the program upgrade authority but is NOT the config authority |

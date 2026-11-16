@@ -40,11 +40,12 @@
 //      always; program-level cases only when the deployment is ready AND
 //      a funded payer is available — never via an implicit faucet).
 //
-// Deployment: NS-3 (DR-002) — the program IDs are ASSIGNED but NOT yet
-// deployed or initialized. Until the owner executes the NS-3 deployment
-// (graveyield-protocol docs/DEVNET.md), Case 1 applies and the suite
-// reports the pending condition explicitly. The NS-2 deployment is a
-// preserved legacy record — do NOT re-point at it.
+// Deployment: NS-3 (DR-002) — deployed and accepted on-chain 2026-11-12
+// (graveyield-protocol docs/DEVNET.md). The suite resolves the actual
+// deployment state at runtime: if a deployment is absent on the targeted
+// cluster, Case 1 applies and the pending condition is reported
+// explicitly. The NS-2 deployment is a preserved legacy record — do NOT
+// re-point at it.
 //
 // Mirrors sdk/test/devnetSmoke.test.ts conventions.
 
