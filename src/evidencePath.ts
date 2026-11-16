@@ -4,10 +4,10 @@
 //
 // Runs the full verification matrix against the DEPLOYED devnet
 // GraveScanner (NS-3, assigned per DR-002:
-// EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL — deployment pending until
-// the owner executes it; the NS-2 deployment CuQZes…Ao54 is a preserved
-// legacy record) and against live chain data, producing a structured
-// pass/fail report.
+// EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL — deployed and accepted
+// on-chain 2026-11-12 per graveyield-protocol/docs/DEVNET.md; the NS-2
+// deployment CuQZes…Ao54 is a preserved legacy record) and against live
+// chain data, producing a structured pass/fail report.
 //
 // DEPLOYMENT GATING (review-enforced): the harness resolves the actual
 // program-account existence FIRST (src/deploymentState.ts). Program-level

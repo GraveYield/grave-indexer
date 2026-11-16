@@ -21,12 +21,12 @@
 import { PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 
-/** NS-3 GraveScanner program ID (assigned, DR-002; deployment pending). */
+/** NS-3 GraveScanner program ID (assigned, DR-002; deployed and accepted 2026-11-12 — see graveyield-protocol docs/DEVNET.md). */
 export const DEVNET_SCANNER_PROGRAM_ID = new PublicKey(
   "EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL",
 );
 
-/** NS-3 GraveVault program ID (assigned, DR-002; deployment pending). */
+/** NS-3 GraveVault program ID (assigned, DR-002; deployed and accepted 2026-11-12 — see graveyield-protocol docs/DEVNET.md). */
 export const DEVNET_VAULT_PROGRAM_ID = new PublicKey(
   "7VxUGJNgi1bZ8x4rTtLBNdgLs9sCLmUTpVE3on1nshya",
 );
