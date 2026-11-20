@@ -286,8 +286,19 @@ export async function cmdCollect(
     // starts. Fail closed: no bundle, no attestation, no fallback — the
     // pool is skipped and the refusal is recorded (machine-checkable via
     // the health registry's m1-sourcing failure counter).
+    //
+    // HEALTH ACCOUNTING (m1-sourcing): EVERY attempted sourcing
+    // validation records exactly one outcome — recordSuccess on an
+    // accepted identity, recordFailure on a rejection — so
+    // successes + failures equals the number of pools that reached the
+    // gate. A run with zero candidates records nothing and the component
+    // stays "degraded" (never-reported components are not ok): completing
+    // the command without any validation attempt must never mark sourcing
+    // healthy — health reflects actual validation outcomes only.
+    const tM1 = Date.now();
     try {
       assertM1Sourcing({ coinMint: identity.baseMint, pcMint: identity.quoteMint });
+      health.recordSuccess("m1-sourcing", Date.now() - tM1);
     } catch (err) {
       health.recordFailure("m1-sourcing", err);
       console.log(`[skip] ${poolStr}: m1-sourcing rejected — ${String((err as Error).message ?? err).slice(0, 100)}`);
