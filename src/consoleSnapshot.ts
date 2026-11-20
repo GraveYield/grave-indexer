@@ -1,7 +1,7 @@
 // console-snapshot — typed, secret-free console data contract (P3-A Task 3.1).
 //
 // Bridges the Phase 2 discovery/evidence pipeline to the GraveYield console:
-// a `ConsoleSnapshotV1` artifact carries REAL mainnet Raydium V4 pool facts
+// a `ConsoleSnapshotV2` artifact carries REAL mainnet Raydium V4 pool facts
 // (identity, vault reserves, LP supply, derived last-swap) with end-to-end
 // provenance, for the console to render with truthful freshness labelling.
 //
@@ -23,8 +23,9 @@ import { SCANNER_PROTOCOL_CONFIG_DEFAULTS } from "@graveyield/sdk";
 import type { Cluster } from "./provenance.js";
 import type { EndpointKind } from "./provenance.js";
 import type { DiscoveredPoolRecord } from "./discovery.js";
+import { assertM1Sourcing } from "./m1Sourcing.js";
 
-export const CONSOLE_SNAPSHOT_SCHEMA_VERSION = 1;
+export const CONSOLE_SNAPSHOT_SCHEMA_VERSION = 2;
 
 /** Criteria states the snapshot can express. Everything not derivable is "pending". */
 export type SnapshotCriterionState = "pass" | "fail" | "pending";
@@ -38,15 +39,29 @@ export interface SnapshotCriteria {
   c6MultiEpoch: "pending";
 }
 
-/** One enriched, salvage-funnel-supported pool. All amounts are exact decimal strings. */
+/** One enriched, M1-sourcing-eligible pool. All amounts are exact decimal strings. */
 export interface SnapshotPool {
   address: string;
   ammProgramId: string;
+  /** Raydium AmmInfo coin_mint (@400) — the base-side mint; non-WSOL for every emitted pool. */
+  coinMint: string;
+  /** Raydium AmmInfo pc_mint (@432) — the quote-side mint; WSOL for every emitted pool. */
+  pcMint: string;
   baseMint: string;
-  /** Always WSOL — supported pairs have exactly one WSOL side (7019 guard). */
+  /** Always WSOL here — the D-01 M1 sourcing gate only emits pc_mint-WSOL pools. */
   quoteMint: string;
   lpMint: string;
   wsolSide: { memecoinMint: string; coinIsWsol: boolean };
+  /**
+   * D-01 M1 sourcing assertion (GY-M1-ODR-001 §3), machine-checkable and
+   * retained in the artifact. Every pool that reaches this contract has
+   * PASSED the exact predicate — coin_mint non-WSOL, pc_mint WSOL,
+   * exactly one WSOL side — re-asserted by the builder (fail-closed: a
+   * record that cannot establish that orientation throws and is never
+   * emitted; rejected pools surface in `failures` under stage
+   * "m1-sourcing" and in `counts.m1SourcingRejected`).
+   */
+  m1Sourcing: { eligible: true; wsolSide: "pc_mint"; reason: null };
   /** WSOL-side vault token-account amount (u64 exact). */
   wsolReserveLamports: string;
   /** Memecoin-side vault token-account amount (u64 exact). */
@@ -69,8 +84,8 @@ export interface ConsoleSnapshotFailure {
   reason: string;
 }
 
-export interface ConsoleSnapshotV1 {
-  schemaVersion: 1;
+export interface ConsoleSnapshotV2 {
+  schemaVersion: 2;
   generatedAtUnixMs: number;
   /** Discovery cluster (mainnet-beta for the real corpus). */
   cluster: Cluster;
@@ -90,6 +105,8 @@ export interface ConsoleSnapshotV1 {
     rawAccounts: number;
     parsedPools: number;
     supportedWsolPairs: number;
+    /** Pools rejected by the D-01 M1 sourcing gate at this boundary. */
+    m1SourcingRejected: number;
     enriched: number;
   };
   failures: ConsoleSnapshotFailure[];
@@ -179,16 +196,29 @@ export function buildSnapshotPool(
 ): SnapshotPool {
   if (!record.wsolSide) fail(`pool ${record.poolAddress.toBase58()} has no WSOL side — not salvage-funnel supported`);
   if (enrichment.fetchedAtUnixMs <= 0) fail(`pool ${record.poolAddress.toBase58()} enrichment has no timestamp`);
+  // D-01 M1 sourcing assertion — fail closed. The record's own parsed
+  // AmmInfo fields are authoritative (baseMint IS coin_mint, quoteMint
+  // IS pc_mint). A pool whose orientation is missing, contradictory or
+  // unverifiable throws here and can NEVER be marked M1-acceptable in
+  // the artifact — an operator cannot accidentally accept it.
+  assertM1Sourcing({ coinMint: record.pool.baseMint, pcMint: record.pool.quoteMint });
   const address = record.poolAddress.toBase58();
   return {
     address,
     ammProgramId: record.ammProgramId.toBase58(),
+    coinMint: assertBase58Pubkey(record.pool.baseMint.toBase58(), "coinMint"),
+    pcMint: assertBase58Pubkey(record.pool.quoteMint.toBase58(), "pcMint"),
     baseMint: assertBase58Pubkey(record.pool.baseMint.toBase58(), "baseMint"),
     quoteMint: assertBase58Pubkey(record.pool.quoteMint.toBase58(), "quoteMint"),
     lpMint: assertBase58Pubkey(record.pool.lpMint.toBase58(), "lpMint"),
     wsolSide: {
       memecoinMint: assertBase58Pubkey(record.wsolSide.memecoinMint.toBase58(), "memecoinMint"),
       coinIsWsol: record.wsolSide.coinIsWsol,
+    },
+    m1Sourcing: {
+      eligible: true,
+      wsolSide: "pc_mint",
+      reason: null,
     },
     wsolReserveLamports: assertExactU64(enrichment.wsolReserveLamports, "wsolReserveLamports"),
     memecoinReserveRaw: assertExactU64(enrichment.memecoinReserveRaw, "memecoinReserveRaw"),
@@ -208,7 +238,7 @@ export interface ConsoleSnapshotMeta {
   indexerGitHead: string | null;
   maxAgeMs: number;
   thresholds: SnapshotThresholds;
-  counts: { rawAccounts: number; parsedPools: number; supportedWsolPairs: number };
+  counts: { rawAccounts: number; parsedPools: number; supportedWsolPairs: number; m1SourcingRejected: number };
   failures: ConsoleSnapshotFailure[];
   slotLowerBound: number;
   slotUpperBound: number;
@@ -223,7 +253,7 @@ export function buildConsoleSnapshot(
   records: DiscoveredPoolRecord[],
   enrichments: Map<string, PoolEnrichment>,
   meta: ConsoleSnapshotMeta,
-): ConsoleSnapshotV1 {
+): ConsoleSnapshotV2 {
   if (meta.generatedAtUnixMs <= 0) fail("generatedAtUnixMs must be positive");
   if (meta.maxAgeMs <= 0) fail("freshness.maxAgeMs must be positive");
   const ordered = [...records].sort((a, b) =>
@@ -255,6 +285,7 @@ export function buildConsoleSnapshot(
       rawAccounts: meta.counts.rawAccounts,
       parsedPools: meta.counts.parsedPools,
       supportedWsolPairs: meta.counts.supportedWsolPairs,
+      m1SourcingRejected: meta.counts.m1SourcingRejected,
       enriched: pools.length,
     },
     failures: meta.failures,

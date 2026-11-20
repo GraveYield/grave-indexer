@@ -78,7 +78,21 @@ function poolAccountBytes(): Uint8Array {
   const raw = JSON.parse(readFileSync(`${FIXTURE_DIR}/pool_account_sol_usdc.json`, "utf8")) as {
     dataBase64: string;
   };
-  return new Uint8Array(Buffer.from(raw.dataBase64, "base64"));
+  const bytes = new Uint8Array(Buffer.from(raw.dataBase64, "base64"));
+  // D-01 M1 sourcing (GY-M1-ODR-001 §3): the REAL mainnet fixture pool is
+  // a SOL/USDC pair with WSOL on the coin (base) side, which the collect
+  // path's M1 sourcing gate now (correctly) refuses. These tests exercise
+  // the attestation-evidence gate, so the identity's MINT orientation is
+  // flipped to the M1-eligible one (coin_mint := USDC, pc_mint := WSOL) —
+  // a test-only, clearly-labeled modification of the identity fields.
+  // Vault bytes (336..400) and everything else stay the genuine fixture;
+  // the last-swap evidence classifier keys on vaults, not mints, so the
+  // derivation is unaffected.
+  const coinMint = bytes.slice(400, 432); // WSOL in the real fixture
+  const pcMint = bytes.slice(432, 464); // USDC in the real fixture
+  bytes.set(pcMint, 400);
+  bytes.set(coinMint, 432);
+  return bytes;
 }
 
 const swapV2Outer = readFixture("tx_swap_base_in_v2_outer_legacy");

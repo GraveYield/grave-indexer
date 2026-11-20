@@ -24,7 +24,8 @@ export type HealthComponentId =
   | "evidence"
   | "verifier"
   | "journal"
-  | "enrich";
+  | "enrich"
+  | "m1-sourcing";
 
 export interface HealthComponentReport {
   component: HealthComponentId;
@@ -73,6 +74,8 @@ export class HealthRegistry {
       "evidence",
       "verifier",
       "journal",
+      "enrich",
+      "m1-sourcing",
     ];
     for (const id of all) {
       this.reports.set(id, {
