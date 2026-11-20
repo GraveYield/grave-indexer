@@ -42,12 +42,19 @@
 //     "m1-sourcing" with a pool address — so the count can never drift
 //     into a misleading artifact total.
 //
-// DOWNSTREAM COMPATIBILITY NOTE (documented unresolved dependency): the
-// GraveYield console (GraveYield/graveyield-console,
-// src/lib/gy/snapshotContract.ts) currently pins schemaVersion === 1 and
-// throws SnapshotError on anything else — until that contract is upgraded
-// to v2 it classifies every v2 artifact as corrupt. This reader does NOT
-// (and must not) emulate the v1 shape to paper over that gap.
+// DOWNSTREAM COMPATIBILITY STATUS (updated 2026-11-21): the GraveYield
+// console consumer (GraveYield/graveyield-console,
+// src/lib/gy/snapshotContract.ts) has been upgraded to this schema v2
+// contract — strict v2-only, mirroring this reader rule-for-rule, with the
+// real-serializer fixture + digest pin and the cross-repo compat battery
+// (console side: __tests__/snapshotV2Compat.test.ts; sharing mechanism and
+// regeneration procedure: console src/lib/gy/snapshot-fixture/PROVENANCE.md,
+// docs/snapshot-contract.md). It rejects schemaVersion 1 the same way this
+// reader does — never reinterpreting it — so a v1 artifact is corrupt for
+// BOTH sides; regenerate with this indexer instead of downgrading the
+// consumer. Rollout order matters: a v2-emitting indexer must never point
+// at a console deployment that still pins v1 (it would classify every v2
+// artifact corrupt) — deploy the console upgrade first.
 
 import { WSOL_MINT } from "@graveyield/sdk";
 
