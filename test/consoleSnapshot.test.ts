@@ -31,7 +31,7 @@ function makeRecord(seed: number, opts?: { coinIsWsol?: boolean; noWsolSide?: bo
   const data = buildAmmInfo();
   const poolAddress = synth(seed);
   const coinIsWsol = opts?.coinIsWsol ?? false;
-  const baseMint = synth(0x13);
+  const baseMint = coinIsWsol ? WSOL_MINT : synth(0x13);
   return {
     poolAddress,
     ammProgramId: synth(0x99),
@@ -39,10 +39,10 @@ function makeRecord(seed: number, opts?: { coinIsWsol?: boolean; noWsolSide?: bo
       coinVault: synth(0x11),
       pcVault: synth(0x12),
       baseMint,
-      quoteMint: coinIsWsol ? baseMint : WSOL_MINT,
+      quoteMint: coinIsWsol ? synth(0x17) : WSOL_MINT,
       lpMint: synth(0x14),
     },
-    wsolSide: opts?.noWsolSide ? null : { memecoinMint: baseMint, coinIsWsol },
+    wsolSide: opts?.noWsolSide ? null : { memecoinMint: coinIsWsol ? synth(0x17) : baseMint, coinIsWsol },
     raw: {
       mode: "full",
       dataLen: data.length,
@@ -80,7 +80,7 @@ function makeMeta(over: Record<string, unknown> = {}) {
     indexerGitHead: null,
     maxAgeMs: 86_400_000,
     thresholds: THRESHOLDS,
-    counts: { rawAccounts: 706_002, parsedPools: 400, supportedWsolPairs: 2 },
+    counts: { rawAccounts: 706_002, parsedPools: 400, supportedWsolPairs: 2, m1SourcingRejected: 0 },
     failures: [] as Array<{ stage: string; pool?: string; reason: string }>,
     slotLowerBound: 100,
     slotUpperBound: 110,
@@ -91,7 +91,7 @@ function makeMeta(over: Record<string, unknown> = {}) {
 describe("consoleSnapshot — artifact contract", () => {
   test("assembles, orders, and pins the exhaustive secret-free key set", () => {
     const a = makeRecord(1);
-    const b = makeRecord(2, { coinIsWsol: true });
+    const b = makeRecord(2);
     const enrichments = new Map([
       [a.poolAddress.toBase58(), makeEnrichment()],
       [b.poolAddress.toBase58(), makeEnrichment({ wsolReserveLamports: "18446744073709551615" })],
@@ -99,7 +99,9 @@ describe("consoleSnapshot — artifact contract", () => {
     // Deliberately pass records out of order — the builder must sort.
     const snap = buildConsoleSnapshot([b, a], enrichments, makeMeta());
     assert.equal(snap.schemaVersion, CONSOLE_SNAPSHOT_SCHEMA_VERSION);
-    assert.equal(snap.schemaVersion, 1);
+    // Schema v2: per-pool coin_mint/pc_mint + the D-01 M1 sourcing
+    // assertion (see test/m1Sourcing.test.ts for the full vectors).
+    assert.equal(snap.schemaVersion, 2);
     assert.deepEqual(Object.keys(snap).sort(), [...CONSOLE_SNAPSHOT_KEYS].sort());
     const addresses = snap.pools.map((p) => p.address);
     assert.deepEqual(addresses, [...addresses].sort());

@@ -18,6 +18,7 @@ import { fetchV4Pool, decodeScannerProtocolConfig } from "@graveyield/sdk";
 
 import { loadPipelineConfig, type PipelineConfig } from "./config.js";
 import { discoverRaydiumV4Pools } from "./discovery.js";
+import type { DiscoveredPoolRecord } from "./discovery.js";
 import { IngestLedger } from "./ingest.js";
 import { HealthRegistry } from "./health.js";
 import {
@@ -37,6 +38,7 @@ import {
   type PoolEnrichment,
   type SnapshotThresholds,
 } from "./consoleSnapshot.js";
+import { evaluateM1Sourcing, assertM1Sourcing } from "./m1Sourcing.js";
 import { endpointKindFor, type Cluster } from "./provenance.js";
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
@@ -276,6 +278,22 @@ export async function cmdCollect(
       continue;
     }
 
+    // D-01 M1 sourcing gate (GY-M1-ODR-001 §3) — the collect path is an
+    // ALTERNATE candidate-ingestion route (explicit --pool arguments and
+    // ledger candidates bypass the console-snapshot enrichment filter),
+    // so it MUST independently enforce the exact WSOL quote-side
+    // predicate on the freshly fetched identity before any evidence work
+    // starts. Fail closed: no bundle, no attestation, no fallback — the
+    // pool is skipped and the refusal is recorded (machine-checkable via
+    // the health registry's m1-sourcing failure counter).
+    try {
+      assertM1Sourcing({ coinMint: identity.baseMint, pcMint: identity.quoteMint });
+    } catch (err) {
+      health.recordFailure("m1-sourcing", err);
+      console.log(`[skip] ${poolStr}: m1-sourcing rejected — ${String((err as Error).message ?? err).slice(0, 100)}`);
+      continue;
+    }
+
     // Last-swap derivation from DISCOVERY-cluster history.
     const t0 = Date.now();
     let activity;
@@ -463,12 +481,34 @@ export async function cmdConsoleSnapshot(
     ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
   });
   health.recordSuccess("rpc-discovery", Date.now() - t0);
-  const supported = run.records
+  const wsolSupported = run.records
     .filter((r) => r.wsolSide !== null)
     .sort((a, b) => (a.poolAddress.toBase58() < b.poolAddress.toBase58() ? -1 : 1));
+  // D-01 M1 sourcing gate (GY-M1-ODR-001 §3): only pools whose parsed
+  // AmmInfo identity satisfies the exact WSOL quote-side predicate may
+  // enter the enriched candidate list of this operator artifact. The
+  // gate is applied HERE (discovery boundary) and re-asserted by the
+  // builder (fail-closed), so rejected candidates can never be rendered
+  // as M1-acceptable. Rejections are machine-checkable: each appears in
+  // `failures` under stage "m1-sourcing" and in
+  // `counts.m1SourcingRejected`. Non-M1 discovery behavior is preserved:
+  // the discovery ledger keeps recording every 7019-supported pool.
+  const supported: DiscoveredPoolRecord[] = [];
+  for (const record of wsolSupported) {
+    const verdict = evaluateM1Sourcing({ coinMint: record.pool.baseMint, pcMint: record.pool.quoteMint });
+    if (verdict.accepted) {
+      supported.push(record);
+    } else {
+      failures.push({
+        stage: "m1-sourcing",
+        pool: record.poolAddress.toBase58(),
+        reason: `${verdict.reason} — ${verdict.detail}`,
+      });
+    }
+  }
   const targets = supported.slice(0, opts.enrich);
   console.log(
-    `discovery: ${run.stats.parsedPools} parsed, ${supported.length} WSOL-supported, enriching ${targets.length}`,
+    `discovery: ${run.stats.parsedPools} parsed, ${wsolSupported.length} WSOL-supported, ${supported.length} m1-eligible (pc_mint WSOL), enriching ${targets.length}`,
   );
 
   // ---- Per-pool enrichment: vault reserves, LP supply, memecoin decimals, last swap.
@@ -559,7 +599,8 @@ export async function cmdConsoleSnapshot(
     counts: {
       rawAccounts: run.stats.rawAccounts,
       parsedPools: run.stats.parsedPools,
-      supportedWsolPairs: supported.length,
+      supportedWsolPairs: wsolSupported.length,
+      m1SourcingRejected: wsolSupported.length - supported.length,
     },
     failures,
     slotLowerBound: run.stats.slotLowerBound,
