@@ -16,8 +16,11 @@ import {
   CONSOLE_SNAPSHOT_KEYS,
   CONSOLE_SNAPSHOT_SCHEMA_VERSION,
   deriveCriteria,
+  type ConsoleSnapshotFailure,
+  type ConsoleSnapshotV2,
   type PoolEnrichment,
 } from "../src/consoleSnapshot.js";
+import { ConsoleSnapshotParseError, parseConsoleSnapshot } from "../src/consoleSnapshotParse.js";
 import type { DiscoveredPoolRecord } from "../src/discovery.js";
 import { accountFingerprint, sha256Hex } from "../src/provenance.js";
 import { buildAmmInfo, synth, WSOL_MINT } from "./fixtures.js";
@@ -219,5 +222,227 @@ describe("consoleSnapshot — artifact contract", () => {
     const fp = accountFingerprint(synth(1), data);
     assert.match(fp, /^[0-9a-f]{64}$/);
     assert.equal(fp, sha256Hex(Buffer.concat([synth(1).toBytes(), Buffer.from(data)])));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseConsoleSnapshot — the fail-closed v2 READER (review finding 3)
+// ---------------------------------------------------------------------------
+
+const WSOL_B58 = WSOL_MINT.toBase58();
+
+/** A valid v2 artifact: one emitted pool + one M1-rejected pool counted
+ *  in counts.m1SourcingRejected and failures — the producer-true shape. */
+function buildValidV2(): ConsoleSnapshotV2 {
+  const rec = makeRecord(1);
+  const rejectedAddress = synth(0x21).toBase58();
+  const snap = buildConsoleSnapshot(
+    [rec],
+    new Map([[rec.poolAddress.toBase58(), makeEnrichment()]]),
+    makeMeta({
+      counts: { rawAccounts: 10, parsedPools: 2, supportedWsolPairs: 2, m1SourcingRejected: 1 },
+      failures: [
+        {
+          stage: "m1-sourcing",
+          pool: rejectedAddress,
+          reason: "wsol-on-coin-side — WSOL is coin_mint (base side) — M1 requires WSOL on pc_mint (quote side)",
+        },
+      ],
+    }),
+  );
+  return snap;
+}
+
+function roundTrip(snap: ConsoleSnapshotV2): unknown {
+  return JSON.parse(JSON.stringify(snap));
+}
+
+describe("consoleSnapshotParse — schema v2 consumer contract (review finding 3)", () => {
+  test("a valid v2 artifact parses and preserves every field", () => {
+    const snap = buildValidV2();
+    const parsed = parseConsoleSnapshot(roundTrip(snap));
+    assert.deepEqual(parsed, snap, "the parsed contract is exactly the produced artifact");
+    assert.equal(parsed.schemaVersion, 2);
+    const p = parsed.pools[0]!;
+    assert.equal(p.coinMint, synth(0x13).toBase58());
+    assert.notEqual(p.coinMint, WSOL_B58, "coinMint is non-WSOL");
+    assert.equal(p.pcMint, WSOL_B58, "pcMint is the canonical WSOL mint");
+    assert.deepEqual(p.m1Sourcing, { eligible: true, wsolSide: "pc_mint", reason: null });
+    assert.equal(parsed.counts.m1SourcingRejected, 1);
+  });
+
+  test("malformed sourcing metadata is rejected (exact D-01 requirement)", () => {
+    const base = buildValidV2();
+    const mutate = (fn: (snap: ConsoleSnapshotV2) => void): unknown => {
+      const copy = JSON.parse(JSON.stringify(base)) as ConsoleSnapshotV2;
+      fn(copy);
+      return copy;
+    };
+    // coinMint must be non-WSOL.
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.coinMint = WSOL_B58; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /coinMint.*non-WSOL/.test(e.message),
+    );
+    // pcMint must be the canonical WSOL mint.
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.pcMint = synth(0x17).toBase58(); })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /pcMint.*canonical WSOL/.test(e.message),
+    );
+    // The machine-checkable acceptance, exactly: eligible true.
+    assert.throws(
+      () =>
+        parseConsoleSnapshot(
+          mutate((s) => { (s.pools[0]!.m1Sourcing.eligible as boolean) = false; }),
+        ),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /m1Sourcing.eligible/.test(e.message),
+    );
+    // ... wsolSide "pc_mint".
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { (s.pools[0]!.m1Sourcing.wsolSide as string) = "coin_mint"; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /m1Sourcing.wsolSide/.test(e.message),
+    );
+    // ... reason null.
+    assert.throws(
+      () =>
+        parseConsoleSnapshot(
+          mutate((s) => { (s.pools[0]!.m1Sourcing.reason as string | null) = "wsol-on-coin-side"; }),
+        ),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /m1Sourcing.reason/.test(e.message),
+    );
+    // The aliasing must agree (baseMint IS coin_mint, quoteMint IS pc_mint).
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.baseMint = synth(0x30).toBase58(); })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /baseMint.*coinMint/.test(e.message),
+    );
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.quoteMint = synth(0x31).toBase58(); })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /quoteMint.*pcMint/.test(e.message),
+    );
+    // wsolSide must agree with the validated orientation.
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.wsolSide.coinIsWsol = true; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /coinIsWsol.*false/.test(e.message),
+    );
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.pools[0]!.wsolSide.memecoinMint = synth(0x32).toBase58(); })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /memecoinMint.*coinMint/.test(e.message),
+    );
+  });
+
+  test("unsupported schema versions are rejected with an actionable error — v1 is never reinterpreted", () => {
+    const base = buildValidV2();
+    // Explicit v1 policy: actionable error, no silent reinterpretation.
+    const v1 = roundTrip(base) as Record<string, unknown>;
+    v1.schemaVersion = 1;
+    // A real v1 artifact also lacks the v2 fields entirely.
+    delete (v1.pools as Array<Record<string, unknown>>)[0]!.coinMint;
+    assert.throws(
+      () => parseConsoleSnapshot(v1),
+      (e: unknown) =>
+        e instanceof ConsoleSnapshotParseError &&
+        /schemaVersion 1 is not supported.*never reinterpreted/.test(e.message) &&
+        /Regenerate/.test(e.message),
+    );
+    // Unknown future versions are rejected the same way.
+    const v3 = roundTrip(base) as Record<string, unknown>;
+    v3.schemaVersion = 3;
+    assert.throws(
+      () => parseConsoleSnapshot(v3),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /unsupported schemaVersion.*3/.test(e.message),
+    );
+    // Missing version is unsupported too (the exhaustive root key set
+    // flags it: schemaVersion is a required contract key).
+    const missing = roundTrip(base) as Record<string, unknown>;
+    delete missing.schemaVersion;
+    assert.throws(
+      () => parseConsoleSnapshot(missing),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /schemaVersion/.test(e.message),
+    );
+  });
+
+  test("unknown or missing fields are never silently ignored", () => {
+    const base = buildValidV2();
+    const extraTop = roundTrip(base) as Record<string, unknown>;
+    extraTop.operatorNote = "hello";
+    assert.throws(
+      () => parseConsoleSnapshot(extraTop),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /root.*unknown operatorNote/.test(e.message),
+    );
+    const missingField = roundTrip(base) as Record<string, unknown>;
+    delete (missingField.pools as Array<Record<string, unknown>>)[0]!.coinMint;
+    assert.throws(
+      () => parseConsoleSnapshot(missingField),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /pools\[0\].*missing coinMint/.test(e.message),
+    );
+    const extraPoolKey = roundTrip(base) as Record<string, unknown>;
+    (extraPoolKey.pools as Array<Record<string, unknown>>)[0]!.score = 99;
+    assert.throws(
+      () => parseConsoleSnapshot(extraPoolKey),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /pools\[0\].*unknown score/.test(e.message),
+    );
+    const extraCountsKey = roundTrip(base) as Record<string, unknown>;
+    (extraCountsKey.counts as Record<string, unknown>).rejected = 1;
+    assert.throws(
+      () => parseConsoleSnapshot(extraCountsKey),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /counts.*unknown rejected/.test(e.message),
+    );
+  });
+
+  test("m1SourcingRejected counts cannot drift into misleading totals", () => {
+    const base = buildValidV2();
+    const mutate = (fn: (snap: ConsoleSnapshotV2) => void): unknown => {
+      const copy = JSON.parse(JSON.stringify(base)) as ConsoleSnapshotV2;
+      fn(copy);
+      return copy;
+    };
+    // enriched must equal the emitted pool list.
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.counts.enriched = 2; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /counts.enriched \(2\) != pools\.length \(1\)/.test(e.message),
+    );
+    // Rejections cannot exceed the WSOL-supported corpus.
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.counts.m1SourcingRejected = 5; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /exceeds counts\.supportedWsolPairs/.test(e.message),
+    );
+    // The emitted list cannot exceed supported minus rejected (enrichment
+    // failures shrink it, never grow it).
+    assert.throws(
+      () => parseConsoleSnapshot(mutate((s) => { s.counts.supportedWsolPairs = 1; })),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /never grow it/.test(e.message),
+    );
+    // Every rejected pool must appear exactly once under stage m1-sourcing.
+    assert.throws(
+      () =>
+        parseConsoleSnapshot(
+          mutate((s) => { s.counts.m1SourcingRejected = 0; }),
+        ),
+      (e: unknown) =>
+        e instanceof ConsoleSnapshotParseError &&
+        /counts\.m1SourcingRejected \(0\) != failures with stage "m1-sourcing" \(1\)/.test(e.message),
+    );
+    assert.throws(
+      () =>
+        parseConsoleSnapshot(
+          mutate((s) => {
+            const dup = { ...(s.failures[0] as ConsoleSnapshotFailure) };
+            s.failures.push(dup);
+            // The count tracks the (now twice-reported) rejection — the
+            // per-pool distinctness check is what must catch this.
+            s.counts.m1SourcingRejected = 2;
+          }),
+        ),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /more than once under stage "m1-sourcing"/.test(e.message),
+    );
+  });
+
+  test("criteria honesty: a future index cannot quietly invent evaluations", () => {
+    const base = buildValidV2();
+    const copy = JSON.parse(JSON.stringify(base)) as ConsoleSnapshotV2;
+    (copy.pools[0]!.criteria.c2PriceCollapse as string) = "pass";
+    assert.throws(
+      () => parseConsoleSnapshot(copy),
+      (e: unknown) => e instanceof ConsoleSnapshotParseError && /c2PriceCollapse must be "pending"/.test(e.message),
+    );
   });
 });
