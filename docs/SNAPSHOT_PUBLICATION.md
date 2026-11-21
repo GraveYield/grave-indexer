@@ -531,7 +531,7 @@ mutation invocations themselves.
    the manual `workflow_dispatch` trigger. Adding a protected
    environment is an optional owner hardening step.
 
-## 12. Private-repository impact (owner changed visibility to private)
+## 12. Private-repository impact (owner changed visibility to private; restored to public — see 12.4)
 
 The owner changed `GraveYield/grave-indexer` from public to private
 (2026-11-22). GitHub serves unauthenticated requests to a private
@@ -557,6 +557,8 @@ places. All three now authenticate with the READ-ONLY automatic token:
    was already authenticated).
 
 ### 12.2 PRODUCTION INTEGRATION BLOCKER — the Console cannot fetch the snapshot
+
+> **STATUS UPDATE (2026-11-22):** resolved by the owner — see 12.4.
 
 The shipped `graveyield-console` consumer contract fetches the snapshot
 with an UNAUTHENTICATED HTTP GET of
@@ -602,6 +604,44 @@ deployment configuration (outside this task's authorization).
    publication should be dispatched under this option, since the newly
    published artifact would be unreachable by production.
 
-**This decision is a blocker for the next production publication** (the
-published artifact must be reachable by its production consumer), and
-it is recorded in the PR description as an outstanding owner decision.
+**This decision was a blocker for the next production publication** (the
+published artifact must be reachable by its production consumer); it
+was resolved on 2026-11-22 by alternative 3 — see 12.4.
+
+### 12.4 Addendum — visibility restored to public (owner decision, 2026-11-22)
+
+The owner restored `GraveYield/grave-indexer` to **public** — i.e.
+alternative 12.3.3 was chosen. Verified live on 2026-11-22,
+unauthenticated (no credential used):
+
+- `https://github.com/GraveYield/grave-indexer` → **HTTP 200**
+- `https://github.com/GraveYield/grave-indexer/releases` → **HTTP 200**
+
+Consequences, stated precisely:
+
+1. **The 12.2 production integration blocker is lifted.** The Console's
+   unauthenticated fetch contract is structurally compatible with the
+   repository again. No Console or Vercel change is required.
+2. **The stable URL is not yet live — because no release exists yet.**
+   Verified: the releases page lists zero releases, `/releases/latest`
+   redirects to the releases index, and
+   `releases/latest/download/console-snapshot.json` → HTTP 404. That
+   404 is "no latest release", not "unreachable repository". The stable
+   URL begins resolving unauthenticated only once the first versioned
+   release is created (`--latest=false`) and subsequently promoted
+   (`gh release edit --latest`) by the workflow's release/promote
+   steps. Until then, production ingestion has nothing to fetch — the
+   same state as before the visibility change, and consistent with the
+   no-release-yet invariant.
+3. **The authenticated transports of 12.1 remain correct on a public
+   repository.** They are not public-visibility-specific: the
+   authenticated tag gates keep their three-way fail-closed semantics,
+   and authenticated asset fetches work for public releases as well.
+   The unauthenticated fallback paths in `verifyReleaseAssetSet` are
+   likewise retained, so both visibility modes are covered.
+4. **12.3 alternatives 1 and 2 remain documented** (not deleted) for
+   the future case where the repository is made private again.
+
+Nothing in this addendum changes the credential model of §11, the
+workflow structure, or any release state: no release was created,
+modified or promoted in the course of documenting this.
