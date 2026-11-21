@@ -2,17 +2,31 @@
 //
 // publish-console-snapshot.yml — workflow-level validation (GY-M1-INT-001
 // correction §5; PR #5 remediation — review Tasks 1-5, Task 1 corrected
-// twice). YAML parsing alone proves nothing about behavior, so these
+// THREE times). YAML parsing alone proves nothing about behavior, so these
 // tests pin the SECURITY-CRITICAL structure of the real workflow file:
 // trigger restrictions, least-privilege permissions, job separation
-// (read-only preparation/verification vs the MINIMAL privileged release
-// job), artifact integrity handling, release behavior (latest promotion,
-// no clobber), concurrency, and explicit failure paths. The behavioral
-// sequence itself is exercised end-to-end by
+// (read-only preparation/verification vs privileged jobs that contain ZERO
+// custom code), artifact integrity handling, release behavior (latest
+// promotion, no clobber), concurrency, and explicit failure paths. The
+// behavioral sequence itself is exercised end-to-end by
 // test/snapshotPublicationSequence.test.ts.
 //
 // Parsing uses PyYAML via a thin synchronous bridge (no YAML dependency
 // is added to the package manifest for a test-only concern).
+//
+// KNOWN LIMITATION (stated explicitly, per the review requirement): these
+// tests inspect the workflow's DECLARED structure — job permissions, step
+// env blocks, command lines and action references. They cannot observe
+// GitHub's runtime behavior (e.g. they cannot execute a workflow run to
+// prove that actions/download-artifact never touches github.token, or
+// that the runner injects nothing beyond what is declared). The runtime
+// properties pinned here rest on GitHub's documented behavior:
+//   - a job-level `permissions` grant makes github.token write-capable
+//     for EVERY step of that job (which is exactly why the repository-
+//     built code was moved OUT of the write-permission jobs);
+//   - actions/download-artifact authenticates with the artifact-scoped
+//     ACTIONS_RUNTIME_TOKEN and takes no github.token input;
+//   - `run:` steps receive secrets only through explicitly declared env.
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
@@ -23,6 +37,7 @@ interface Workflow {
   name: string;
   on: Record<string, unknown>;
   permissions: Record<string, string>;
+  env?: Record<string, unknown>;
   concurrency: { group: string; "cancel-in-progress": boolean };
   jobs: Record<
     string,
@@ -53,14 +68,36 @@ function runBlocks(job: Workflow["jobs"][string]): string[] {
   return job.steps.filter((s) => typeof s["run"] === "string").map((s) => s["run"] as string);
 }
 
+function stepEnv(step: Record<string, unknown>): Record<string, unknown> {
+  return ((step["env"] ?? {}) as Record<string, unknown>) ?? {};
+}
+
+function hasTokenEnv(step: Record<string, unknown>): boolean {
+  const env = stepEnv(step);
+  return "GH_TOKEN" in env || "GITHUB_TOKEN" in env;
+}
+
 describe("publish-console-snapshot workflow — security-critical structure", () => {
   const wf = loadWorkflow();
   const generate = wf.jobs["generate"];
   const verify = wf.jobs["verify"];
   const publish = wf.jobs["publish"];
+  const release = wf.jobs["release"];
+  const verifyVersioned = wf.jobs["verify-versioned"];
+  const promote = wf.jobs["promote"];
   const verifyStable = wf.jobs["verify-stable"];
-  assert.ok(generate && verify && publish && verifyStable, "all four jobs exist");
-  if (!generate || !verify || !publish || !verifyStable) throw new Error("workflow jobs missing");
+  const allJobs: Array<[string, Workflow["jobs"][string] | undefined]> = [
+    ["generate", generate],
+    ["verify", verify],
+    ["publish", publish],
+    ["release", release],
+    ["verify-versioned", verifyVersioned],
+    ["promote", promote],
+    ["verify-stable", verifyStable],
+  ];
+  assert.ok(allJobs.every(([, j]) => j), "all seven jobs exist");
+  if (!allJobs.every(([, j]) => j)) throw new Error("workflow jobs missing");
+  const jobs = allJobs.map(([, j]) => j!) as NonNullable<Workflow["jobs"][string]>[];
 
   test("workflow_dispatch is the ONLY trigger", () => {
     assert.deepEqual(Object.keys(wf.on), ["workflow_dispatch"]);
@@ -77,15 +114,22 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
     }
   });
 
-  test("top-level permissions are read-only; ONLY the publish job gets contents:write", () => {
+  test("top-level permissions are read-only; ONLY release + promote get contents:write", () => {
     assert.deepEqual(wf.permissions, { contents: "read" });
-    assert.equal(generate.permissions, undefined, "generate inherits the read-only default");
-    assert.equal(verify.permissions, undefined, "verify inherits the read-only default");
-    assert.deepEqual(publish.permissions, { contents: "write" });
-    assert.equal(verifyStable.permissions, undefined, "verify-stable inherits the read-only default");
-    assert.ok(publish.needs?.includes("generate") && publish.needs?.includes("verify"), "publish depends on BOTH read-only preparation jobs (job separation)");
-    assert.ok(verify.needs?.includes("generate"), "verify depends on generate");
-    assert.ok(verifyStable.needs?.includes("publish"), "verify-stable runs after publish");
+    assert.equal(generate!.permissions, undefined, "generate inherits the read-only default");
+    assert.equal(verify!.permissions, undefined, "verify inherits the read-only default");
+    assert.deepEqual(publish!.permissions, { contents: "read" }, "publish is EXPLICITLY read-only: repository-built code runs there");
+    assert.deepEqual(release!.permissions, { contents: "write" }, "release is the release-creation job");
+    assert.equal(verifyVersioned!.permissions, undefined, "verify-versioned inherits the read-only default");
+    assert.deepEqual(promote!.permissions, { contents: "write" }, "promote is the activation job");
+    assert.equal(verifyStable!.permissions, undefined, "verify-stable inherits the read-only default");
+    // dependency chain: every privileged job is gated behind read-only preparation
+    assert.ok(release!.needs?.includes("publish"), "release depends on the read-only publish gates");
+    assert.ok(verifyVersioned!.needs?.includes("release"), "the roundtrip gate runs after upload");
+    assert.ok(promote!.needs?.includes("verify-versioned"), "promotion is UNREACHABLE until same-release verification passed");
+    assert.ok(verifyStable!.needs?.includes("promote") && verifyStable!.needs?.includes("publish"), "the post-activation gate runs after promotion");
+    assert.ok(publish!.needs?.includes("generate") && publish!.needs?.includes("verify"), "publish depends on BOTH read-only preparation jobs");
+    assert.ok(verify!.needs?.includes("generate"), "verify depends on generate");
   });
 
   test("concurrency: one publication at a time, never cancelled mid-run", () => {
@@ -94,7 +138,7 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
   });
 
   test("actions are pinned to full commit SHAs", () => {
-    for (const job of [generate, verify, publish, verifyStable]) {
+    for (const job of jobs) {
       for (const step of job.steps) {
         if (typeof step["uses"] === "string") {
           const ref = step["uses"].split("@")[1] ?? "";
@@ -105,11 +149,11 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
   });
 
   test("dispatch inputs reach the CLI through env indirection and are validated as positive integers", () => {
-    const runs = runBlocks(generate).join("\n");
+    const runs = runBlocks(generate!).join("\n");
     assert.ok(runs.includes("MAX_POOLS") && runs.includes("ENRICH"), "inputs are consumed from env, not inline interpolation");
     assert.ok(runs.includes("must be a positive integer"), "a numeric validation gate exists");
     assert.ok(
-      !generate.steps.some(
+      !generate!.steps.some(
         (s) => typeof s["run"] === "string" && (s["run"] as string).includes("${{ inputs."),
         "no direct ${{ inputs.* }} interpolation inside run blocks",
       ),
@@ -117,70 +161,81 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
   });
 
   test("the staged bundle passes between jobs through a named workflow artifact with fail-closed upload", () => {
-    const up = generate.steps.find((s) => s["uses"]?.toString().startsWith("actions/upload-artifact"));
+    const up = generate!.steps.find((s) => s["uses"]?.toString().startsWith("actions/upload-artifact"));
     assert.ok(up, "generate uploads the bundle");
     const upWith = (up?.["with"] ?? {}) as Record<string, unknown>;
     assert.equal(upWith["if-no-files-found"], "error");
     assert.equal(upWith["name"], "snapshot-publication-bundle");
-    const down = verify.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact"));
+    const down = verify!.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact"));
     assert.equal((down?.["with"] as Record<string, unknown> | undefined)?.["name"], "snapshot-publication-bundle");
-    const pubDown = publish.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact") && JSON.stringify(s["with"]).includes("snapshot-publication-bundle"));
-    assert.ok(pubDown, "publish downloads the verified publication bundle");
+    const pubDown = publish!.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact") && JSON.stringify(s["with"]).includes("snapshot-publication-bundle"));
+    assert.ok(pubDown, "the read-only publish job downloads the verified publication bundle");
+    const relDown = release!.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact") && JSON.stringify(s["with"]).includes("snapshot-publication-bundle"));
+    assert.ok(relDown, "the release job downloads the verified publication bundle for upload");
+    const opsDown = verifyVersioned!.steps.find((s) => s["uses"]?.toString().startsWith("actions/download-artifact") && JSON.stringify(s["with"]).includes("release-ops-cli"));
+    assert.ok(opsDown, "the roundtrip gate downloads the prebuilt release-ops bundle");
   });
 
-  test("integrity is recalculated against downloaded bytes at every gate: independent re-verification, same-release roundtrip, post-activation", () => {
+  test("integrity is recalculated against downloaded bytes at every gate: independent re-verification, pre-upload belts, same-release roundtrip, post-activation", () => {
     // Gate 1 (read-only verify job): strict schema-v2 + integrity re-check
     // of the DOWNLOADED bundle, independent of the generate job.
-    const verifyRuns = runBlocks(verify).join("\n");
+    const verifyRuns = runBlocks(verify!).join("\n");
     assert.match(verifyRuns, /verify-snapshot[\s\\]+bundle\//, "independent re-verification BEFORE any publication");
-    // Gate 2 (privileged publish job): pure-shell checksum over the exact
-    // downloaded bytes before anything is uploaded.
-    const publishRuns = runBlocks(publish).join("\n");
-    assert.match(publishRuns, /sha256sum -c console-snapshot\.sha256/, "the privileged job re-checks the checksum over the downloaded bytes");
+    // Gates 2a/2b (publish + release): pure-shell checksum over the exact
+    // downloaded bytes — including INSIDE the privileged release job,
+    // immediately before the upload.
+    assert.match(runBlocks(publish!).join("\n"), /sha256sum -c console-snapshot\.sha256/, "the read-only gate job re-checks the checksum over the downloaded bytes");
+    assert.match(runBlocks(release!).join("\n"), /sha256sum -c console-snapshot\.sha256/, "the PRIVILEGED release job re-checks the checksum over its own downloaded bytes before uploading");
     // The roundtrip and stable gates recompute the checksum over the exact
     // downloaded bytes inside verifyReleaseAssetSet (verifyChecksumFile),
     // exercised by test/releaseOps.test.ts; here we pin that the workflow
     // invokes them at both scopes.
-    assert.match(publishRuns, /--scope versioned/, "same-release roundtrip gate (privileged job)");
-    const stableRuns = runBlocks(verifyStable).join("\n");
+    assert.match(runBlocks(verifyVersioned!).join("\n"), /--scope versioned/, "same-release roundtrip gate (read-only job, between upload and promotion)");
+    const stableRuns = runBlocks(verifyStable!).join("\n");
     assert.match(stableRuns, /--scope latest/, "post-activation stable gate (read-only job)");
   });
 
   test("duplicate versioned tags abort before creation; releases are created explicitly NOT latest", () => {
-    const runs = runBlocks(publish).join("\n");
-    assert.match(runs, /git ls-remote --exit-code --tags/, "duplicate-tag gate");
-    assert.match(runs, /--latest=false/, "versioned releases never become latest on creation");
-    assert.ok(!runs.includes("--clobber"), "no asset clobbering anywhere");
-    assert.match(runs, /gh release edit .* --latest/, "the stable reference is activated by a single promotion");
+    const relRuns = runBlocks(release!).join("\n");
+    assert.match(relRuns, /git ls-remote --exit-code --tags/, "duplicate-tag gate runs in the privileged job, immediately before the mutation");
+    assert.match(relRuns, /--latest=false/, "versioned releases never become latest on creation");
+    assert.ok(!relRuns.includes("--clobber"), "no asset clobbering anywhere");
+    const pubRuns = runBlocks(publish!).join("\n");
+    assert.match(pubRuns, /git ls-remote --exit-code --tags/, "the duplicate-tag gate ALSO runs in the read-only publish job (early fail-closed)");
   });
 
   test("the stable reference is activated only AFTER same-release verification, then re-verified through the stable gate", () => {
-    const runs = runBlocks(publish);
-    const uploadIdx = runs.findIndex((r) => r.includes("gh release upload"));
-    const roundtripIdx = runs.findIndex((r) => r.includes("--scope versioned"));
-    // The rollback-discovery step MENTIONS `gh release edit <prev>` in its
-    // summary text, so the activation step is matched precisely.
-    const activateIdx = runs.findIndex((r) => r.includes('gh release edit "$TAG" --repo "$REPO" --latest'));
-    assert.ok(uploadIdx > -1 && roundtripIdx > uploadIdx, "same-release verification follows upload");
-    assert.ok(activateIdx > -1 && activateIdx > roundtripIdx, "activation follows verification");
-    // The post-activation stable gate runs in the SEPARATE read-only job.
-    const stableRuns = runBlocks(verifyStable).join("\n");
+    // Cross-job ordering: release → verify-versioned → promote.
+    assert.equal(promote!.needs?.includes("verify-versioned"), true, "promotion is gated on the same-release verification JOB");
+    const promoteRuns = runBlocks(promote!).join("\n");
+    assert.match(promoteRuns, /gh release edit "\$TAG" --repo "\$REPO" --latest/, "the stable reference is activated by a single promotion command");
+    const releaseRuns = runBlocks(release!).join("\n");
+    assert.match(releaseRuns, /--latest=false/, "the release job creates the release explicitly NOT latest");
+    assert.ok(!/--latest(?!=false)/.test(releaseRuns), "the release job must NOT set the latest designation (only --latest=false)");
+    const stableRuns = runBlocks(verifyStable!).join("\n");
     assert.match(stableRuns, /--scope latest --expected-tag "\$TAG"/, "the stable gate cross-checks the activated tag");
     assert.match(stableRuns, /verify-release-assets/, "the stable gate runs the same-release verification CLI");
   });
 
-  test("the workflow records the previous latest tag as a rollback pointer", () => {
-    const runs = runBlocks(publish).join("\n");
+  test("the workflow records the previous latest tag as a rollback pointer (read-only discovery)", () => {
+    const runs = runBlocks(publish!).join("\n");
     assert.match(runs, /release-latest/, "the current latest designation is read through the hardened gate before activation");
-    assert.match(runs, /previous_latest_tag/, "the rollback pointer is captured for the summary");
+    assert.match(runs, /previous_latest_tag/, "the rollback pointer is captured as a job output");
     assert.match(runs, /rollback/, "the rollback pointer is surfaced in the summary");
+    const summaryStep = verifyStable!.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("ConsoleSnapshot publication")));
+    assert.ok(summaryStep, "the final publication summary exists in the read-only verify-stable job");
+    assert.equal(
+      stepEnv(summaryStep!)["PREV"],
+      "${{ needs.publish.outputs.previous_latest_tag }}",
+      "the rollback pointer reaches the final publication summary through the validated job output",
+    );
   });
 
   test("no secret material is echoed; authenticated URLs never reach provenance or step summaries", () => {
     const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
     const summaryBlocks = raw.split("GITHUB_STEP_SUMMARY").slice(1).join("");
     assert.ok(!summaryBlocks.includes("${{ secrets."), "no secrets interpolate into the summary");
-    const allRuns = [...runBlocks(generate), ...runBlocks(verify), ...runBlocks(publish), ...runBlocks(verifyStable)].join("\n");
+    const allRuns = jobs.map((j) => runBlocks(j).join("\n")).join("\n");
     assert.ok(!allRuns.includes("MAINNET_RPC_URL") || !allRuns.includes("echo $DISCOVERY_RPC_URL"), "RPC secrets are consumed, never echoed");
     // The only URLs printed are the public unauthenticated ones (the
     // match is line-bounded so the regex cannot span into other keys).
@@ -195,12 +250,30 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
   const generate = wf.jobs["generate"]!;
   const verify = wf.jobs["verify"]!;
   const publish = wf.jobs["publish"]!;
+  const release = wf.jobs["release"]!;
+  const verifyVersioned = wf.jobs["verify-versioned"]!;
+  const promote = wf.jobs["promote"]!;
   const verifyStable = wf.jobs["verify-stable"]!;
-  const readOnlyJobs = [generate, verify, verifyStable];
+  const allJobs = [generate, verify, publish, release, verifyVersioned, promote, verifyStable];
+  const readOnlyJobs: Array<[string, typeof generate]> = [
+    ["generate", generate],
+    ["verify", verify],
+    ["publish", publish],
+    ["verify-versioned", verifyVersioned],
+    ["verify-stable", verifyStable],
+  ];
+  const privilegedJobs: Array<[string, typeof generate]> = [
+    ["release", release],
+    ["promote", promote],
+  ];
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
-  test("ALL FOUR jobs carry the job-level main-only guard (`if: github.ref == 'refs/heads/main'`)", () => {
-    for (const job of [generate, verify, publish, verifyStable]) {
+  function effectivePermissions(job: typeof generate): Record<string, string> {
+    return job.permissions ?? { contents: "read" };
+  }
+
+  test("ALL SEVEN jobs carry the job-level main-only guard (`if: github.ref == 'refs/heads/main'`)", () => {
+    for (const job of allJobs) {
       assert.equal(
         job["if"],
         "github.ref == 'refs/heads/main'",
@@ -209,8 +282,8 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     }
   });
 
-  test("ALL FOUR jobs carry an explicit in-step ref guard that rejects anything but refs/heads/main", () => {
-    for (const job of [generate, verify, publish, verifyStable]) {
+  test("ALL SEVEN jobs carry an explicit in-step ref guard that rejects anything but refs/heads/main", () => {
+    for (const job of allJobs) {
       const guards = job.steps.filter(
         (s) => typeof s["run"] === "string" && (s["run"] as string).includes("refs/heads/main") && (s["run"] as string).includes("GITHUB_REF"),
       );
@@ -226,14 +299,17 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
   test("the workflow cannot reach release-writing steps from an arbitrary branch or tag (layered)", () => {
     // Layer 1: job-level if on every job. Layer 2: guard steps. Layer 3: dispatch-only trigger.
     assert.deepEqual(Object.keys(wf.on), ["workflow_dispatch"], "dispatch-only trigger: no push/PR/schedule context can run it");
-    const publishRuns = runBlocks(publish).join("\n");
-    assert.ok(publishRuns.includes("refusing to publish"), "the release job's guard names its refusal explicitly");
+    const releaseRuns = runBlocks(release).join("\n");
+    assert.ok(releaseRuns.includes("refusing to publish"), "the release job's guard names its refusal explicitly");
+    const promoteRuns = runBlocks(promote).join("\n");
+    assert.ok(promoteRuns.includes("refusing to promote"), "the promotion job's guard names its refusal explicitly");
   });
 
   test("every repository checkout is pinned to the selected commit; the workflow asserts HEAD equals it", () => {
-    for (const job of readOnlyJobs) {
+    for (const [name, job] of readOnlyJobs) {
+      if (name === "publish" || name === "verify-versioned") continue; // these jobs deliberately have NO checkout
       const checkout = job.steps.find((s) => typeof s["uses"] === "string" && (s["uses"] as string).startsWith("actions/checkout"));
-      assert.ok(checkout, "checkout step exists in the read-only job");
+      assert.ok(checkout, `checkout step exists in the read-only job ${name}`);
       const withRef = ((checkout?.["with"] ?? {}) as Record<string, unknown>)["ref"];
       assert.equal(withRef, "${{ github.sha }}", "checkout must be the EXACT commit Actions selected, never a moving branch head");
       const assertStep = job.steps.find(
@@ -244,117 +320,167 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     }
   });
 
-  // ── SECOND-ROUND CORRECTION (review follow-up): the first remediation
-  // attached GH_TOKEN per-step but kept `permissions: contents: write` at
-  // the JOB level on a job that also ran checkout, setup-node, pnpm and
-  // dependency installation. The job-level grant makes `github.token`
-  // write-capable for the whole job, and first-party actions consume it
-  // BY DEFAULT (actions/checkout's `token` input, actions/setup-node's
-  // `token` input). These tests pin the corrected structure. ──────────────
-
-  test("the privileged publish job is MINIMAL: no checkout, no setup-node, no pnpm, no dependency installation, no repository code", () => {
-    const usesSteps = publish.steps.filter((s) => typeof s["uses"] === "string").map((s) => s["uses"] as string);
-    assert.ok(usesSteps.length > 0, "the publish job downloads its artifacts through actions");
-    for (const uses of usesSteps) {
-      assert.match(uses, /^actions\/download-artifact@/, `the privileged job's only allowed action is download-artifact (found: ${uses}) — checkout and setup-node both consume github.token by default`);
-    }
-    const runs = runBlocks(publish).join("\n");
-    assert.ok(!runs.includes("pnpm "), "no pnpm commands in the privileged job (no dependency installation with the write token present)");
-    assert.ok(!runs.includes("npm "), "no npm commands in the privileged job");
-    assert.ok(!runs.includes("node --import tsx"), "no repository TypeScript runs in the privileged job (only the prebuilt zero-dependency bundle)");
-    assert.ok(!runs.includes("src/cli.ts"), "no repository CLI runs in the privileged job");
-    assert.ok(!runs.includes("tsc "), "no compilation runs in the privileged job");
-    assert.ok(!runs.includes("build:sdk"), "no SDK build runs in the privileged job");
-    assert.ok(!publish.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/checkout")), "the privileged job NEVER checks out the repository");
-    assert.ok(!publish.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/setup-node")), "the privileged job NEVER runs setup-node (its token input defaults to github.token)");
+  test("the privileged release job targets the asserted commit (github.sha), never a moving ref", () => {
+    assert.equal(release.env?.["CHECKOUT_SHA"], "${{ github.sha }}", "the release job pins the release target to the workflow's selected commit");
+    const runs = runBlocks(release).join("\n");
+    assert.match(runs, /--target "\$CHECKOUT_SHA"/, "gh release create uses the pinned commit");
   });
 
-  test("the privileged job runs the prebuilt zero-dependency release-ops bundle and preinstalled tooling only", () => {
+  // ── THIRD-ROUND CORRECTION (review follow-up): the second remediation
+  // removed checkout/setup-node/pnpm from the privileged job but STILL ran
+  // repository-built code (the release-ops bundle, provenance parsing)
+  // inside the write-permission job. GitHub makes github.token write-
+  // capable for EVERY step of a job whose permissions grant write, whether
+  // or not an explicit GH_TOKEN env is attached. The corrected structure
+  // moves ALL custom code into read-only jobs; the write-permission jobs
+  // contain NOTHING but token-free precondition checks and the pinned
+  // `gh release` mutation commands. These tests pin that boundary. ────────
+
+  test("the publish job is EXPLICITLY READ-ONLY: repository-built code runs there, so contents:write must not exist in it", () => {
+    assert.deepEqual(publish.permissions, { contents: "read" }, "publish declares contents:read explicitly — the review's finding was a write-capable token reaching custom code in this job");
     const runs = runBlocks(publish).join("\n");
-    assert.match(runs, /node ops\/release-ops\.mjs release-latest/, "rollback discovery runs the prebuilt bundle");
-    assert.match(runs, /node ops\/release-ops\.mjs verify-release-assets/, "same-release verification runs the prebuilt bundle");
-    assert.match(runs, /sha256sum -c/, "the pre-upload checksum belt uses preinstalled shell tooling");
-    assert.match(runs, /git ls-remote/, "the tag-collision gate uses preinstalled git");
-    // The bundle is built by the read-only verify job from the asserted commit.
-    const verifyRuns = runBlocks(verify).join("\n");
-    assert.match(verifyRuns, /bundle:release-ops/, "the read-only verify job builds the zero-dependency release-ops bundle");
-    const up = verify.steps.find((s) => JSON.stringify(s["with"] ?? {}).includes("release-ops-cli"));
-    assert.ok(up, "the verify job uploads the release-ops bundle as a named artifact");
-    assert.equal(((up?.["with"] ?? {}) as Record<string, unknown>)["if-no-files-found"], "error", "the bundle upload is fail-closed");
+    // The custom operations live here — under a read-only grant.
+    assert.match(runs, /node ops\/release-ops\.mjs release-latest/, "rollback discovery (custom code) runs in the read-only job");
+    assert.match(runs, /node -e "console\.log\(JSON\.parse/, "provenance parsing runs in the read-only job");
+    // And nothing in this job can mutate releases. (The rollback summary
+    // MENTIONS the rollback command in its documentation text, so only
+    // actual command lines count — line-anchored.)
+    assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(runs), "the read-only publish job performs NO release-mutating operation");
   });
 
-  test("the write-capable GH_TOKEN is NOT set at job level and never reaches any non-API step", () => {
-    for (const job of [generate, verify, publish, verifyStable]) {
-      assert.ok(!("GH_TOKEN" in (job.env ?? {})), "no job-level GH_TOKEN (it would leak to every step)");
-      assert.ok(!("GITHUB_TOKEN" in (job.env ?? {})), "no job-level GITHUB_TOKEN");
+  test("custom `release-latest` execution receives a READ-ONLY credential, never a write-capable one", () => {
+    // Find the step that actually executes the custom bundle for rollback
+    // discovery and inspect ITS job's effective permissions.
+    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("release-latest"));
+    assert.ok(step, "the rollback-discovery step exists");
+    const perms = effectivePermissions(publish);
+    assert.equal(perms["contents"], "read", "the job running custom discovery code grants only contents:read — github.token is read-only for EVERY step of it");
+    const env = stepEnv(step!);
+    assert.equal(env["GH_TOKEN"], "${{ github.token }}", "discovery authenticates with the workflow token, which is READ-ONLY because of the job grant");
+    // Belt-and-suspenders: no OTHER job that runs release-latest exists with write permission.
+    for (const [name, job] of privilegedJobs) {
+      const runs = runBlocks(job).join("\n");
+      assert.ok(!runs.includes("release-latest"), `${name} (write-permission job) must not execute the custom release-latest code`);
     }
-    // No read-only job receives a token anywhere at all (verify-stable's
-    // post-activation gate uses the READ-ONLY workflow token — it has no
-    // write permission, so it is not a leak).
-    for (const job of [generate, verify]) {
-      assert.ok(
-        !job.steps.some((s) => typeof s["env"] === "object" && s["env"] !== null && ("GH_TOKEN" in ((s["env"] ?? {}) as Record<string, unknown>) || "GITHUB_TOKEN" in ((s["env"] ?? {}) as Record<string, unknown>))),
-        "preparation jobs receive no GitHub token",
-      );
-    }
-    // In the publish job, ONLY the four GitHub release API steps carry the token.
-    const publishTokenSteps = publish.steps.filter(
-      (s) => typeof s["env"] === "object" && s["env"] !== null && "GH_TOKEN" in ((s["env"] ?? {}) as Record<string, unknown>),
-    );
-    assert.ok(publishTokenSteps.length > 0, "release API steps carry the token");
-    for (const step of publishTokenSteps) {
-      const run = (step["run"] as string) ?? "";
-      assert.ok(
-        run.includes("gh release") || run.includes("curl -sS"),
-        "token steps are exactly the GitHub release API steps (gh CLI or the authenticated release-collision curl belt)",
-      );
-    }
-    const expectedTokenSteps = ["release-collision", "rollback", "Publish the immutable versioned release", "Activate the stable reference"];
-    assert.equal(publishTokenSteps.length, expectedTokenSteps.length, "exactly the four release-API steps carry the write token");
-    for (const step of publish.steps) {
-      const run = (step["run"] as string) ?? "";
-      const hasToken = typeof step["env"] === "object" && step["env"] !== null && "GH_TOKEN" in ((step["env"] ?? {}) as Record<string, unknown>);
-      if (hasToken) {
-        assert.ok(
-          !run.includes("pnpm install") && !run.includes("pnpm run") && !run.includes("verify-snapshot"),
-          "dependency installation, builds and verification never receive the write-capable token",
-        );
-      } else {
-        // Only actual command lines count (summary echo text merely
-        // documents the rollback procedure and carries no authority).
-        assert.ok(
-          !/^\s*gh release (create|upload|edit|view) /m.test(run),
-          "steps without the token never call the GitHub release API",
-        );
-        assert.ok(
-          !/Authorization: Bearer/m.test(run),
-          "steps without the token never make authenticated API calls",
-        );
+  });
+
+  test("PRIVILEGED JOBS CONTAIN ZERO CUSTOM CODE: no node, no repository script, no pnpm/npm, no build, no compilation", () => {
+    for (const [name, job] of privilegedJobs) {
+      const runs = runBlocks(job).join("\n");
+      for (const banned of ["node ", "pnpm ", "npm ", "npx ", "src/cli.ts", ".mjs", "tsc ", "build:sdk", "tsx"]) {
+        assert.ok(!runs.includes(banned), `${name} (contents:write) must not contain '${banned}' — no custom or repository-built code may execute where github.token is write-capable`);
+      }
+      assert.ok(!job.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/checkout")), `${name} NEVER checks out the repository`);
+      assert.ok(!job.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/setup-node")), `${name} NEVER runs setup-node (its token input defaults to github.token)`);
+      const usesSteps = job.steps.filter((s) => typeof s["uses"] === "string").map((s) => s["uses"] as string);
+      for (const uses of usesSteps) {
+        assert.match(uses, /^actions\/download-artifact@/, `${name}'s only allowed action is download-artifact (found: ${uses})`);
       }
     }
   });
 
-  test("the same-release versioned verification step in the privileged job receives NO token (public tag URLs)", () => {
-    const step = publish.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope versioned")));
-    assert.ok(step, "the versioned verification step exists");
-    assert.equal(typeof step!["env"], "undefined", "the versioned verification step receives no token — the tag URLs are public");
+  test("GLOBAL INVARIANT: every step that invokes node or executes a bundle lives in a job WITHOUT contents:write", () => {
+    // Walk every job; any run block that executes node/npm/pnpm/a bundle
+    // must belong to a job whose effective github.token is read-only.
+    for (const job of allJobs) {
+      const writeCapable = effectivePermissions(job)["contents"] === "write";
+      for (const run of runBlocks(job)) {
+        const executesCode = /\bnode\b|\bpnpm\b|\bnpm\b|\bnpx\b|\.mjs|src\/cli\.ts/.test(run);
+        if (executesCode && writeCapable) {
+          assert.fail(`a write-permission job executes custom/repository code: ${run.slice(0, 120)}`);
+        }
+      }
+    }
   });
 
-  test("permissions stay least-privilege: read-only preparation/verification, contents:write only on the minimal release job", () => {
+  test("only the EXPLICIT release-mutation steps receive the write-capable token; every other step in privileged jobs is token-free", () => {
+    const expectedMutations: Array<[string, RegExp]> = [
+      ["release", /gh release create "\$TAG"/],
+      ["release", /gh release upload "\$TAG"/],
+      ["promote", /gh release edit "\$TAG" --repo "\$REPO" --latest/],
+    ];
+    const found: string[] = [];
+    for (const [name, job] of privilegedJobs) {
+      for (const step of job.steps) {
+        const run = (step["run"] as string) ?? "";
+        if (hasTokenEnv(step)) {
+          const matched = expectedMutations.filter(([jn, re]) => jn === name && re.test(run));
+          assert.ok(matched.length > 0, `a token-bearing step in ${name} is not a recognized release mutation: ${run.slice(0, 120)}`);
+          assert.ok(!run.includes("node ") && !run.includes(".mjs"), "token-bearing steps execute only the pinned gh CLI, never custom code");
+          found.push(...matched.map(() => name));
+        } else {
+          // Token-free steps must not invoke the release API or make
+          // authenticated calls, and must not interpolate github.token.
+          assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(run), `token-free step in ${name} must not call the GitHub release API`);
+          assert.ok(!run.includes("Authorization: Bearer"), "token-free steps never make authenticated API calls");
+          assert.ok(!run.includes("${{ github.token }}"), "token-free steps never reference the token context directly");
+        }
+      }
+      assert.ok(!("GH_TOKEN" in (job.env ?? {})) && !("GITHUB_TOKEN" in (job.env ?? {})), `${name} must not declare GH_TOKEN/GITHUB_TOKEN at JOB level (it would leak to every step)`);
+    }
+    assert.deepEqual(found.sort(), ["promote", "release", "release"], "exactly three privileged mutation steps carry the write token: create, upload, promote");
+  });
+
+  test("no workflow-level or job-level env exposes the release credential anywhere", () => {
+    assert.equal(wf.env, undefined, "no workflow-level env block exists (a token declared there would leak to every step of every job)");
+    for (const job of allJobs) {
+      assert.ok(!("GH_TOKEN" in (job.env ?? {})), `job ${job.name ?? "(unnamed)"} must not declare GH_TOKEN at job level`);
+      assert.ok(!("GITHUB_TOKEN" in (job.env ?? {})), `job ${job.name ?? "(unnamed)"} must not declare GITHUB_TOKEN at job level`);
+    }
+    // The token string may only appear inside step-level env values.
+    const tokenSteps = allJobs.flatMap((j) => j.steps.filter((s) => typeof s["env"] === "object" && s["env"] !== null && "GH_TOKEN" in ((s["env"] ?? {}) as Record<string, unknown>)));
+    for (const step of tokenSteps) {
+      assert.equal(stepEnv(step)["GH_TOKEN"], "${{ github.token }}", "step-level tokens always reference the automatic workflow token (no other credential source exists)");
+    }
+  });
+
+  test("artifact download and integrity/verification steps never carry a release-write credential", () => {
+    for (const job of allJobs) {
+      const writeCapable = effectivePermissions(job)["contents"] === "write";
+      for (const step of job.steps) {
+        const uses = (step["uses"] as string | undefined) ?? "";
+        if (uses.startsWith("actions/download-artifact") || uses.startsWith("actions/upload-artifact")) {
+          assert.ok(!hasTokenEnv(step), `${uses} in ${job.name ?? "(unnamed)"} must not receive a GitHub token (it authenticates with the artifact-scoped runtime token)`);
+        }
+        const run = (step["run"] as string) ?? "";
+        const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("--scope latest") || run.includes("verify-snapshot");
+        if (isVerification && writeCapable) {
+          assert.ok(!run.includes("node ") && !run.includes(".mjs"), "verification inside a write-permission job must be pure shell (sha256sum), never custom code");
+          assert.ok(!hasTokenEnv(step), "verification steps never carry the write token");
+        }
+      }
+    }
+    // The same-release roundtrip gate is a READ-ONLY job with NO token at all.
+    assert.equal(verifyVersioned.permissions, undefined, "verify-versioned inherits the read-only default");
+    for (const step of verifyVersioned.steps) {
+      assert.ok(!hasTokenEnv(step), "the roundtrip gate runs completely token-free (the tag URLs are public)");
+    }
+  });
+
+  test("read-only rollback discovery remains possible AND the post-activation gate stays read-only", () => {
+    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("release-latest"));
+    assert.ok(step, "rollback discovery exists in the read-only publish job");
+    assert.equal(publish.permissions?.["contents"], "read", "discovery runs under a read-only grant");
+    // Post-activation gate: read-only token, no mutation.
+    assert.equal(verifyStable.permissions, undefined, "verify-stable has no elevated permissions");
+    const gate = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope latest")));
+    assert.ok(gate, "the stable gate step exists");
+    assert.equal(stepEnv(gate!)["GH_TOKEN"], "${{ github.token }}", "the stable gate authenticates with the READ-ONLY workflow token");
+    assert.ok(!runBlocks(verifyStable).join("\n").includes("gh release"), "the stable gate performs NO release-mutating operations");
+  });
+
+  test("permissions stay least-privilege: five read-only jobs, two narrow write jobs", () => {
     assert.deepEqual(wf.permissions, { contents: "read" });
     assert.equal(generate.permissions, undefined);
     assert.equal(verify.permissions, undefined);
+    assert.deepEqual(publish.permissions, { contents: "read" });
+    assert.deepEqual(release.permissions, { contents: "write" });
+    assert.equal(verifyVersioned.permissions, undefined);
+    assert.deepEqual(promote.permissions, { contents: "write" });
     assert.equal(verifyStable.permissions, undefined);
-    assert.deepEqual(publish.permissions, { contents: "write" });
-    assert.ok(!publish.permissions || Object.keys(publish.permissions).every((k) => k === "contents"));
-  });
-
-  test("the post-activation gate is a READ-ONLY job using the read-only workflow token", () => {
-    assert.equal(verifyStable.permissions, undefined, "verify-stable has no elevated permissions");
-    const step = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope latest")));
-    assert.ok(step, "the stable gate step exists");
-    assert.equal(((step!["env"] ?? {}) as Record<string, unknown>)["GH_TOKEN"], "${{ github.token }}", "the stable gate authenticates with the READ-ONLY workflow token");
-    assert.ok(!runBlocks(verifyStable).join("\n").includes("gh release"), "the stable gate performs NO release-mutating operations");
+    for (const [, job] of privilegedJobs) {
+      assert.ok(Object.keys(job.permissions ?? {}).every((k) => k === "contents"), "privileged jobs grant ONLY contents (nothing else is elevated)");
+    }
   });
 });
 
@@ -363,6 +489,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
 describe("publish-console-snapshot workflow — rollback discovery hardening (review Task 4)", () => {
   const wf = loadWorkflow();
   const publish = wf.jobs["publish"]!;
+  const release = wf.jobs["release"]!;
 
   test("rollback discovery uses the typed `release-latest` gate, not error-suppressed gh api", () => {
     const runs = runBlocks(publish).join("\n");
@@ -372,10 +499,12 @@ describe("publish-console-snapshot workflow — rollback discovery hardening (re
   });
 
   test("the tag-collision gate distinguishes absent / exists / gate-failure (never treats an API failure as 'absent')", () => {
-    const runs = runBlocks(publish).join("\n");
-    assert.match(runs, /case "\$status" in/, "explicit three-way exit-status handling");
-    assert.match(runs, /status=\$\?/, "the gate captures the real exit status");
-    assert.match(runs, /refusing to treat this as 'tag absent'/, "a failing gate aborts the run");
+    for (const [name, job] of [["publish", publish], ["release", release]] as const) {
+      const runs = runBlocks(job).join("\n");
+      assert.match(runs, /case "\$status" in/, `${name}: explicit three-way exit-status handling`);
+      assert.match(runs, /status=\$\?/, `${name}: the gate captures the real exit status`);
+      assert.match(runs, /refusing to treat this as 'tag absent'/, `${name}: a failing gate aborts the run`);
+    }
   });
 
   test("the release-collision belt check is ALSO three-way (404 absent / 200 exists / anything else aborts)", () => {
@@ -385,17 +514,22 @@ describe("publish-console-snapshot workflow — rollback discovery hardening (re
     assert.match(runs, /404\) echo "no release exists/, "HTTP 404 is the ONLY 'absent' verdict");
     assert.match(runs, /200\) echo "a release for tag \$TAG already exists/, "HTTP 200 is an aborting collision");
     assert.match(runs, /refusing to treat this as 'no release'/, "a transport failure or unexpected status aborts the run");
-    assert.ok(!runs.includes('if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then\n            echo "a release'), "the old suppression-shaped belt check is GONE");
+    const beltStep = publish.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("releases/tags/")));
+    assert.ok(beltStep, "the belt-check step exists");
+    assert.equal(stepEnv(beltStep!)["GH_TOKEN"], "${{ github.token }}", "the belt check authenticates with the workflow token");
+    assert.equal(publish.permissions?.["contents"], "read", "the belt check's token is READ-ONLY because the job grants only contents:read");
   });
 
-  test("the rollback pointer is recorded BEFORE any release operation and surfaced even on failure", () => {
+  test("the rollback pointer is recorded BEFORE any release operation (job chain enforces the order)", () => {
     const steps = publish.steps;
     const runs = steps.map((s) => (typeof s["run"] === "string" ? (s["run"] as string) : ""));
     const rollbackIdx = runs.findIndex((r) => r.includes("previous_latest_tag"));
-    const createIdx = runs.findIndex((r) => r.includes("gh release create"));
-    assert.ok(rollbackIdx > -1 && createIdx > -1 && rollbackIdx < createIdx, "rollback discovery precedes release creation");
+    assert.ok(rollbackIdx > -1, "rollback discovery runs in the publish job");
     const rollbackRun = runs[rollbackIdx] ?? "";
     assert.match(rollbackRun, /GITHUB_STEP_SUMMARY/, "the pointer is written to the run summary at discovery time");
+    // The release job (which performs the first mutation) DEPENDS on publish.
+    assert.equal(release.needs?.includes("publish"), true, "release creation is unreachable until the rollback pointer has been recorded (needs chain)");
+    assert.equal(publish.outputs?.["previous_latest_tag"], "${{ steps.rollback.outputs.previous_latest_tag }}", "the pointer crosses the job boundary as a job output");
   });
 });
 
@@ -404,10 +538,13 @@ describe("publish-console-snapshot workflow — rollback discovery hardening (re
 describe("publish-console-snapshot workflow — same-release verification (review Task 5)", () => {
   const wf = loadWorkflow();
   const publish = wf.jobs["publish"]!;
+  const release = wf.jobs["release"]!;
+  const verifyVersioned = wf.jobs["verify-versioned"]!;
+  const promote = wf.jobs["promote"]!;
   const verifyStable = wf.jobs["verify-stable"]!;
 
   test("roundtrip verification is tag-scoped (--scope versioned) — all three assets from ONE exact release", () => {
-    const runs = runBlocks(publish).join("\n");
+    const runs = runBlocks(verifyVersioned).join("\n");
     assert.match(runs, /verify-release-assets[\s\S]*--scope versioned/, "versioned verification uses the same-release CLI gate");
   });
 
@@ -419,21 +556,33 @@ describe("publish-console-snapshot workflow — same-release verification (revie
     assert.ok(!/curl[\s\S]*stable-check/.test(raw), "the three-separate-curl stable check is replaced by the same-release gate");
   });
 
-  test("verification steps run AFTER upload and promotion in the required order", () => {
-    const runs = runBlocks(publish);
-    const uploadIdx = runs.findIndex((r) => r.includes("gh release upload"));
-    const versionedVerifyIdx = runs.findIndex((r) => r.includes("--scope versioned"));
-    // The promotion STEP (the rollback-discovery step only MENTIONS the edit
-    // command in its summary text, so match the activation step explicitly).
-    const promoteIdx = runs.findIndex((r) => r.includes('gh release edit "$TAG" --repo "$REPO" --latest'));
-    assert.ok(uploadIdx > -1 && versionedVerifyIdx > uploadIdx, "same-release verification follows upload");
-    assert.ok(promoteIdx > versionedVerifyIdx, "promotion follows verification");
-    // The post-activation stable gate runs in the read-only verify-stable job.
-    assert.equal(verifyStable.needs?.includes("publish"), true, "post-activation verification is a separate job that runs after publish");
+  test("verification and promotion run in the required order ACROSS JOBS", () => {
+    const relRuns = runBlocks(release);
+    const uploadIdx = relRuns.findIndex((r) => r.includes("gh release upload"));
+    assert.ok(uploadIdx > -1, "the release job uploads the assets");
+    // The roundtrip verification is a SEPARATE job that needs `release`,
+    // and promotion is a job that needs the roundtrip verification.
+    assert.equal(verifyVersioned.needs?.includes("release"), true, "same-release verification follows upload (job boundary)");
+    assert.equal(promote.needs?.includes("verify-versioned"), true, "promotion follows verification (job boundary)");
+    assert.equal(verifyStable.needs?.includes("promote"), true, "post-activation verification follows promotion (job boundary)");
+    // The promotion job contains exactly ONE gh command — the metadata flip.
+    const promoteRuns = runBlocks(promote);
+    const ghSteps = promoteRuns.filter((r) => /gh release /.test(r));
+    assert.equal(ghSteps.length, 1, "the promotion job performs exactly one GitHub release operation");
+    assert.match(ghSteps[0] ?? "", /gh release edit "\$TAG" --repo "\$REPO" --latest/);
   });
 
-  test("the activated tag crosses the job boundary through a validated output and is re-checked for shape", () => {
+  test("the activated tag crosses every job boundary through validated outputs and is re-checked for shape", () => {
     assert.equal(publish.outputs?.["versioned_tag"], "${{ steps.facts.outputs.tag }}", "publish exposes the strictly-validated tag as a job output");
+    for (const [name, job, from] of [
+      ["release", release, "${{ needs.publish.outputs.versioned_tag }}"],
+      ["verify-versioned", verifyVersioned, "${{ needs.release.outputs.versioned_tag }}"],
+      ["promote", promote, "${{ needs.verify-versioned.outputs.versioned_tag }}"],
+    ] as const) {
+      assert.equal(job.outputs?.["versioned_tag"], from, `${name} passes the tag through its job output`);
+      const shapeStep = job.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("strict versioned-tag shape") || (s["run"] as string).includes("fails the strict versioned-tag shape")));
+      assert.ok(shapeStep, `${name} re-validates the tag shape before use`);
+    }
     const stableGateStep = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope latest")));
     assert.ok(stableGateStep, "the stable gate step exists");
     assert.equal(

@@ -333,21 +333,38 @@ full verification (§3). The stable URL is the constant
 
 ## 10. Remediation hardening (PR #5 — review Tasks 1, 4, 5)
 
-* **Execution restriction (Task 1):** ALL FOUR jobs carry
+* **Execution restriction (Task 1):** ALL SEVEN jobs carry
   `if: github.ref == 'refs/heads/main'` AND an explicit guard step;
   every repository checkout is pinned to `github.sha` and asserts
   `git rev-parse HEAD` equals it, so the provenance
-  `indexerSourceCommitSha` is the actual checked-out commit.
-* **Write-token isolation (Task 1 — second-round correction):** the
+  `indexerSourceCommitSha` is the actual checked-out commit and the
+  release `--target` is the same asserted commit.
+* **Write-token isolation (Task 1 — third-round correction):** the
   first remediation attached `GH_TOKEN` per-step but kept a job-level
   `permissions: contents: write` on a job that also ran checkout,
-  setup-node, pnpm and dependency installation. That was insufficient:
-  the job-level grant makes `github.token` write-capable for the whole
-  job, and first-party actions consume it BY DEFAULT
-  (`actions/checkout`'s `token` input, `actions/setup-node`'s `token`
-  input) even without an explicit `GH_TOKEN` env. The corrected
-  structure separates read-only preparation/verification from the
-  privileged release operations:
+  setup-node, pnpm and dependency installation. The second remediation
+  removed checkout/setup-node/pnpm from the privileged job but STILL
+  executed repository-built code (the release-ops bundle, provenance
+  parsing) inside the write-permission job — and GitHub makes
+  `github.token` write-capable for EVERY step of a job whose
+  `permissions` grant write, whether or not an explicit `GH_TOKEN` env
+  is attached. The corrected structure makes the write-capable token
+  unreachable to custom code by construction: ALL custom code runs in
+  read-only jobs, and ONLY two jobs hold `contents: write` — each
+  containing nothing but token-free precondition checks and pinned
+  `gh release` mutation commands. Seven jobs:
+
+  | Job | Effective permissions | Executes custom code? | Token access |
+  | --- | --- | --- | --- |
+  | `generate` | `contents: read` (workflow default) | YES (build + `publish-snapshot`/`verify-snapshot`) | `github.token` READ-ONLY (consumed implicitly by checkout/setup-node; no `GH_TOKEN` env anywhere); RPC secrets to the snapshot CLI only |
+  | `verify` | `contents: read` (default) | YES (independent re-verification + builds the zero-dep release-ops bundle) | `github.token` READ-ONLY (implicit via checkout/setup-node only) |
+  | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `release-latest` discovery) | `github.token` READ-ONLY, step-level env on the belt-check GET and the discovery step ONLY — the rollback discovery custom code can never see a write-capable token |
+  | `release` | `contents: write` | **NO** | `github.token` WRITE-CAPABLE only on the two `gh release create/upload` steps (step-level env); all other steps token-free (sha256 belt, tag shape re-validation, ls-remote collision gate, download-artifact) |
+  | `verify-versioned` | `contents: read` (default) | YES (prebuilt zero-dep bundle, `--scope versioned` roundtrip) | NO token anywhere — the tag URLs are public |
+  | `promote` | `contents: write` | **NO** | `github.token` WRITE-CAPABLE only on the single `gh release edit --latest` step (step-level env); the tag-shape precondition step is token-free |
+  | `verify-stable` | `contents: read` (default) | YES (reviewed commit's own verification CLI, `--scope latest`) | `github.token` READ-ONLY, step-level env on the gate step only |
+
+  Design points:
   * `generate` (read-only) — build, generate, validate, stage the
     artifact bundle;
   * `verify` (read-only) — independently re-download the staged bundle,
@@ -356,23 +373,57 @@ full verification (§3). The stable URL is the constant
     self-contained bundle with ZERO npm runtime dependencies
     (`pnpm run bundle:release-ops`, `node:` builtins only; pinned by
     test/releaseOpsCliBundle.test.ts);
-  * `publish` (`contents: write`) — the ONLY privileged job, and it is
-    minimal: no checkout, no dependency installation, no build, no pnpm,
-    no repository code, and deliberately NO checkout/setup-node actions
-    (both consume `github.token` by default). Its only `uses:` steps are
-    actions/download-artifact (artifact-scoped runtime token, no
-    `github.token` input). Every command is runner-preinstalled tooling
-    (git, curl, sha256sum, gh) or the prebuilt zero-dependency bundle on
-    the runner's plain `node`. The write-capable `GH_TOKEN` exists only
-    as an explicit step-level env on the GitHub release API steps;
+  * `publish` (READ-ONLY) — every gate and every piece of custom code:
+    checksum belt over the downloaded bytes, provenance tag parsing +
+    strict shape validation, the fail-closed three-way tag/release
+    collision gates, and the hardened `release-latest` rollback-pointer
+    discovery (custom bundle, READ-ONLY token). It declares
+    `permissions: contents: read` EXPLICITLY, so a write-capable token
+    cannot exist in it under any circumstance;
+  * `release` (`contents: write`, ZERO custom code) — no checkout, no
+    setup-node, no pnpm, no node invocation, no repository or artifact-
+    executed code. Its only action is actions/download-artifact
+    (artifact-scoped runtime token, no `github.token` input). Steps:
+    token-free sha256 belt + tag shape re-validation + three-way
+    ls-remote collision gate immediately before the mutation, then
+    `gh release create --latest=false --target <asserted sha>` and
+    `gh release upload` — the ONLY steps where the write-capable token
+    exists (step-level env). GitHub itself fails closed at the mutation
+    (422 already-exists on create; asset-exists on upload);
+  * `verify-versioned` (read-only, NO token) — the same-release
+    roundtrip gate BETWEEN upload and promotion: the three assets of
+    THAT EXACT versioned release are verified through their public tag
+    URLs; the stable pointer cannot move until this job is green
+    (`promote` has `needs: verify-versioned`);
+  * `promote` (`contents: write`, ZERO custom code) — exactly ONE
+    privileged operation, `gh release edit <tag> --latest`, with the
+    write-capable token as that step's env only;
   * `verify-stable` (read-only) — the post-activation stable gate, run
     with the READ-ONLY workflow token from a full repository checkout.
-  The privileged job's trust chain: the bundle it executes was built by
-  the read-only verify job from the exact asserted commit and travels
-  through the run-scoped artifact service within one workflow run; the
-  artifact bytes it uploads were verified by BOTH read-only jobs, and
-  the privileged job re-checks the checksum over the downloaded bytes
-  (`sha256sum -c`) before anything is published.
+  The privileged jobs' trust chain: the bytes they upload were
+  schema- and integrity-verified by BOTH read-only jobs; the release
+  job re-checks the checksum over its own downloaded bytes
+  (`sha256sum -c`) and re-validates the tag shape before anything is
+  published; the tag crossing job boundaries is validated AGAIN in
+  every consuming job; `verify-versioned` verifies the released bytes
+  BEFORE `promote` may run (needs: chain enforces the order);
+  `verify-stable` re-verifies the stable pointer after activation.
+
+  **Honest limitation of the boundary:** GitHub's automatic
+  GITHUB_TOKEN can only obtain `contents: write` through a job-level
+  `permissions` grant — there is no per-step permission knob, and the
+  write-capable token is therefore present (though unreferenced) in the
+  `release` and `promote` job environments as a whole. The isolation
+  boundary is JOBS WITHOUT CUSTOM CODE: no repository-built script, no
+  node execution, no artifact-executed code, and no action that
+  consumes `github.token` by default exists in those jobs; every step
+  that is not a release mutation is token-free. A separately scoped
+  release credential (e.g. a fine-grained PAT with only release-write
+  stored as a repository secret) would narrow the boundary further but
+  requires owner-provisioned credentials and is deliberately NOT
+  improvised here. This structural boundary is pinned by
+  test/publishWorkflow.test.ts (global invariant: any step executing
+  node/npm/a bundle must belong to a job without `contents: write`).
 * **Rollback-pointer discovery (Task 4):** the previous
   `gh api ... 2>/dev/null || echo ""` pattern is replaced by
   `release-latest` (src/releaseOps.ts): only a genuine HTTP 404 yields
