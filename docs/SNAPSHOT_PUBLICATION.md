@@ -46,6 +46,18 @@ designation**, served through the constant URL
 https://github.com/GraveYield/grave-indexer/releases/latest/download/console-snapshot.json
 ```
 
+**PRIVATE-REPOSITORY NOTE (owner changed visibility, 2026-11-22):** that
+URL — and the versioned tag asset URLs — now REQUIRE AUTHENTICATION.
+Unauthenticated requests to a private repository return HTTP 404. The
+workflow's own verification gates fetch through the authenticated REST
+API path with the READ-ONLY workflow token (§11); UNAUTHENTICATED
+consumers (the `graveyield-console` deployment) can NO LONGER FETCH THE
+ARTIFACT AT ALL — the production integration blocker and the secure
+alternatives are documented in §12. Verified GitHub behavior of the
+latest-release redirect path itself (one release's bytes per fetch,
+drafts/prereleases excluded) is unchanged; the tests below were live
+while the repository was public.
+
 Activation is a single metadata operation — `gh release edit <tag>
 --latest` (API `PATCH make_latest=true`) — executed ONLY after:
 
@@ -56,15 +68,18 @@ Activation is a single metadata operation — `gh release edit <tag>
    `verify` job, then by the privileged job's pure-shell `sha256sum -c`
    belt over the exact bytes it is about to upload;
 3. the versioned release was created (duplicate tag aborts, immutably);
-4. the three assets were downloaded BACK through the public
-   unauthenticated URLs and re-verified (schema-v2 parse, `sha256sum
+4. the three assets were downloaded BACK through the authenticated API
+   path (the public unauthenticated URLs were valid only while the
+   repository was public) and re-verified (schema-v2 parse, `sha256sum
    -c`, and the provenance sidecar's `versionedTag`).
 
 After activation the workflow re-fetches the stable URL and requires
 the served bytes to verify against a sidecar that names the activated
 tag (`assertStableReferenceServesVerifiedArtifact`).
 
-Verified GitHub behavior (2026-11-21, live unauthenticated tests):
+Verified GitHub behavior (2026-11-21, live unauthenticated tests — the
+repository was public at the time; since the visibility change the same
+paths require authentication):
 
 * `releases/latest/download/<asset>` redirects to the latest release's
   tag path and serves that release's asset BY NAME — one release's
@@ -92,7 +107,7 @@ Verified GitHub behavior (2026-11-21, live unauthenticated tests):
 | Partial upload cannot be mistaken for success | Promotion runs only after the roundtrip re-verification of ALL three assets |
 | No mixture, no missing window | The stable URL resolves to ONE release's complete asset set before AND after the flip; the flip moves the whole pointer at once |
 | Auditable history | Every publication remains a distinct immutable release |
-| Constant Console-compatible URL | `releases/latest/download/console-snapshot.json` — plain `fetch`, redirects followed, no auth |
+| Constant Console-compatible URL | `releases/latest/download/console-snapshot.json` — while the repository was public: plain `fetch`, redirects followed, no auth. **Since the visibility change this URL requires authentication — the Console can no longer fetch it (§12 blocker)** |
 
 ## 4. Stable-reference semantics (the ten questions)
 
@@ -117,10 +132,13 @@ Verified GitHub behavior (2026-11-21, live unauthenticated tests):
    (plus the `console-snapshot-provenance.json` and
    `console-snapshot.sha256` variants). Only the content behind it
    changes.
-6. **Can the Console retrieve it without authentication?** Yes — the
-   repository is public and the latest-release asset path serves
-   unauthenticated HTTP with redirects (`fetch(url, { redirect:
-   "follow" })` is compatible).
+6. **Can the Console retrieve it without authentication?** NO — the
+   repository is now PRIVATE. The visibility change makes unauthenticated
+   retrieval IMPOSSIBLE and breaks the shipped Console consumer contract.
+   See §12 for the production integration blocker and the owner-decision
+   alternatives. (Historical, public-repository behavior: the
+   latest-release asset path served unauthenticated HTTP with redirects
+   (`fetch(url, { redirect: "follow" })` was compatible).)
 7. **Can a failed update leave the URL unavailable?** No. Failures
    before activation leave the previous release designated (available).
    The only failure mode AFTER activation is the activation itself
@@ -339,8 +357,8 @@ full verification (§3). The stable URL is the constant
   `git rev-parse HEAD` equals it, so the provenance
   `indexerSourceCommitSha` is the actual checked-out commit and the
   release `--target` is the same asserted commit.
-* **Write-token isolation (Task 1 — third-round correction):** the
-  first remediation attached `GH_TOKEN` per-step but kept a job-level
+* **Write-token isolation (Task 1 — FOURTH-round correction, final):**
+  the first remediation attached `GH_TOKEN` per-step but kept a job-level
   `permissions: contents: write` on a job that also ran checkout,
   setup-node, pnpm and dependency installation. The second remediation
   removed checkout/setup-node/pnpm from the privileged job but STILL
@@ -348,21 +366,29 @@ full verification (§3). The stable URL is the constant
   parsing) inside the write-permission job — and GitHub makes
   `github.token` write-capable for EVERY step of a job whose
   `permissions` grant write, whether or not an explicit `GH_TOKEN` env
-  is attached. The corrected structure makes the write-capable token
-  unreachable to custom code by construction: ALL custom code runs in
-  read-only jobs, and ONLY two jobs hold `contents: write` — each
-  containing nothing but token-free precondition checks and pinned
-  `gh release` mutation commands. Seven jobs:
+  is attached. The third remediation moved ALL custom code into
+  read-only jobs, leaving the write grant only on two jobs with zero
+  custom code. The FINAL correction eliminates the write grant
+  entirely: the owner provisioned a fine-grained PAT exclusively for
+  this repository (repository secret `GY_RELEASE_PAT`), and the release
+  mutations authenticate with THAT credential on the two mutation
+  steps' env alone. **No job in the workflow declares `contents:
+  write` — the automatic GITHUB_TOKEN is READ-ONLY in all seven jobs by
+  explicit declaration** (each job carries `permissions: contents:
+  read`; the workflow default is `contents: read`). Seven jobs:
 
   | Job | Effective permissions | Executes custom code? | Token access |
   | --- | --- | --- | --- |
-  | `generate` | `contents: read` (workflow default) | YES (build + `publish-snapshot`/`verify-snapshot`) | `github.token` READ-ONLY (consumed implicitly by checkout/setup-node; no `GH_TOKEN` env anywhere); RPC secrets to the snapshot CLI only |
-  | `verify` | `contents: read` (default) | YES (independent re-verification + builds the zero-dep release-ops bundle) | `github.token` READ-ONLY (implicit via checkout/setup-node only) |
-  | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `release-latest` discovery) | `github.token` READ-ONLY, step-level env on the belt-check GET and the discovery step ONLY — the rollback discovery custom code can never see a write-capable token |
-  | `release` | `contents: write` | **NO** | `github.token` WRITE-CAPABLE only on the two `gh release create/upload` steps (step-level env); all other steps token-free (sha256 belt, tag shape re-validation, ls-remote collision gate, download-artifact) |
-  | `verify-versioned` | `contents: read` (default) | YES (prebuilt zero-dep bundle, `--scope versioned` roundtrip) | NO token anywhere — the tag URLs are public |
-  | `promote` | `contents: write` | **NO** | `github.token` WRITE-CAPABLE only on the single `gh release edit --latest` step (step-level env); the tag-shape precondition step is token-free |
-  | `verify-stable` | `contents: read` (default) | YES (reviewed commit's own verification CLI, `--scope latest`) | `github.token` READ-ONLY, step-level env on the gate step only |
+  | `generate` | `contents: read` (EXPLICIT) | YES (build + `publish-snapshot`/`verify-snapshot`) | `github.token` READ-ONLY (consumed implicitly by checkout/setup-node; no `GH_TOKEN` env anywhere); RPC secrets to the snapshot CLI only |
+  | `verify` | `contents: read` (EXPLICIT) | YES (independent re-verification + builds the zero-dep release-ops bundle) | `github.token` READ-ONLY (implicit via checkout/setup-node only) |
+  | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `release-latest` discovery) | `github.token` READ-ONLY, step-level env on the tag-collision gate, the belt-check GET and the discovery step ONLY — never the PAT |
+  | `release` | `contents: read` (EXPLICIT) | **NO** | `github.token` READ-ONLY, step-level env on the authenticated tag-collision gate ONLY; `GY_RELEASE_PAT` step-level env on the `gh release create/upload` mutation step ONLY |
+  | `verify-versioned` | `contents: read` (EXPLICIT) | YES (prebuilt zero-dep bundle, `--scope versioned` roundtrip) | `github.token` READ-ONLY, step-level env on the roundtrip gate ONLY (the repository is private: release assets 404 unauthenticated) — never the PAT |
+  | `promote` | `contents: read` (EXPLICIT) | **NO** | `GY_RELEASE_PAT` step-level env on the single `gh release edit --latest` mutation step ONLY; the tag-shape precondition step is token-free |
+  | `verify-stable` | `contents: read` (EXPLICIT) | YES (reviewed commit's own verification CLI, `--scope latest`) | `github.token` READ-ONLY, step-level env on the gate step only |
+
+  See §11 for the complete credential-access matrix and the trust
+  assumptions, and §12 for the private-visibility consequences.
 
   Design points:
   * `generate` (read-only) — build, generate, validate, stage the
@@ -380,24 +406,30 @@ full verification (§3). The stable URL is the constant
     discovery (custom bundle, READ-ONLY token). It declares
     `permissions: contents: read` EXPLICITLY, so a write-capable token
     cannot exist in it under any circumstance;
-  * `release` (`contents: write`, ZERO custom code) — no checkout, no
-    setup-node, no pnpm, no node invocation, no repository or artifact-
-    executed code. Its only action is actions/download-artifact
-    (artifact-scoped runtime token, no `github.token` input). Steps:
-    token-free sha256 belt + tag shape re-validation + three-way
-    ls-remote collision gate immediately before the mutation, then
-    `gh release create --latest=false --target <asserted sha>` and
-    `gh release upload` — the ONLY steps where the write-capable token
-    exists (step-level env). GitHub itself fails closed at the mutation
-    (422 already-exists on create; asset-exists on upload);
-  * `verify-versioned` (read-only, NO token) — the same-release
-    roundtrip gate BETWEEN upload and promotion: the three assets of
-    THAT EXACT versioned release are verified through their public tag
-    URLs; the stable pointer cannot move until this job is green
-    (`promote` has `needs: verify-versioned`);
-  * `promote` (`contents: write`, ZERO custom code) — exactly ONE
-    privileged operation, `gh release edit <tag> --latest`, with the
-    write-capable token as that step's env only;
+  * `release` (`contents: read` + PAT on the mutation step, ZERO custom
+    code) — no checkout, no setup-node, no pnpm, no node invocation, no
+    repository or artifact-executed code. Its only action is
+    actions/download-artifact (artifact-scoped runtime token, no
+    `github.token` input). Steps: token-free sha256 belt + tag shape
+    re-validation + the authenticated three-way tag-collision gate
+    (READ-ONLY automatic token — the unauthenticated ls-remote probe
+    cannot resolve a private repository) immediately before the
+    mutation, then `gh release create --latest=false --target <asserted
+    sha>` and `gh release upload` — the ONLY step where the
+    `GY_RELEASE_PAT` write credential exists (step-level env). GitHub
+    itself fails closed at the mutation (422 already-exists on create;
+    asset-exists on upload);
+  * `verify-versioned` (read-only) — the same-release roundtrip gate
+    BETWEEN upload and promotion: the three assets of THAT EXACT
+    versioned release are verified through the AUTHENTICATED API path
+    with the prebuilt zero-dependency bundle and the READ-ONLY workflow
+    token (the repository is private — release assets 404 for
+    unauthenticated requests); the stable pointer cannot move until
+    this job is green (`promote` has `needs: verify-versioned`);
+  * `promote` (`contents: read` + PAT on the mutation step, ZERO custom
+    code) — exactly ONE privileged operation, `gh release edit <tag>
+    --latest`, with the `GY_RELEASE_PAT` credential as that step's env
+    only (the automatic token is read-only);
   * `verify-stable` (read-only) — the post-activation stable gate, run
     with the READ-ONLY workflow token from a full repository checkout.
   The privileged jobs' trust chain: the bytes they upload were
@@ -409,21 +441,21 @@ full verification (§3). The stable URL is the constant
   BEFORE `promote` may run (needs: chain enforces the order);
   `verify-stable` re-verifies the stable pointer after activation.
 
-  **Honest limitation of the boundary:** GitHub's automatic
-  GITHUB_TOKEN can only obtain `contents: write` through a job-level
-  `permissions` grant — there is no per-step permission knob, and the
-  write-capable token is therefore present (though unreferenced) in the
-  `release` and `promote` job environments as a whole. The isolation
-  boundary is JOBS WITHOUT CUSTOM CODE: no repository-built script, no
-  node execution, no artifact-executed code, and no action that
-  consumes `github.token` by default exists in those jobs; every step
-  that is not a release mutation is token-free. A separately scoped
-  release credential (e.g. a fine-grained PAT with only release-write
-  stored as a repository secret) would narrow the boundary further but
-  requires owner-provisioned credentials and is deliberately NOT
-  improvised here. This structural boundary is pinned by
-  test/publishWorkflow.test.ts (global invariant: any step executing
-  node/npm/a bundle must belong to a job without `contents: write`).
+  **Honest limitation of the boundary (now reduced, not eliminated):**
+  GitHub's automatic GITHUB_TOKEN can only obtain `contents: write`
+  through a job-level `permissions` grant — there is no per-step
+  permission knob. The final structure sidesteps this entirely: NO job
+  grants write, so a write-capable AUTOMATIC token does not exist
+  anywhere in the workflow. The write capability lives exclusively in
+  the `GY_RELEASE_PAT` secret, which GitHub injects ONLY into the two
+  steps whose env explicitly references it — and the jobs that hold it
+  contain zero custom code (no checkout, no node, no dependencies), so
+  nothing but the pinned `gh` release-mutation commands can read it.
+  Residual trust assumptions are listed in §11. This structural
+  boundary is pinned by test/publishWorkflow.test.ts (global
+  invariants: no job declares a write grant; the PAT appears only on
+  the two mutation steps; no code-executing, artifact or checkout step
+  references it).
 * **Rollback-pointer discovery (Task 4):** the previous
   `gh api ... 2>/dev/null || echo ""` pattern is replaced by
   `release-latest` (src/releaseOps.ts): only a genuine HTTP 404 yields
@@ -441,3 +473,135 @@ full verification (§3). The stable URL is the constant
   activated tag before the three stable-URL files are cross-checked, so
   neither pointer drift nor an in-flight promotion race can bless a
   mixed artifact set.
+
+## 11. Credential-access matrix and PAT trust assumptions (final credential isolation)
+
+The owner provisioned a fine-grained PAT exclusively for
+`GraveYield/grave-indexer` and stored it as the repository Actions
+secret `GY_RELEASE_PAT`. The workflow consumes it BY REFERENCE ONLY
+(`${{ secrets.GY_RELEASE_PAT }}`); nothing in this repository ever
+prints, decodes, logs or otherwise exposes its value, and the value was
+never accessed while preparing this change.
+
+### Who can access what
+
+| Credential | Where it exists | What it can do |
+| --- | --- | --- |
+| `github.token` (automatic) | ALL SEVEN jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, latest-designation query, authenticated asset fetches during verification) |
+| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly TWO steps: the `release` job's `gh release create/upload` step and the `promote` job's single `gh release edit --latest` step | GitHub release mutations (create immutable versioned release, upload its three assets, flip the latest designation) |
+| `ACTIONS_RUNTIME_TOKEN` | Managed by GitHub for `actions/upload-artifact` / `actions/download-artifact` inside one workflow run | Run-scoped artifact transport only; not a `github.token` input |
+| `MAINNET_RPC_URL` / `DEVNET_RPC_URL` | `generate` job env (RPC access for snapshot generation) | RPC endpoints; no GitHub capability |
+
+### The steps that never receive a write credential
+
+Every job that checks out code, installs dependencies, builds, runs
+tests, generates snapshots, executes repository-built JavaScript,
+downloads or verifies artifacts, validates schema/provenance/checksums,
+or discovers the rollback pointer runs under an explicit
+`contents: read` grant and references `github.token` (read-only) or no
+token at all — NEVER the PAT. The release and promote jobs hold the PAT
+but contain ZERO custom code: no checkout, no dependency installation,
+no node, no repository script, no artifact-executed code — the only
+commands that can read the credential are the pinned `gh release`
+mutation invocations themselves.
+
+### Trust assumptions (owner-side, not verifiable from this repository)
+
+1. **PAT scope.** The workflow cannot verify the PAT's permission
+   configuration. The isolation above assumes the owner provisioned it
+   fine-grained, scoped to `GraveYield/grave-indexer` only, with
+   Contents read/write (the minimum needed for release create/upload/
+   edit) and no additional permissions. If the PAT is broader, the
+   blast radius of the two mutation steps grows accordingly — that is a
+   provisioning decision outside the workflow's control.
+2. **Secret masking.** GitHub masks registered secret values in run
+   logs; the workflow additionally never echoes, interpolates into
+   URLs, or writes the credential to summaries (pinned by test).
+3. **`gh` CLI trust.** The mutation steps execute the runner-preinstalled
+   GitHub CLI (not a third-party action, not downloaded code). This
+   trusts the runner image's `gh` binary — the same trust every
+   `actions/*` step already requires.
+4. **Job-level granularity is GitHub's floor.** For the AUTOMATIC
+   token, permissions are job-scoped by GitHub's design; this workflow
+   answers that by never requesting a write grant at all. The PAT
+   achieves the per-OPERATION granularity the automatic token cannot.
+5. **Environment protection rules.** GitHub environment secrets/rules
+   could further restrict who can trigger the PAT-bearing jobs; the
+   workflow currently relies on the `refs/heads/main` job gates plus
+   the manual `workflow_dispatch` trigger. Adding a protected
+   environment is an optional owner hardening step.
+
+## 12. Private-repository impact (owner changed visibility to private)
+
+The owner changed `GraveYield/grave-indexer` from public to private
+(2026-11-22). GitHub serves unauthenticated requests to a private
+repository (including its release pages, `releases/download/...` asset
+paths and the `releases/latest/download/...` stable URL) as HTTP 404 —
+the resource is indistinguishable from a nonexistent one. Consequences:
+
+### 12.1 The workflow itself — remediated in this change
+
+The workflow previously relied on unauthenticated probes in three
+places. All three now authenticate with the READ-ONLY automatic token:
+
+1. the tag-collision gates in `publish` and `release`
+   (`git ls-remote` → authenticated `GET /repos/{repo}/git/ref/tags/{tag}`,
+   same three-way fail-closed semantics: 404 = absent, 200 = exists,
+   anything else = gate failure);
+2. the same-release roundtrip gate (`verify-versioned`) — assets are now
+   fetched through the release record's `api.github.com` asset URLs with
+   `Accept: application/octet-stream` (the documented path `gh release
+   download` uses), authenticated by the READ-ONLY workflow token;
+3. the post-activation stable gate (`verify-stable`) — same
+   authenticated transport for the asset fetches (its designation query
+   was already authenticated).
+
+### 12.2 PRODUCTION INTEGRATION BLOCKER — the Console cannot fetch the snapshot
+
+The shipped `graveyield-console` consumer contract fetches the snapshot
+with an UNAUTHENTICATED HTTP GET of
+`https://github.com/GraveYield/grave-indexer/releases/latest/download/console-snapshot.json`
+(no credential available client-side, by design). On a private
+repository that request returns 404, so **production snapshot ingestion
+is BROKEN until one of the alternatives below is implemented**. This is
+a factual blocker: no claim is made that production ingestion still
+works. The Console's fail-closed reader will report the artifact as
+`missing` (and stale if a cached copy exists) rather than render
+unverified data — the consumer contract degrades safely, but it
+degrades.
+
+Constraints honored while documenting this: the PAT must NEVER be
+embedded in client-side Console code (a browser-visible secret), and
+this change does NOT modify `graveyield-console` or the Vercel
+deployment configuration (outside this task's authorization).
+
+### 12.3 Secure alternatives (owner decision required)
+
+1. **Server-side fetch proxy (recommended).** The Console's Vercel
+   deployment adds a server-side API route/function that fetches the
+   snapshot with a read-scoped credential (a fine-grained PAT with
+   Contents:read only, stored as a server-side environment variable, or
+   a minimal GitHub App). The browser only talks to the proxy; the
+   credential never reaches client code. The proxy response must pass
+   the SAME schema-v2 + freshness validation the Console already
+   applies.
+2. **Public distribution repository.** Keep `grave-indexer` private and
+   mirror the verified release assets to a dedicated PUBLIC repository
+   (e.g. via an isolated workflow that copies the verified bytes after
+   `verify-stable` passes). The Console keeps its existing
+   unauthenticated fetch against the distribution repo's stable URL.
+   Cost: a second repository, a copy pipeline, and a trust question
+   about what is published publicly (the snapshot contents themselves
+   become public again).
+3. **Restore public visibility** (or make only the releases public —
+   GitHub does not support per-release visibility, so this is all-or-
+   nothing for the repository). Cost: the indexer source becomes public
+   again, which the owner evidently chose to avoid.
+4. **Do nothing** — accept that the Console serves from its last cached
+   artifact and reports staleness/missing until a decision is made. No
+   publication should be dispatched under this option, since the newly
+   published artifact would be unreachable by production.
+
+**This decision is a blocker for the next production publication** (the
+published artifact must be reachable by its production consumer), and
+it is recorded in the PR description as an outstanding owner decision.

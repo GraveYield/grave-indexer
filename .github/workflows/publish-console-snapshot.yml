@@ -1,7 +1,7 @@
 name: publish-console-snapshot
 
 # Manual-only ConsoleSnapshot publication (GY-M1-INT-001 §4, §8; PR #5
-# remediation — independent review Tasks 1-5, Task 1 corrected THREE times).
+# remediation — independent review Tasks 1-5, Task 1 corrected FOUR times).
 #
 # TRIGGER: `workflow_dispatch` ONLY. No schedule, no cron, no push, no
 # pull_request publication — a production snapshot is an explicit,
@@ -70,38 +70,37 @@ name: publish-console-snapshot
 #                            review requirement that discovery use a
 #                            read-only credential or a read-only job).
 #                            No step in this job holds write permission.
-#   release (contents:write) THE ONLY release-creation job, and it
-#                            contains ZERO custom code: no checkout, no
+#   release (contents:read;  THE ONLY release-creation job, and it
+#   PAT on mutations)        contains ZERO custom code: no checkout, no
 #                            setup-node, no pnpm, no dependency
 #                            installation, no node invocation, no
 #                            repository script, no downloaded-code
 #                            execution. Its only action is
 #                            actions/download-artifact (artifact-scoped
 #                            runtime token, no github.token input); its
-#                            only commands are runner-preinstalled
-#                            coreutils/git (token-free precondition
-#                            checks: sha256sum belt, strict tag shape,
-#                            three-way ls-remote collision gate) and TWO
-#                            pinned GitHub CLI release-mutation
-#                            invocations (`gh release create
-#                            --latest=false --target <asserted sha>` and
-#                            `gh release upload`), each of which is the
-#                            ONLY place the write-capable token exists —
-#                            as a STEP-level env, never job/workflow
-#                            level.
+#                            only commands are the authenticated
+#                            read-only collision gate (curl, automatic
+#                            token) and TWO pinned GitHub CLI
+#                            release-mutation invocations (`gh release
+#                            create --latest=false --target <asserted
+#                            sha>` and `gh release upload`) which use
+#                            the `GY_RELEASE_PAT` secret as a STEP-level
+#                            env — the only place the write-capable
+#                            credential exists, never job/workflow level.
 #   verify-versioned         READ-ONLY same-release roundtrip gate
-#   (read-only, NO token)    between upload and promotion: the three
+#   (read-only)              between upload and promotion: the three
 #                            assets of THAT EXACT versioned release are
-#                            verified through their public tag URLs with
-#                            the prebuilt zero-dependency bundle — which
-#                            receives NO GitHub token at all (the tag
-#                            URLs are public). The stable pointer cannot
-#                            move until this job is green.
-#   promote (contents:write) THE activation job: exactly ONE privileged
+#                            verified through the AUTHENTICATED API path
+#                            with the prebuilt zero-dependency bundle,
+#                            which receives the READ-ONLY workflow token
+#                            (a private repository's release assets 404
+#                            for unauthenticated requests). The stable
+#                            pointer cannot move until this job is green.
+#   promote (contents:read)  THE activation job: exactly ONE privileged
 #                            operation — `gh release edit <tag> --latest`
 #                            — plus token-free precondition checks. Zero
 #                            custom code, no checkout, no node; the
-#                            write-capable token exists ONLY as the
+#                            release-write PAT exists ONLY as the
 #                            step-level env of that single gh command.
 #   verify-stable (read-only) the post-activation stable-reference gate,
 #                            run with the READ-ONLY workflow token from a
@@ -109,18 +108,32 @@ name: publish-console-snapshot
 #                            strict schema-v2 parser + same-release
 #                            cross-checks — is the reviewed commit's own).
 #
-# WHY THE AUTOMATIC TOKEN IS STILL JOB-SCOPED (honest limitation):
+# FOURTH-ROUND CORRECTION — CREDENTIAL ISOLATION VIA A DEDICATED PAT:
+# the owner provisioned a fine-grained PAT exclusively for this
+# repository and stored it as the Actions secret `GY_RELEASE_PAT`.
 # GitHub's automatic GITHUB_TOKEN can only obtain `contents: write`
 # through a job-level `permissions` grant — there is no per-step
-# permission knob. The isolation boundary is therefore JOBS WITHOUT
-# CUSTOM CODE: the write-capable token exists only inside `release` and
-# `promote`, and those two jobs contain nothing but preinstalled trusted
-# tooling and the pinned gh release-mutation commands. Every step in
-# them that is NOT a release mutation is token-free, and repository-built
-# code cannot execute there at all (pinned by test/publishWorkflow.test.ts).
-# A separately scoped release credential (fine-grained PAT stored as a
-# repository secret) would narrow this further but requires an owner-
-# provisioned secret and is deliberately NOT improvised here.
+# permission knob, so a write-capable automatic token can never be
+# narrower than a whole job. The final structure therefore NEVER grants
+# the automatic token write anywhere:
+#
+#   * EVERY job declares `contents: read` (explicitly at job level, not
+#     only via the workflow default) — the automatic GITHUB_TOKEN is
+#     READ-ONLY in all seven jobs by construction;
+#   * the ONLY write-capable credential in the entire workflow is the
+#     owner-provisioned `GY_RELEASE_PAT` secret, exposed as STEP-LEVEL
+#     env on EXACTLY the two trusted release-mutation steps (the
+#     create+upload step of `release` and the single promotion command
+#     of `promote`) — never at workflow or job level, never to any step
+#     that checks out code, installs dependencies, runs node/scripts or
+#     downloads artifacts;
+#   * the `release` and `promote` jobs still contain ZERO custom code
+#     (no checkout, no setup-node, no pnpm, no node, no repository or
+#     artifact-executed code) — pinned by test/publishWorkflow.test.ts.
+#   Trust assumption (owner-side, not verifiable from the workflow): the
+#   PAT's value is never visible here; its narrow scope (fine-grained,
+#   this repository only, release-write) is the owner's provisioning
+#   decision. GitHub masks the secret value in run logs.
 #
 # TRUST CHAIN FOR THE PRIVILEGED JOBS: the bytes they upload were
 # schema- and integrity-verified by BOTH read-only jobs; the release job
@@ -128,18 +141,27 @@ name: publish-console-snapshot
 # (`sha256sum -c`, pure coreutils) and re-validates the tag shape before
 # anything is published; the tag crossing job boundaries is validated
 # AGAIN in every consuming job; `verify-versioned` verifies the released
-# bytes through the public tag URLs BEFORE `promote` may run (needs:
-# chain enforces the order); `verify-stable` re-verifies the stable
-# pointer after activation.
+# bytes through the AUTHENTICATED API path BEFORE `promote` may run
+# (needs: chain enforces the order); `verify-stable` re-verifies the
+# stable pointer after activation.
 #
 # STABLE REFERENCE — LATEST-RELEASE PROMOTION (ARCHITECTURE DECISION
-# PENDING OWNER APPROVAL — review Task 2): every publication is an
-# immutable versioned release (`console-snapshot-prod-<UTC
+# PENDING OWNER APPROVAL — review Task 2; the PAT provisioning is NOT
+# approval of this architecture): every publication is an immutable
+# versioned release (`console-snapshot-prod-<UTC
 # timestamp>-<source commit>`, created with `--latest=false` so it does
 # NOT move the stable pointer on creation). The stable retrieval
 # reference is the repo-wide "latest release" designation, served
-# through the CONSTANT unauthenticated URL
+# through the CONSTANT URL
 #   https://github.com/<repo>/releases/latest/download/console-snapshot.json
+# NOTE (repository is now PRIVATE): that URL — and the versioned tag
+# asset URLs — require AUTHENTICATION since the visibility change. The
+# workflow's own verification gates fetch through the authenticated API
+# path with the READ-ONLY workflow token; unauthenticated CONSUMERS
+# (the graveyield-console deployment) can no longer fetch the artifact
+# AT ALL — that production integration blocker is documented in
+# docs/SNAPSHOT_PUBLICATION.md §11 and is an owner decision; Console and
+# Vercel are outside this task's authorization.
 # Activation is a SINGLE metadata operation (`gh release edit <tag>
 # --latest`, API PATCH make_latest=true) that moves the whole pointer at
 # once — no asset is ever deleted or overwritten, so the stable URL
@@ -199,20 +221,14 @@ name: publish-console-snapshot
 #      rollback pointer) is written.
 #
 # PERMISSIONS: least privilege — the workflow default is `contents:
-# read`; `publish`, `verify-versioned` and `verify-stable` never hold
-# write (publish declares contents:read EXPLICITLY because repository-
-# built code runs there); ONLY the `release` and `promote` jobs override
-# to `contents: write`, and those jobs contain no checkout, no
-# dependencies, no build, no node, no repository code, and no action
-# that consumes `github.token` by default — only download-artifact and
-# the pinned gh release-mutation steps. An untrusted pull_request
-# context cannot reach any step: workflow_dispatch is the only trigger,
-# all seven jobs are gated to refs/heads/main, and the workflow-level
-# default is read-only.
-#
-# CONCURRENCY: one publication at a time, queued (never cancelled
-# mid-run) — a cancelled publication must never leave a half-activated
-# stable reference behind.
+# read`, and EVERY ONE of the seven jobs declares `contents: read`
+# EXPLICITLY at job level: the automatic GITHUB_TOKEN is READ-ONLY in
+# every job of this workflow, and no job-level grant can elevate it.
+# The ONLY write-capable credential is the `GY_RELEASE_PAT` secret on
+# the two trusted release-mutation steps (step-level env only). An
+# untrusted pull_request context cannot reach any step:
+# workflow_dispatch is the only trigger, all seven jobs are gated to
+# refs/heads/main, and the workflow-level default is read-only.
 #
 # RELEASE PROTECTION MODEL (review Task 3): VERIFIED repository
 # settings show NO tag-protection ruleset and no verifiable
@@ -254,6 +270,11 @@ jobs:
     # skips this job (and therefore the whole workflow) entirely.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # EXPLICIT job-level grant (fourth-round correction): never rely on
+    # organization defaults — the automatic token is READ-ONLY here by
+    # declaration.
+    permissions:
+      contents: read
     env:
       DISCOVERY_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
       DEVNET_RPC_URL: ${{ secrets.DEVNET_RPC_URL }}
@@ -336,6 +357,10 @@ jobs:
     # Layer 1 of the main-only restriction.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # EXPLICIT job-level grant: the automatic token is READ-ONLY here by
+    # declaration.
+    permissions:
+      contents: read
     env:
       CHECKOUT_SHA: ${{ github.sha }}
     steps:
@@ -457,19 +482,27 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "versioned tag: $TAG"
       - name: Fail safely on an existing versioned tag collision (immutability, no clobber)
-        # Explicit three-way handling: exit 2 = genuinely absent (safe),
-        # exit 0 = EXISTS (abort), ANY other status = the gate itself
+        # Explicit three-way handling: HTTP 404 = genuinely absent (safe),
+        # HTTP 200 = EXISTS (abort), ANY other status = the gate itself
         # failed (network/auth/API) — NEVER interpreted as "absent".
-        # Unauthenticated ls-remote against the EXPLICIT repo URL: no
-        # checkout needed; on a private repo this fails closed (abort).
+        # FOURTH-ROUND CORRECTION (private repository): the previous
+        # unauthenticated `git ls-remote` probe CANNOT work against a
+        # private repository (it fails closed, but it can never confirm
+        # absence). The gate now queries the REST API with the READ-ONLY
+        # workflow token (this job's explicit grant is contents:read) —
+        # a query credential, never a write credential.
+        env:
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
-          status=0
-          git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG" >/dev/null 2>&1 || status=$?
-          case "$status" in
-            2) echo "versioned tag $TAG does not exist — safe to publish" ;;
-            0) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
-            *) echo "tag-collision gate FAILED (git ls-remote exit $status — network, auth or API problem); refusing to treat this as 'tag absent'"; exit 1 ;;
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/$TAG") || { echo "tag-collision gate FAILED (curl transport error); refusing to treat this as 'tag absent'"; exit 1; }
+          case "$code" in
+            404) echo "versioned tag $TAG does not exist — safe to publish" ;;
+            200) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
+            *) echo "tag-collision gate FAILED (unexpected HTTP $code); refusing to treat this as 'tag absent'"; exit 1 ;;
           esac
       - name: Belt check — an existing RELEASE for this tag is also a fail-closed collision
         # Three-way (review Task 4 semantics): HTTP 404 = genuinely
@@ -527,10 +560,13 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # 4. release — PRIVILEGED but ZERO CUSTOM CODE: the only job that
-  #    creates the versioned release. Every step is either a token-free
-  #    precondition (coreutils/git) or a pinned `gh release` mutation
-  #    with the write-capable token attached to THAT step alone. No
-  #    node, no repository script, no downloaded-code execution.
+  #    creates the versioned release. The automatic GITHUB_TOKEN stays
+  #    READ-ONLY (explicit contents:read); the ONLY write-capable
+  #    credential is the owner-provisioned `GY_RELEASE_PAT` secret,
+  #    attached as step-level env to the pinned `gh release` mutation
+  #    step alone. Every other step is a token-free precondition (or an
+  #    authenticated READ gate using the automatic token). No node, no
+  #    repository script, no downloaded-code execution.
   # ─────────────────────────────────────────────────────────────────────
   release:
     name: create + upload the immutable versioned release (privileged — trusted gh operations only, no custom code)
@@ -539,15 +575,21 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the versioned release (NOT latest) + upload its assets
+      # FOURTH-ROUND CORRECTION: the automatic GITHUB_TOKEN is READ-ONLY
+      # even here. The release mutations authenticate with the dedicated
+      # fine-grained `GY_RELEASE_PAT` secret (step-level env on the
+      # mutation step ONLY), so the job-level grant never needs
+      # contents: write — a write-capable automatic token does not exist
+      # in ANY job of this workflow.
+      contents: read
     env:
-      # NOTE: no GH_TOKEN at job level — the write-capable token exists
-      # ONLY as the step-level env of the two `gh release` mutation
-      # steps below. This job contains NO checkout, NO setup-node, NO
-      # pnpm, NO dependency installation, NO node invocation and NO
-      # repository-built or artifact-executed code: nothing here can
-      # reach the privileged credential except the two pinned gh
-      # release-mutation commands themselves.
+      # NOTE: no GH_TOKEN and no GY_RELEASE_PAT at job level — the write
+      # credential exists ONLY as the step-level env of the `gh release`
+      # mutation step below. This job contains NO checkout, NO
+      # setup-node, NO pnpm, NO dependency installation, NO node
+      # invocation and NO repository-built or artifact-executed code:
+      # nothing here can reach the privileged credential except the
+      # pinned gh release-mutation command itself.
       REPO: ${{ github.repository }}
       CHECKOUT_SHA: ${{ github.sha }} # the commit asserted by generate/verify
     steps:
@@ -590,19 +632,23 @@ jobs:
           esac
       - name: Fail safely on an existing versioned tag collision (immutability, no clobber)
         # Re-run IMMEDIATELY before the mutation (three-way semantics as
-        # in the publish job): exit 2 = genuinely absent (safe), exit 0 =
-        # EXISTS (abort), ANY other status = the gate itself failed
-        # (abort). Token-free (unauthenticated ls-remote against the
-        # explicit repo URL).
+        # in the publish job): HTTP 404 = genuinely absent (safe), HTTP
+        # 200 = EXISTS (abort), ANY other status = the gate itself failed
+        # (abort). Authenticated with the READ-ONLY automatic token (the
+        # unauthenticated ls-remote probe cannot resolve a private
+        # repository) — a query credential, never the release-write PAT.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
         run: |
-          status=0
-          git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG" >/dev/null 2>&1 || status=$?
-          case "$status" in
-            2) echo "versioned tag $TAG does not exist — safe to publish" ;;
-            0) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
-            *) echo "tag-collision gate FAILED (git ls-remote exit $status — network, auth or API problem); refusing to treat this as 'tag absent'"; exit 1 ;;
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/$TAG") || { echo "tag-collision gate FAILED (curl transport error); refusing to treat this as 'tag absent'"; exit 1; }
+          case "$code" in
+            404) echo "versioned tag $TAG does not exist — safe to publish" ;;
+            200) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
+            *) echo "tag-collision gate FAILED (unexpected HTTP $code); refusing to treat this as 'tag absent'"; exit 1 ;;
           esac
       - name: Publish the immutable versioned release (explicitly NOT latest)
         # `--latest=false` pins the stable pointer: the release must NOT
@@ -611,19 +657,22 @@ jobs:
         # Release creation (422 on any collision) and upload failures
         # abort the run BEFORE activation — the previous release keeps
         # serving the stable URL throughout.
-        # THE write-capable token exists ONLY here (create + upload of
-        # the versioned release) — pinned GitHub CLI operations, never
-        # custom code.
+        # THE write-capable credential exists ONLY here: the dedicated
+        # fine-grained `GY_RELEASE_PAT` repository secret, scoped to
+        # THIS step's env. The automatic GITHUB_TOKEN is read-only and
+        # is NOT used for the mutation. The PAT reaches only this pinned
+        # gh CLI invocation — never node, never a script, never an
+        # action, never a downloaded artifact.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
-          GH_TOKEN: ${{ github.token }} # scoped to this step only
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
         run: |
           gh release create "$TAG" \
             --repo "$REPO" \
             --target "$CHECKOUT_SHA" \
             --latest=false \
             --title "ConsoleSnapshot v2 — $TAG" \
-            --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the public URL and the latest-release promotion succeeds."
+            --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the authenticated path and the latest-release promotion succeeds."
           gh release upload "$TAG" \
             --repo "$REPO" \
             bundle/console-snapshot.json \
@@ -634,15 +683,22 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # 5. verify-versioned — READ-ONLY same-release roundtrip gate BETWEEN
-  #    upload and promotion (no GitHub token at all: the tag URLs are
-  #    public). The stable pointer cannot move until this job is green.
+  #    upload and promotion. The gate authenticates with the READ-ONLY
+  #    automatic token (a private repository's release assets 404 for
+  #    unauthenticated requests); it receives NO release-write
+  #    credential. The stable pointer cannot move until this job is
+  #    green.
   # ─────────────────────────────────────────────────────────────────────
   verify-versioned:
-    name: verify the released assets of THIS exact versioned release, before promotion (read-only, no token)
+    name: verify the released assets of THIS exact versioned release, before promotion (read-only)
     needs: release
     # Layer 1 of the main-only restriction.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # EXPLICIT job-level grant: the automatic token is READ-ONLY here by
+    # declaration.
+    permissions:
+      contents: read
     env:
       REPO: ${{ github.repository }}
     steps:
@@ -670,17 +726,22 @@ jobs:
             '') echo "no versioned tag crossed the job boundary"; exit 1 ;;
             *) echo "tag crossing into the roundtrip gate fails the strict versioned-tag shape: $TAG"; exit 1 ;;
           esac
-      - name: Verify the versioned release's OWN assets (same-release cross-check, public unauthenticated tag URLs)
+      - name: Verify the versioned release's OWN assets (same-release cross-check, authenticated API path)
         # Review Task 5: all three assets are verified against the EXACT
         # versioned release — checksum over the exact snapshot bytes,
         # provenance digest over the bytes, and the provenance sidecar
         # must NAME this release's tag, so a mixed artifact set (files
-        # resolved from different releases) can never pass. This job
-        # receives NO GitHub token anywhere — the tag URLs are public —
-        # and it holds no write permission, so promotion (the next job)
-        # is unreachable until this verification has passed.
+        # resolved from different releases) can never pass.
+        # CREDENTIAL NOTE (fourth-round correction): the repository is
+        # PRIVATE, so the release record and its assets are unreachable
+        # unauthenticated — the gate authenticates with the READ-ONLY
+        # automatic workflow token (this job declares contents:read). It
+        # receives NO release-write credential, and it holds no write
+        # permission, so promotion (the next job) is unreachable until
+        # this verification has passed.
         env:
           TAG: ${{ needs.release.outputs.versioned_tag }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
         run: |
           node ops/release-ops.mjs verify-release-assets \
             "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
@@ -689,9 +750,10 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # 6. promote — PRIVILEGED activation: exactly ONE trusted gh command
-  #    (the latest-release metadata promotion). Zero custom code, no
-  #    checkout, no node; the write-capable token exists ONLY as the
-  #    step-level env of that single command. Runs only after the
+  #    (the latest-release metadata promotion), authenticated with the
+  #    dedicated `GY_RELEASE_PAT` secret on that step's env alone. Zero
+  #    custom code, no checkout, no node; the automatic GITHUB_TOKEN
+  #    stays READ-ONLY (explicit contents:read). Runs only after the
   #    roundtrip gate (verify-versioned) proved the released bytes.
   # ─────────────────────────────────────────────────────────────────────
   promote:
@@ -701,7 +763,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: write # flip the latest designation (single metadata operation)
+      # FOURTH-ROUND CORRECTION: the automatic GITHUB_TOKEN is READ-ONLY
+      # even here; the promotion mutates the release designation through
+      # the dedicated `GY_RELEASE_PAT` secret (step-level env below), so
+      # no job-level write grant is needed anywhere in this workflow.
+      contents: read
     env:
       REPO: ${{ github.repository }}
       STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
@@ -731,10 +797,13 @@ jobs:
         # artifact remains fully available (its release is untouched) and
         # a failure here still serves the OLD artifact. `gh release edit`
         # itself fails closed if the release does not exist.
-        # THE write-capable token exists ONLY on this step.
+        # THE write-capable credential exists ONLY on this step: the
+        # dedicated fine-grained `GY_RELEASE_PAT` repository secret. The
+        # automatic GITHUB_TOKEN is read-only and is NOT used for the
+        # mutation; the PAT reaches only this pinned gh CLI invocation.
         env:
           TAG: ${{ needs.verify-versioned.outputs.versioned_tag }}
-          GH_TOKEN: ${{ github.token }} # scoped to this step only
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
         run: |
           gh release edit "$TAG" --repo "$REPO" --latest
           echo "stable reference activated: $STABLE_SNAPSHOT_URL"
@@ -750,6 +819,10 @@ jobs:
     # Layer 1 of the main-only restriction.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # EXPLICIT job-level grant: the automatic token is READ-ONLY here by
+    # declaration.
+    permissions:
+      contents: read
     env:
       REPO: ${{ github.repository }}
       CHECKOUT_SHA: ${{ github.sha }}
@@ -784,16 +857,18 @@ jobs:
         # repo-wide latest designation (queried through the authenticated
         # API) to equal the activated versioned tag — an unrelated
         # promotion that moved the pointer FAILS the run; and (b) the
-        # three assets fetched through the constant public latest URL to
-        # be ONE release's complete artifact set naming that tag
-        # (checksum + digest + provenance-tag cross-check), so a pointer
-        # race DURING the downloads cannot bless a mixed artifact set.
-        # This is a READ-ONLY job: it runs the reviewed commit's own
-        # verification code with the workflow's READ-ONLY token — no
-        # write permission exists in this job at all.
+        # three assets fetched through the authenticated API path (the
+        # repository is PRIVATE — the constant latest URL 404s for
+        # unauthenticated requests) to be ONE release's complete
+        # artifact set naming that tag (checksum + digest +
+        # provenance-tag cross-check), so a pointer race DURING the
+        # downloads cannot bless a mixed artifact set. This is a
+        # READ-ONLY job: it runs the reviewed commit's own verification
+        # code with the workflow's READ-ONLY token — no write permission
+        # and no release-write credential exists in this job at all.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
-          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job inherits contents: read)
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job declares contents: read)
         run: |
           case "$TAG" in
             console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;

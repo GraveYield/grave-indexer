@@ -76,9 +76,11 @@ export const CHECKSUM_ASSET_NAME = "console-snapshot.sha256";
 
 /**
  * The stable, CONSTANT Console retrieval URL for a repository: the
- * "latest release" asset path. Unauthenticated, redirect-following,
- * plain-fetch compatible. Resolves to whatever release currently holds
- * the repo-wide latest designation.
+ * "latest release" asset path. Resolves to whatever release currently
+ * holds the repo-wide latest designation. NOTE (repository is now
+ * PRIVATE): the URL is unchanged, but it now requires authentication —
+ * unauthenticated consumers get HTTP 404 (see
+ * docs/SNAPSHOT_PUBLICATION.md §12 for the Console-side blocker).
  */
 export function stableSnapshotUrl(repository: string): string {
   return `https://github.com/${repository}/releases/latest/download/${SNAPSHOT_ASSET_NAME}`;
@@ -327,8 +329,10 @@ export function assertVersionedTagFormat(tag: string): void {
  * The ordered publication steps (the workflow MUST execute them in this
  * order). The stable reference is a PROMOTION (repo-wide latest-release
  * designation), executed as one metadata operation AFTER the versioned
- * release has been published AND its assets verified through the public
- * unauthenticated path, and followed by a stable-URL re-verification.
+ * release has been published AND its assets verified (through the
+ * authenticated API path on a private repository; the unauthenticated
+ * download-URL path was valid only while the repository was public),
+ * and followed by a stable-URL re-verification.
  */
 export const PUBLICATION_STEPS = [
   "generate",
@@ -431,10 +435,11 @@ export function assertStableReferenceServesVerifiedArtifact(args: {
  *     the new one is activated, and rollback is another single
  *     metadata operation (`gh release edit <previous-tag> --latest`).
  *   * The promotion step runs ONLY after the versioned release's
- *     assets have been downloaded back through the public unauthenticated
- *     path and re-verified (enforced by `assertStableAdvanceAllowed`);
- *     post-activation verification re-confirms the stable URL serves
- *     the activated bytes (`assertStableReferenceServesVerifiedArtifact`).
+ *     assets have been downloaded back and re-verified (authenticated
+ *     API path on a private repository; enforced by
+ *     `assertStableAdvanceAllowed`); post-activation verification
+ *     re-confirms the stable reference serves the activated bytes
+ *     (`assertStableReferenceServesVerifiedArtifact`).
  *
  * Residual non-atomicity / disclosed risks (see docs/SNAPSHOT_PUBLICATION.md):
  *   * "latest" is a REPO-WIDE designation — any other non-draft,

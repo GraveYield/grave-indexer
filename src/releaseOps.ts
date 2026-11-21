@@ -37,6 +37,21 @@
 //          versioned release (see `cmdVerifyReleaseAssets`), so a pointer
 //          that moved between fetch and API query fails the run.
 //
+//   3. PRIVATE-REPOSITORY ASSET VERIFICATION (fourth-round correction).
+//      The owner changed `GraveYield/grave-indexer` visibility to PRIVATE
+//      and provisioned a fine-grained release PAT as the repository
+//      secret `GY_RELEASE_PAT`. A private release asset 404s for
+//      unauthenticated requests, so the same-release verification gates
+//      can no longer fetch through the unauthenticated
+//      `releases/download/...` URLs. When the caller supplies a token,
+//      `verifyReleaseAssetSet` switches to the DOCUMENTED authenticated
+//      path: the release record is resolved through the REST API and the
+//      three assets are downloaded through their `api.github.com` asset
+//      URLs with `Accept: application/octet-stream` — the mechanism `gh
+//      release download` itself uses. The verification jobs supply the
+//      READ-ONLY automatic workflow token for this; the release-write PAT
+//      is never present in those jobs.
+//
 // DESIGN RULES:
 //   * GitHub-side operations are injectable (`HttpImpl`, `FetchAssetImpl`)
 //     so every behavior is offline-testable.
@@ -68,6 +83,7 @@ export type ReleaseOpsErrorCategory =
   | "API_OUTAGE" // 5xx from api.github.com
   | "NETWORK" // fetch itself threw (DNS, TLS, connection reset)
   | "MALFORMED_RESPONSE" // 200 but body is not JSON / wrong shape
+  | "NOT_FOUND" // 404 where the queried release/asset MUST exist (authenticated verification)
   | "UNEXPECTED_STATUS"; // any other HTTP status — fail closed, never guess
 
 const RELEASE_OPS_CATEGORIES: readonly ReleaseOpsErrorCategory[] = [
@@ -77,6 +93,7 @@ const RELEASE_OPS_CATEGORIES: readonly ReleaseOpsErrorCategory[] = [
   "API_OUTAGE",
   "NETWORK",
   "MALFORMED_RESPONSE",
+  "NOT_FOUND",
   "UNEXPECTED_STATUS",
 ];
 
@@ -132,11 +149,10 @@ export function authedHttp(token: string): HttpImpl {
 /** Injectable asset downloader (compatible with global fetch). */
 export type FetchAssetImpl = (url: string) => Promise<Uint8Array>;
 
-/** Default unauthenticated asset downloader (redirect-following, 200-only). */
-export const defaultFetchAsset: FetchAssetImpl = async (url) => {
+async function fetchAssetWithHeaders(url: string, headers: Record<string, string>): Promise<Uint8Array> {
   let res: Response;
   try {
-    res = await fetch(url, { redirect: "follow" });
+    res = await fetch(url, { redirect: "follow", headers });
   } catch (err) {
     throw new ReleaseOpsError("NETWORK", `asset fetch failed: ${String((err as Error).message ?? err)}`);
   }
@@ -144,7 +160,10 @@ export const defaultFetchAsset: FetchAssetImpl = async (url) => {
     throw new ReleaseOpsError("UNEXPECTED_STATUS", `asset fetch ${url} returned HTTP ${res.status}`, res.status);
   }
   return new Uint8Array(await res.arrayBuffer());
-};
+}
+
+/** Default unauthenticated asset downloader (redirect-following, 200-only). */
+export const defaultFetchAsset: FetchAssetImpl = (url) => fetchAssetWithHeaders(url, {});
 
 // ─── 1. Rollback-pointer discovery (review Task 4) ─────────────────────────
 
@@ -240,10 +259,134 @@ function assetUrls(repository: string, tag: string, scope: AssetScope): { snapsh
   };
 }
 
+/** Minimal shape of a GitHub release record the verification consumes. */
+interface ReleaseRecord {
+  tag_name?: unknown;
+  assets?: Array<{ name?: unknown; url?: unknown }>;
+}
+
+/**
+ * Resolve a release record through the REST API (authenticated http impl)
+ * and classify the outcome fail-closed. Used by the authenticated
+ * verification path: on a private repository the release record itself is
+ * also unreachable for unauthenticated requests.
+ */
+async function fetchReleaseRecord(repository: string, byTag: string | null, http: HttpImpl): Promise<ReleaseRecord> {
+  const url = byTag === null
+    ? `https://api.github.com/repos/${repository}/releases/latest`
+    : `https://api.github.com/repos/${repository}/releases/tags/${byTag}`;
+  let res: MinimalHttpResponse;
+  try {
+    res = await http(url);
+  } catch (err) {
+    throw new ReleaseOpsError("NETWORK", `release lookup failed: ${String((err as Error).message ?? err)}`);
+  }
+  if (res.status === 404) {
+    throw new ReleaseOpsError("NOT_FOUND", `release lookup returned HTTP 404 — the ${byTag === null ? "latest designation" : `release for tag ${byTag}`} does not exist (private repository: unauthenticated requests also 404)`, 404);
+  }
+  if (res.status === 401) {
+    throw new ReleaseOpsError("AUTHENTICATION", "release lookup rejected the credentials", 401);
+  }
+  if (res.status === 403 || res.status === 429) {
+    const remaining = res.headers.get("x-ratelimit-remaining");
+    if (res.status === 429 || remaining === "0") {
+      throw new ReleaseOpsError("RATE_LIMIT", "GitHub API rate limit exhausted during release lookup", res.status);
+    }
+    throw new ReleaseOpsError("PERMISSION", "release lookup was denied (token lacks repository access)", res.status);
+  }
+  if (res.status >= 500) {
+    throw new ReleaseOpsError("API_OUTAGE", `api.github.com unavailable during release lookup (HTTP ${res.status})`, res.status);
+  }
+  if (res.status !== 200) {
+    throw new ReleaseOpsError("UNEXPECTED_STATUS", `release lookup returned an unexpected HTTP status`, res.status);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (err) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", `release lookup response is not JSON: ${String((err as Error).message ?? err)}`, 200);
+  }
+  if (typeof body !== "object" || body === null) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", "release lookup response is not a JSON object", 200);
+  }
+  return body as ReleaseRecord;
+}
+
+/**
+ * Fetch one asset's RAW bytes through its api.github.com asset URL with
+ * `Accept: application/octet-stream` — the documented authenticated
+ * download path for release assets, including on private repositories
+ * (this is what `gh release download` uses). The token travels ONLY as
+ * the Authorization request header — never in a URL, log line or error
+ * message. Redirects to the signed asset host drop the Authorization
+ * header per the fetch spec; the signed URL requires none.
+ */
+async function fetchAssetOctetStream(url: string, token: string): Promise<Uint8Array> {
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      redirect: "follow",
+      headers: { accept: "application/octet-stream", authorization: `Bearer ${token}` },
+    });
+  } catch (err) {
+    throw new ReleaseOpsError("NETWORK", `asset fetch failed: ${String((err as Error).message ?? err)}`);
+  }
+  if (res.status !== 200) {
+    throw new ReleaseOpsError("UNEXPECTED_STATUS", `asset fetch returned HTTP ${res.status}`, res.status);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+/**
+ * Fetch the three assets THROUGH the release record's `api.github.com`
+ * asset URLs. Every wanted asset must exist BY NAME on the record — an
+ * incomplete artifact set fails closed.
+ */
+async function fetchAssetsFromRecord(
+  record: ReleaseRecord,
+  token: string,
+): Promise<{ snapshotBytes: Uint8Array; provenanceBytes: Uint8Array; checksumBytes: Uint8Array }> {
+  const assets = Array.isArray(record.assets) ? record.assets : [];
+  const byName = new Map<string, string>();
+  for (const asset of assets) {
+    if (typeof asset?.name === "string" && typeof asset?.url === "string") {
+      byName.set(asset.name, asset.url);
+    }
+  }
+  const wanted: Array<[string, "snapshot" | "provenance" | "checksum"]> = [
+    [SNAPSHOT_ASSET_NAME, "snapshot"],
+    [PROVENANCE_ASSET_NAME, "provenance"],
+    [CHECKSUM_ASSET_NAME, "checksum"],
+  ];
+  const out: { snapshotBytes: Uint8Array; provenanceBytes: Uint8Array; checksumBytes: Uint8Array } = { snapshotBytes: new Uint8Array(), provenanceBytes: new Uint8Array(), checksumBytes: new Uint8Array() };
+  for (const [name, slot] of wanted) {
+    const assetUrl = byName.get(name);
+    if (assetUrl === undefined) {
+      throw new ReleaseOpsError("NOT_FOUND", `the release record does not contain the asset '${name}' — refusing to verify an incomplete artifact set`, 200);
+    }
+    const bytes = await fetchAssetOctetStream(assetUrl, token);
+    if (slot === "snapshot") out.snapshotBytes = bytes;
+    else if (slot === "provenance") out.provenanceBytes = bytes;
+    else out.checksumBytes = bytes;
+  }
+  return out;
+}
+
 /**
  * Verify that the snapshot / provenance / checksum triple fetched through
  * `scope` URLs is ONE release's complete, internally consistent artifact
  * set naming `expectedTag`.
+ *
+ * TWO TRANSPORTS:
+ *   * Unauthenticated (default): the three files are fetched through the
+ *     `releases/download/...` URLs — valid only for a PUBLIC repository.
+ *   * Authenticated (`authToken` supplied): the release record is
+ *     resolved through the REST API and the three assets are downloaded
+ *     through their api.github.com asset URLs with
+ *     `Accept: application/octet-stream` — the documented private-repo-
+ *     safe path. The credential must be a READ-scoped token (the
+ *     verification jobs use the automatic workflow token; the release-
+ *     write PAT is never present in verification jobs).
  *
  * WHY THIS IS RACE-SAFE (review Task 5): the three requests are issued
  * independently, so a concurrent promotion CAN deliver bytes from two
@@ -264,15 +407,35 @@ export async function verifyReleaseAssetSet(args: {
   scope: AssetScope;
   expectedTag: string;
   fetchAsset?: FetchAssetImpl;
+  /** Read-scoped API token; switches to the private-repo-safe authenticated path. */
+  authToken?: string;
 }): Promise<void> {
-  const fetchAsset = args.fetchAsset ?? defaultFetchAsset;
-  const urls = assetUrls(args.repository, args.tag, args.scope);
-
-  // Three independent requests — exactly what a racing client or the
-  // workflow would issue; the cross-checks below make any mixture detectable.
-  const snapshotBytes = await fetchAsset(urls.snapshot);
-  const provenanceBytes = await fetchAsset(urls.provenance);
-  const checksumBytes = await fetchAsset(urls.checksum);
+  let snapshotBytes: Uint8Array;
+  let provenanceBytes: Uint8Array;
+  let checksumBytes: Uint8Array;
+  if (args.authToken !== undefined) {
+    const record = await fetchReleaseRecord(
+      args.repository,
+      args.scope === "versioned" ? args.tag : null,
+      authedHttp(args.authToken),
+    );
+    if (args.scope === "versioned" && record.tag_name !== args.tag) {
+      throw new ReleaseOpsError(
+        "MALFORMED_RESPONSE",
+        `release lookup returned tag_name ${String(record.tag_name ?? "<none>")}, expected ${args.tag} — refusing to verify a mismatched release record`,
+        200,
+      );
+    }
+    ({ snapshotBytes, provenanceBytes, checksumBytes } = await fetchAssetsFromRecord(record, args.authToken));
+  } else {
+    const fetchAsset = args.fetchAsset ?? defaultFetchAsset;
+    const urls = assetUrls(args.repository, args.tag, args.scope);
+    // Three independent requests — exactly what a racing client or the
+    // workflow would issue; the cross-checks below make any mixture detectable.
+    snapshotBytes = await fetchAsset(urls.snapshot);
+    provenanceBytes = await fetchAsset(urls.provenance);
+    checksumBytes = await fetchAsset(urls.checksum);
+  }
 
   // Checksum file must be sha256sum-compatible, must name the snapshot
   // asset, and must match the EXACT snapshot bytes we received.

@@ -167,6 +167,7 @@ describe("releaseOps — error taxonomy completeness", () => {
       "AUTHENTICATION",
       "MALFORMED_RESPONSE",
       "NETWORK",
+      "NOT_FOUND",
       "PERMISSION",
       "RATE_LIMIT",
       "UNEXPECTED_STATUS",
@@ -508,6 +509,138 @@ describe("cmdVerifyReleaseAssets / cmdReleaseLatest — the workflow's entry poi
     });
     const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
     assert.equal(exit, 1);
+    globalThis.fetch = realFetch;
+  });
+});
+
+// ─── Authenticated verification transport (private repository, fourth round) ──
+
+describe("verifyReleaseAssetSet / cmdVerifyReleaseAssets — authenticated API transport (private repository)", () => {
+  const realFetch = globalThis.fetch;
+  const READ_TOKEN = "ghs_readonly-runner-token";
+
+  interface CapturedCall { url: string; headers: Record<string, string> }
+  const captured: CapturedCall[] = [];
+  const assetBase = `https://api.github.com/repos/${REPO}/releases/assets`;
+
+  function releaseRecord(tag: string): unknown {
+    return {
+      tag_name: tag,
+      assets: [
+        { name: SNAPSHOT_ASSET_NAME, url: `${assetBase}/1` },
+        { name: PROVENANCE_ASSET_NAME, url: `${assetBase}/2` },
+        { name: CHECKSUM_ASSET_NAME, url: `${assetBase}/3` },
+      ],
+    };
+  }
+
+  function installAuthedFakeFetch(): void {
+    captured.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      captured.push({ url, headers });
+      if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+        return new Response(JSON.stringify(releaseRecord(TAG_B)), { status: 200 });
+      }
+      if (url === `${assetBase}/1`) return binaryResponse(B.snapshot);
+      if (url === `${assetBase}/2`) return binaryResponse(B.provenanceBytes);
+      if (url === `${assetBase}/3`) return binaryResponse(B.checksum);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+  }
+
+  test("with a token, verification resolves the release through the API and downloads assets via the octet-stream asset URLs", async () => {
+    process.env.GH_TOKEN = READ_TOKEN;
+    installAuthedFakeFetch();
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    delete process.env.GH_TOKEN;
+    assert.equal(exit, 0, "the authenticated private-repo path verifies a genuine same-release set");
+    // Release lookup happened through the REST API.
+    assert.ok(captured.some((c) => c.url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`), "the release record is resolved through the API (private repos are unreachable unauthenticated)");
+    // All three assets came from their api.github.com asset URLs.
+    const assetCalls = captured.filter((c) => c.url.startsWith(`${assetBase}/`));
+    assert.equal(assetCalls.length, 3, "all three assets are fetched through their API asset URLs");
+    for (const call of assetCalls) {
+      assert.equal(call.headers["accept"], "application/octet-stream", "the raw-bytes accept header is set on asset fetches");
+      assert.equal(call.headers["authorization"], `Bearer ${READ_TOKEN}`, "the credential travels as the Authorization HEADER only");
+      assert.ok(!call.url.includes(READ_TOKEN), "the token never enters a URL");
+    }
+    globalThis.fetch = realFetch;
+  });
+
+  test("without a token, verification stays on the unauthenticated download-URL path (no Authorization header anywhere)", async () => {
+    installAuthedFakeFetch();
+    // The fake above only serves the API path, so re-install a URL-path fake.
+    const tagBase = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      captured.push({ url, headers });
+      if (url === `${tagBase}/${SNAPSHOT_ASSET_NAME}`) return binaryResponse(B.snapshot);
+      if (url === `${tagBase}/${PROVENANCE_ASSET_NAME}`) return binaryResponse(B.provenanceBytes);
+      if (url === `${tagBase}/${CHECKSUM_ASSET_NAME}`) return binaryResponse(B.checksum);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    assert.equal(exit, 0);
+    assert.ok(captured.every((c) => c.headers["authorization"] === undefined), "the unauthenticated path sends NO Authorization header");
+    assert.ok(captured.every((c) => c.url.startsWith(`https://github.com/${REPO}/releases/download/`)), "the unauthenticated path uses the release download URLs");
+    globalThis.fetch = realFetch;
+  });
+
+  test("a 404 release lookup is NOT_FOUND (typed abort — never silently 'verified')", async () => {
+    installAuthedFakeFetch();
+    globalThis.fetch = (async () => new Response(JSON.stringify({ message: "Not Found" }), { status: 404 })) as typeof fetch;
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    assert.equal(exit, 1, "a missing release record fails the verification");
+    globalThis.fetch = realFetch;
+  });
+
+  test("a release record MISSING an asset fails closed (incomplete artifact set is never accepted)", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+        const record = releaseRecord(TAG_B) as { assets: Array<{ name: string; url: string }> };
+        return new Response(JSON.stringify({ tag_name: TAG_B, assets: record.assets.slice(0, 2) }), { status: 200 });
+      }
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    assert.equal(exit, 1, "a partial asset set aborts the run");
+    globalThis.fetch = realFetch;
+  });
+
+  test("a versioned release lookup returning a DIFFERENT tag_name fails closed", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+        return new Response(JSON.stringify({ tag_name: TAG_A, assets: [] }), { status: 200 });
+      }
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    assert.equal(exit, 1, "a mismatched release record must never be verified against the expected tag");
+    globalThis.fetch = realFetch;
+  });
+
+  test("tokenless environment: the CLI does not authenticate even when a URL responds (explicit contract)", async () => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    const seenAuth: string[] = [];
+    const tagBase = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const headers = ((init?.headers ?? {}) as Record<string, string>);
+      if (headers["authorization"] !== undefined) seenAuth.push(headers["authorization"]);
+      const url = String(input);
+      if (url === `${tagBase}/${SNAPSHOT_ASSET_NAME}`) return binaryResponse(B.snapshot);
+      if (url === `${tagBase}/${PROVENANCE_ASSET_NAME}`) return binaryResponse(B.provenanceBytes);
+      if (url === `${tagBase}/${CHECKSUM_ASSET_NAME}`) return binaryResponse(B.checksum);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
+    assert.equal(exit, 0);
+    assert.deepEqual(seenAuth, [], "no Authorization header is sent without a credential");
     globalThis.fetch = realFetch;
   });
 });

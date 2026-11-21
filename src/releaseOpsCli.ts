@@ -110,6 +110,14 @@ export async function cmdReleaseLatest(repository: string): Promise<number> {
  *                      that moves between the downloads and the
  *                      designation query fails the mismatch check.
  *
+ * TRANSPORT (fourth-round correction — private repository): with a token
+ * in the environment, the assets are fetched through the AUTHENTICATED
+ * REST API path (`Accept: application/octet-stream`) — a private
+ * repository's release assets 404 for unauthenticated requests. The
+ * token supplied here is the READ-ONLY automatic workflow token: the
+ * verification jobs hold no release-write credential and must never see
+ * one.
+ *
  * Exit 0 = the fetched triple is one complete, internally consistent,
  * correctly-named artifact set. Exit 1 = any mismatch, missing sidecar,
  * pointer drift, or API failure — the workflow aborts (and, post-activation,
@@ -142,6 +150,7 @@ export async function cmdVerifyReleaseAssets(args: {
       tag: args.tag,
       scope: args.scope,
       expectedTag: args.expectedTag,
+      ...(token ? { authToken: token } : {}),
     });
     console.error(
       `verify-release-assets: OK — ${args.scope} scope resolved to ONE complete artifact set naming ${args.expectedTag} (checksum + provenance digest + tag cross-check)`,
