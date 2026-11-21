@@ -52,7 +52,9 @@ Activation is a single metadata operation — `gh release edit <tag>
 1. the artifact passed the strict schema-v2 parser and the completeness
    gates (discovery + enrichment) in the generate job;
 2. the staged bundle was re-verified after the workflow-artifact
-   download (schema + SHA-256 + byte length);
+   download (schema + SHA-256 + byte length) — first by the read-only
+   `verify` job, then by the privileged job's pure-shell `sha256sum -c`
+   belt over the exact bytes it is about to upload;
 3. the versioned release was created (duplicate tag aborts, immutably);
 4. the three assets were downloaded BACK through the public
    unauthenticated URLs and re-verified (schema-v2 parse, `sha256sum
@@ -331,13 +333,46 @@ full verification (§3). The stable URL is the constant
 
 ## 10. Remediation hardening (PR #5 — review Tasks 1, 4, 5)
 
-* **Execution restriction (Task 1):** both jobs carry
-  `if: github.ref == 'refs/heads/main'` AND an explicit guard step; the
-  checkout is pinned to `github.sha` and asserts `git rev-parse HEAD`
-  equals it, so the provenance `indexerSourceCommitSha` is the actual
-  checked-out commit. The write-capable token is attached per-step to
-  the GitHub API/CLI steps only — never to dependency installation,
-  builds, or local verification.
+* **Execution restriction (Task 1):** ALL FOUR jobs carry
+  `if: github.ref == 'refs/heads/main'` AND an explicit guard step;
+  every repository checkout is pinned to `github.sha` and asserts
+  `git rev-parse HEAD` equals it, so the provenance
+  `indexerSourceCommitSha` is the actual checked-out commit.
+* **Write-token isolation (Task 1 — second-round correction):** the
+  first remediation attached `GH_TOKEN` per-step but kept a job-level
+  `permissions: contents: write` on a job that also ran checkout,
+  setup-node, pnpm and dependency installation. That was insufficient:
+  the job-level grant makes `github.token` write-capable for the whole
+  job, and first-party actions consume it BY DEFAULT
+  (`actions/checkout`'s `token` input, `actions/setup-node`'s `token`
+  input) even without an explicit `GH_TOKEN` env. The corrected
+  structure separates read-only preparation/verification from the
+  privileged release operations:
+  * `generate` (read-only) — build, generate, validate, stage the
+    artifact bundle;
+  * `verify` (read-only) — independently re-download the staged bundle,
+    re-verify schema-v2 + integrity against the downloaded bytes, and
+    compile the release-ops CLI (src/releaseOpsCli.ts) into a single
+    self-contained bundle with ZERO npm runtime dependencies
+    (`pnpm run bundle:release-ops`, `node:` builtins only; pinned by
+    test/releaseOpsCliBundle.test.ts);
+  * `publish` (`contents: write`) — the ONLY privileged job, and it is
+    minimal: no checkout, no dependency installation, no build, no pnpm,
+    no repository code, and deliberately NO checkout/setup-node actions
+    (both consume `github.token` by default). Its only `uses:` steps are
+    actions/download-artifact (artifact-scoped runtime token, no
+    `github.token` input). Every command is runner-preinstalled tooling
+    (git, curl, sha256sum, gh) or the prebuilt zero-dependency bundle on
+    the runner's plain `node`. The write-capable `GH_TOKEN` exists only
+    as an explicit step-level env on the GitHub release API steps;
+  * `verify-stable` (read-only) — the post-activation stable gate, run
+    with the READ-ONLY workflow token from a full repository checkout.
+  The privileged job's trust chain: the bundle it executes was built by
+  the read-only verify job from the exact asserted commit and travels
+  through the run-scoped artifact service within one workflow run; the
+  artifact bytes it uploads were verified by BOTH read-only jobs, and
+  the privileged job re-checks the checksum over the downloaded bytes
+  (`sha256sum -c`) before anything is published.
 * **Rollback-pointer discovery (Task 4):** the previous
   `gh api ... 2>/dev/null || echo ""` pattern is replaced by
   `release-latest` (src/releaseOps.ts): only a genuine HTTP 404 yields

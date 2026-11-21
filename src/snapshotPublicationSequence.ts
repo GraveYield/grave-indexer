@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Executable publication sequence — a faithful, offline abstraction of
-// the `publish` job in .github/workflows/publish-console-snapshot.yml
-// (GY-M1-INT-001 §4.2/§4.5 correction).
+// the publication jobs in .github/workflows/publish-console-snapshot.yml
+// (GY-M1-INT-001 §4.2/§4.5 correction; the workflow's second-round Task 1
+// correction split the previous two-job layout into read-only
+// generate/verify/verify-stable jobs plus a minimal privileged `publish`
+// job — the SEQUENCE below is unchanged, only its execution boundary
+// moved: the pre-publication re-verification now runs in the read-only
+// verify job, and the post-activation stable gate now runs in the
+// read-only verify-stable job).
 //
 // WHY THIS EXISTS: the previous engineering report validated the
 // workflow by YAML parsing plus helper-level tests. That cannot prove
@@ -43,6 +49,7 @@ import {
   PROVENANCE_ASSET_NAME,
   SNAPSHOT_ASSET_NAME,
   snapshotSha256,
+  verifyChecksumFile,
   verifySnapshotIntegrity,
   type PublicationProvenance,
   type PublicationStep,
@@ -144,26 +151,10 @@ export interface SequenceResult {
   previousLatestTag: string | null;
 }
 
-/**
- * Verify a `<sha256>␠␠<filename>` checksum file against the exact
- * snapshot bytes — the same check the workflow runs as
- * `sha256sum -c <file>` inside the download directory.
- */
-export function verifyChecksumFile(snapshotBytes: Uint8Array, checksumBytes: Uint8Array, assetName: string): void {
-  const text = Buffer.from(checksumBytes).toString("utf8");
-  const match = /^([0-9a-f]{64})  ([^\n]+)\n?$/.exec(text);
-  if (!match) {
-    throw new Error(`checksum file is not sha256sum-compatible: ${JSON.stringify(text.slice(0, 120))}`);
-  }
-  const [, expected, file] = match;
-  if (file !== assetName) {
-    throw new Error(`checksum file names ${file}, expected ${assetName}`);
-  }
-  const actual = snapshotSha256(snapshotBytes);
-  if (actual !== expected) {
-    throw new Error(`checksum MISMATCH for ${assetName}: file says ${expected}, bytes hash to ${actual}`);
-  }
-}
+// verifyChecksumFile has MOVED to snapshotPublication.ts (the integrity
+// home of the release-ops bundle graph); re-exported here so existing
+// import sites (tests, the sequence) keep working unchanged.
+export { verifyChecksumFile };
 
 /**
  * The publication sequence — the workflow's publish job, step for step.

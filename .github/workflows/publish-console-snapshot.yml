@@ -1,7 +1,7 @@
 name: publish-console-snapshot
 
 # Manual-only ConsoleSnapshot publication (GY-M1-INT-001 §4, §8; PR #5
-# remediation — independent review Tasks 1-5).
+# remediation — independent review Tasks 1-5, Task 1 corrected twice).
 #
 # TRIGGER: `workflow_dispatch` ONLY. No schedule, no cron, no push, no
 # pull_request publication — a production snapshot is an explicit,
@@ -10,7 +10,7 @@ name: publish-console-snapshot
 # EXECUTION RESTRICTION (review Task 1): the workflow is restricted to
 # the `main` branch at TWO independent layers:
 #   1. a job-level `if: github.ref == 'refs/heads/main'` condition on
-#      BOTH jobs — a dispatch against any other ref skips both jobs
+#      ALL FOUR jobs — a dispatch against any other ref skips every job
 #      outright, so release-writing steps are unreachable;
 #   2. an explicit guard step at the top of each job that re-checks
 #      GITHUB_REF == refs/heads/main (defense in depth; also covers a
@@ -27,11 +27,66 @@ name: publish-console-snapshot
 # configuration; see docs/SNAPSHOT_PUBLICATION.md §8) — this workflow
 # cannot configure repository protection itself.
 #
-# SOURCE COMMIT FIDELITY (review Task 1 #4): both jobs check out the
-# EXACT commit Actions selected (`ref: ${{ github.sha }}`) and assert
-# `git rev-parse HEAD` equals that SHA. The provenance sidecar's
-# `indexerSourceCommitSha` is `git rev-parse HEAD` from this checkout,
-# so it provably refers to the actual reviewed commit.
+# SOURCE COMMIT FIDELITY (review Task 1 #4): every repository-checkout
+# job checks out the EXACT commit Actions selected (`ref:
+# ${{ github.sha }}`) and asserts `git rev-parse HEAD` equals that SHA.
+# The provenance sidecar's `indexerSourceCommitSha` is `git rev-parse
+# HEAD` from this checkout, so it provably refers to the actual reviewed
+# commit; the release-ops bundle the privileged job runs is built from
+# the same asserted commit.
+#
+# JOB SEPARATION — WRITE-TOKEN ISOLATION (review Task 1 #5, SECOND-ROUND
+# CORRECTION): the first remediation attached GH_TOKEN per-step but kept
+# a job-level `permissions: contents: write` on a job that also ran
+# checkout, setup-node, pnpm and dependency installation. That was
+# insufficient: the job-level grant makes `github.token` write-capable
+# for the WHOLE job, and several first-party actions consume it by
+# default even without an explicit GH_TOKEN env — `actions/checkout`'s
+# `token` input defaults to `${{ github.token }}`, and so does
+# `actions/setup-node`'s. The corrected structure separates READ-ONLY
+# preparation/verification from PRIVILEGED release operations:
+#
+#   generate (read-only)     build + generate + validate + stage the
+#                            artifact bundle, upload it as a run-scoped
+#                            artifact.
+#   verify (read-only)       INDEPENDENTLY re-download the staged bundle,
+#                            re-verify schema-v2 + integrity against the
+#                            downloaded bytes, and compile the release-ops
+#                            CLI (src/releaseOpsCli.ts) into a SINGLE
+#                            self-contained bundle with ZERO npm runtime
+#                            dependencies (`pnpm run bundle:release-ops`,
+#                            ~11 KB, `node:` builtins only — pinned by
+#                            test/releaseOpsCliBundle.test.ts).
+#   publish (contents:write) the ONLY privileged job, and it is MINIMAL:
+#                            no checkout, no dependency installation, no
+#                            build, no pnpm, no repository code, and —
+#                            deliberately — NO checkout/setup-node
+#                            actions, because both take
+#                            `token: ${{ github.token }}` by default and
+#                            would silently consume the write-capable
+#                            token. Its only `uses:` steps are
+#                            actions/download-artifact (which does NOT
+#                            take a github.token input; it uses the
+#                            artifact-scoped ACTIONS_RUNTIME_TOKEN). Every
+#                            command it runs is runner-preinstalled shell
+#                            tooling (git, curl, sha256sum, gh) or the
+#                            prebuilt zero-dependency release-ops bundle
+#                            executed with the runner's plain `node`. The
+#                            write-capable GH_TOKEN exists ONLY as an
+#                            explicit step-level env on the four steps
+#                            that call the GitHub release API.
+#   verify-stable (read-only) the post-activation stable-reference gate,
+#                            run with the READ-ONLY workflow token from a
+#                            full repository checkout (the code it runs —
+#                            strict schema-v2 parser + same-release
+#                            cross-checks — is the reviewed commit's own).
+#
+# TRUST CHAIN FOR THE PRIVILEGED JOB: the bundle it executes was built by
+# the read-only `verify` job from the EXACT asserted commit and travels
+# through the run-scoped artifact service inside one workflow run; the
+# artifact bytes it uploads were schema- and integrity-verified by BOTH
+# read-only jobs, and the privileged job re-checks the checksum file over
+# the downloaded bytes (`sha256sum -c`) before anything is published.
 #
 # STABLE REFERENCE — LATEST-RELEASE PROMOTION (ARCHITECTURE DECISION
 # PENDING OWNER APPROVAL — review Task 2): every publication is an
@@ -55,9 +110,9 @@ name: publish-console-snapshot
 # over the pointer. It is retained ONLY as the interim implementation
 # with an explicit owner-approval gate and a documented exclusive
 # promotion policy (docs/SNAPSHOT_PUBLICATION.md §9); an unrelated
-# promotion is additionally DETECTED post-activation (the stable
-# verification requires the latest designation to equal the activated
-# tag) and fails the run.
+# promotion is additionally DETECTED post-activation (verify-stable
+# requires the latest designation to equal the activated tag) and fails
+# the run.
 #
 # WHAT IT DOES (in order, fail-closed):
 #   1. generate — build the indexer (frozen lockfile), run
@@ -66,10 +121,13 @@ name: publish-console-snapshot
 #      provenance sidecar + SHA-256 checksum derived from the exact
 #      artifact bytes, completeness gate (discovery + enrichment).
 #      NOTHING is published unless this job is green.
-#   2. publish  — download the staged artifact, RE-VERIFY schema-v2 and
-#      integrity against the downloaded bytes, abort on an existing
+#   2. verify — download the staged artifact, RE-VERIFY schema-v2 and
+#      integrity against the downloaded bytes, build the zero-dependency
+#      release-ops bundle from the asserted commit.
+#   3. publish — download bundle + release-ops CLI, re-check the
+#      checksum over the downloaded bytes, abort on an existing
 #      versioned tag or release (immutability; never clobber; the tag
-#      gate distinguishes "absent" from "exists" from "ls-remote
+#      gate distinguishes "absent" from "exists" from "ls-remote/curl
 #      failed" — an API failure is NEVER treated as "tag absent"),
 #      record the current latest release through the hardened
 #      `release-latest` gate (only a genuine HTTP 404 means "no
@@ -78,29 +136,21 @@ name: publish-console-snapshot
 #      --latest=false, upload the three assets, verify all three assets
 #      of THAT EXACT VERSIONED RELEASE through its tag URLs with
 #      same-release cross-checks (`verify-release-assets --scope
-#      versioned`), and ONLY then promote the release to "latest" with
-#      one metadata operation and re-verify BOTH that the latest
-#      designation equals the activated tag AND that the stable URL
-#      serves exactly one complete artifact set naming that tag
+#      versioned`, no token — the tag URLs are public), and ONLY then
+#      promote the release to "latest" with one metadata operation.
+#   4. verify-stable — read-only post-activation gate: the repo-wide
+#      latest designation must equal the activated tag AND the stable
+#      URL must serve exactly one complete artifact set naming that tag
 #      (`verify-release-assets --scope latest`).
 #
-# TOKEN EXPOSURE (review Task 1 #5): the write-capable GH_TOKEN is NOT
-# set at job level. It is attached ONLY to the individual steps that
-# call the GitHub API/CLI (duplicate-tag/release-collision gate,
-# rollback discovery, release create/upload, promotion, authenticated
-# stable-pointer resolution). Dependency installation, builds, typecheck,
-# verification CLI runs and unauthenticated asset downloads never see a
-# write-capable token. No secrets are read into logs; RPC endpoints come
-# from repository secrets and are never echoed. Actions are pinned to
-# full commit SHAs (this workflow is the only one that can mutate
-# production state, so it is pinned harder than the CI workflows).
-#
-# PERMISSIONS: least privilege — `contents: read` for generation, and
-# `contents: write` ONLY on the release job (needed to create releases
-# and flip the latest designation). An untrusted pull_request context
-# cannot reach any step: workflow_dispatch is the only trigger, both
-# jobs are gated to refs/heads/main, and the workflow-level default is
-# read-only.
+# PERMISSIONS: least privilege — the workflow default is `contents:
+# read`; ONLY the `publish` job overrides it with `contents: write`
+# (create the versioned release + flip the latest designation), and that
+# job contains no checkout, no dependencies, no build, and no action
+# that consumes `github.token` by default. An untrusted pull_request
+# context cannot reach any step: workflow_dispatch is the only trigger,
+# all four jobs are gated to refs/heads/main, and the workflow-level
+# default is read-only.
 #
 # CONCURRENCY: one publication at a time, queued (never cancelled
 # mid-run) — a cancelled publication must never leave a half-activated
@@ -138,7 +188,7 @@ concurrency:
 
 jobs:
   generate:
-    name: generate + validate + stage artifact
+    name: generate + validate + stage artifact (read-only)
     # Layer 1 of the main-only restriction: a dispatch on any other ref
     # skips this job (and therefore the whole workflow) entirely.
     if: github.ref == 'refs/heads/main'
@@ -216,26 +266,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  publish:
-    name: verify + publish versioned release + activate stable (latest-release promotion)
+  verify:
+    name: independently re-verify staged bundle + build zero-dep release-ops CLI (read-only)
     needs: generate
-    # Layer 1 of the main-only restriction on the release-writing job.
+    # Layer 1 of the main-only restriction.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # create the versioned release + flip the latest designation
     env:
-      # NOTE: no GH_TOKEN here — the write-capable token is attached
-      # per-step (below) so it never reaches dependency installation,
-      # builds, or verification steps that do not need it.
-      REPO: ${{ github.repository }}
-      STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
       CHECKOUT_SHA: ${{ github.sha }}
     steps:
-      - name: Guard — release-writing steps run ONLY from refs/heads/main
+      - name: Guard — verification runs ONLY from refs/heads/main
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "refusing to publish: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            echo "refusing to run: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
             exit 1
           fi
       - name: Download the staged publication bundle
@@ -252,7 +295,7 @@ jobs:
         run: |
           ACTUAL=$(git rev-parse HEAD)
           if [ "$ACTUAL" != "$CHECKOUT_SHA" ]; then
-            echo "checkout mismatch: HEAD ($ACTUAL) != selected commit ($CHECKOUT_SHA)"; exit 1
+            echo "checkout mismatch: HEAD ($ACTUAL) != selected commit ($CHECKOUT_SHA) — refusing to verify against an unverified source"; exit 1
           fi
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
         with:
@@ -262,10 +305,78 @@ jobs:
           version: 9
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build:sdk
-      - name: Re-verify the downloaded artifact BEFORE any publication
+      - name: Re-verify the downloaded artifact BEFORE any publication (independent of generate)
         run: |
           node --import tsx/esm src/cli.ts verify-snapshot \
             bundle/console-snapshot.json bundle/console-snapshot-provenance.json
+      - name: Build the ZERO-DEPENDENCY release-ops bundle (from the asserted commit)
+        # src/releaseOpsCli.ts compiles to a single self-contained .mjs
+        # whose ONLY imports are `node:` builtins (pinned by
+        # test/releaseOpsCliBundle.test.ts). The privileged publish job
+        # runs THIS prebuilt file with the runner's plain node — it never
+        # installs dependencies, checks out code, or executes repository
+        # scripts while holding the write-capable token.
+        run: pnpm run bundle:release-ops
+      - name: Upload the release-ops bundle for the privileged job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # actions/upload-artifact v4
+        with:
+          name: release-ops-cli
+          path: dist/release-ops.mjs
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish versioned release + activate stable (MINIMAL privileged job — write token)
+    needs: [generate, verify]
+    # Layer 1 of the main-only restriction on the release-writing job.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the versioned release + flip the latest designation
+    env:
+      # NOTE: no GH_TOKEN here — the write-capable token is attached
+      # per-step (below) so it never reaches any step that does not call
+      # the GitHub release API. This job contains NO checkout, NO
+      # setup-node, NO pnpm, NO dependency installation and NO repository
+      # code: checkout and setup-node both take `token:
+      # ${{ github.token }}` by default and would silently consume the
+      # write-capable token; the release-ops bundle was built by the
+      # read-only verify job from the asserted commit and runs on the
+      # runner's preinstalled node.
+      REPO: ${{ github.repository }}
+      STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
+      CHECKOUT_SHA: ${{ github.sha }}
+    steps:
+      - name: Guard — release-writing steps run ONLY from refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "refusing to publish: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            exit 1
+          fi
+      - name: Download the verified publication bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact v4
+        with:
+          name: snapshot-publication-bundle
+          path: bundle
+      - name: Download the prebuilt release-ops bundle (built by the read-only verify job)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact v4
+        with:
+          name: release-ops-cli
+          path: ops
+      - name: Assert both downloaded artifacts exist (fail closed on a missing artifact)
+        run: |
+          test -f bundle/console-snapshot.json || { echo "publication bundle incomplete (console-snapshot.json missing)"; exit 1; }
+          test -f bundle/console-snapshot-provenance.json || { echo "publication bundle incomplete (provenance missing)"; exit 1; }
+          test -f bundle/console-snapshot.sha256 || { echo "publication bundle incomplete (checksum missing)"; exit 1; }
+          test -f ops/release-ops.mjs || { echo "release-ops bundle missing — the privileged job refuses to run without the verified bundle"; exit 1; }
+          node --version
+      - name: Re-check the checksum over the downloaded bytes (pure shell, no repository code)
+        # The privileged job's LAST line of defense before anything is
+        # published: the three files it is about to upload must be
+        # internally consistent (checksum file over the exact snapshot
+        # bytes), verified with runner-preinstalled sha256sum only.
+        working-directory: bundle
+        run: sha256sum -c console-snapshot.sha256
       - name: Read + validate the versioned tag from the provenance sidecar
         id: facts
         run: |
@@ -280,26 +391,41 @@ jobs:
           esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "versioned tag: $TAG"
-      - name: Fail safely on an existing versioned tag or release collision (immutability, no clobber)
+      - name: Fail safely on an existing versioned tag collision (immutability, no clobber)
         # Explicit three-way handling: exit 2 = genuinely absent (safe),
         # exit 0 = EXISTS (abort), ANY other status = the gate itself
         # failed (network/auth/API) — NEVER interpreted as "absent".
-        env:
-          GH_TOKEN: ${{ github.token }} # scoped to this step only
+        # Unauthenticated ls-remote against the EXPLICIT repo URL: no
+        # checkout needed; on a private repo this fails closed (abort).
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
           status=0
-          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 || status=$?
+          git ls-remote --exit-code --tags "https://github.com/$REPO.git" "refs/tags/$TAG" >/dev/null 2>&1 || status=$?
           case "$status" in
             2) echo "versioned tag $TAG does not exist — safe to publish" ;;
             0) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
             *) echo "tag-collision gate FAILED (git ls-remote exit $status — network, auth or API problem); refusing to treat this as 'tag absent'"; exit 1 ;;
           esac
-          # Belt: an existing RELEASE for this tag also aborts (422 would
-          # be a mid-run surprise; make the collision explicit and early).
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "a release for tag $TAG already exists — aborting (stable reference untouched)"; exit 1
-          fi
+      - name: Belt check — an existing RELEASE for this tag is also a fail-closed collision
+        # Three-way like the tag gate (review Task 4 semantics): HTTP 404
+        # = genuinely absent, HTTP 200 = EXISTS (abort), curl transport
+        # failure or any other status = the gate itself failed (abort) —
+        # NEVER reinterpreted as "no release". This replaces the previous
+        # `gh release view ... || true`-shaped check whose non-zero exit
+        # could not distinguish "absent" from "the API call failed".
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only
+        run: |
+          TAG="${{ steps.facts.outputs.tag }}"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG") || { echo "release-collision belt check FAILED (curl transport error); refusing to treat this as 'no release'"; exit 1; }
+          case "$code" in
+            404) echo "no release exists for tag $TAG — confirmed safe to publish" ;;
+            200) echo "a release for tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
+            *) echo "release-collision belt check got unexpected HTTP $code; refusing to treat this as 'no release'"; exit 1 ;;
+          esac
       - name: Record the current stable pointer (rollback reference; aborts on ANY discovery failure)
         # Hardened (review Task 4): `release-latest` exits non-zero on
         # authentication failure, permission failure, rate limit, API
@@ -312,7 +438,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }} # scoped to this step only
         run: |
-          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rollback.out
+          node ops/release-ops.mjs release-latest "$REPO" > /tmp/rollback.out
           kind=$(sed -n 's/^kind=//p' /tmp/rollback.out)
           tag=$(sed -n 's/^tag=//p' /tmp/rollback.out)
           if [ "$kind" = "found" ]; then PREV="$tag"; else PREV=""; fi
@@ -355,7 +481,7 @@ jobs:
         # receives NO GitHub token — the tag URLs are public.
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
-          node --import tsx/esm src/cli.ts verify-release-assets \
+          node ops/release-ops.mjs verify-release-assets \
             "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
       - name: Activate the stable reference (single latest-release promotion)
         # Only reached when: artifact complete + schema-valid + integrity
@@ -376,22 +502,6 @@ jobs:
           fi
           gh release edit "$TAG" --repo "$REPO" --latest
           echo "stable reference activated: $STABLE_SNAPSHOT_URL"
-      - name: Verify the stable reference serves the activated artifact (post-activation gate)
-        # Review Task 5 #7/#8: the post-activation check requires (a) the
-        # repo-wide latest designation (queried through the authenticated
-        # API) to equal the activated versioned tag — an unrelated
-        # promotion that moved the pointer FAILS the run; and (b) the
-        # three assets fetched through the constant public latest URL to
-        # be ONE release's complete artifact set naming that tag
-        # (checksum + digest + provenance-tag cross-check), so a pointer
-        # race DURING the downloads cannot bless a mixed artifact set.
-        env:
-          GH_TOKEN: ${{ github.token }} # scoped to this step only (authenticated pointer query)
-        run: |
-          TAG="${{ steps.facts.outputs.tag }}"
-          node --import tsx/esm src/cli.ts verify-release-assets \
-            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
-          echo "stable reference verified: the latest designation AND the public stable URL serve exactly the activated versioned release's bytes"
       - name: Publication summary (includes rollback pointer)
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
@@ -409,3 +519,65 @@ jobs:
             cat bundle/console-snapshot-provenance.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+    outputs:
+      versioned_tag: ${{ steps.facts.outputs.tag }}
+
+  verify-stable:
+    name: post-activation stable-reference gate (read-only)
+    needs: publish
+    # Layer 1 of the main-only restriction.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      CHECKOUT_SHA: ${{ github.sha }}
+    steps:
+      - name: Guard — the post-activation gate runs ONLY from refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "refusing to run: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Assert the checked-out commit is the workflow's selected commit
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$CHECKOUT_SHA" ]; then
+            echo "checkout mismatch: HEAD ($ACTUAL) != selected commit ($CHECKOUT_SHA)"; exit 1
+          fi
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@f53f5227a9e83886ab598c617f3c170fab62f0d3 # pnpm/action-setup v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: Verify the stable reference serves the activated artifact (post-activation gate)
+        # Review Task 5 #7/#8: the post-activation check requires (a) the
+        # repo-wide latest designation (queried through the authenticated
+        # API) to equal the activated versioned tag — an unrelated
+        # promotion that moved the pointer FAILS the run; and (b) the
+        # three assets fetched through the constant public latest URL to
+        # be ONE release's complete artifact set naming that tag
+        # (checksum + digest + provenance-tag cross-check), so a pointer
+        # race DURING the downloads cannot bless a mixed artifact set.
+        # This is a READ-ONLY job: it runs the reviewed commit's own
+        # verification code with the workflow's READ-ONLY token — no
+        # write permission exists in this job at all.
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job inherits contents: read)
+        run: |
+          case "$TAG" in
+            console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-notrack) ;;
+            *) echo "activated tag fails the strict versioned-tag shape: $TAG"; exit 1 ;;
+          esac
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
+          echo "stable reference verified: the latest designation AND the public stable URL serve exactly the activated versioned release's bytes"

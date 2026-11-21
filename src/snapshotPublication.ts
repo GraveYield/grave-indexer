@@ -49,10 +49,13 @@
 // arguments; the module never reads `process.env` itself.
 
 import { createHash } from "node:crypto";
-import {
-  CONSOLE_SNAPSHOT_SCHEMA_VERSION,
-  type ConsoleSnapshotV2,
-} from "./consoleSnapshot.js";
+// The schema-version VALUE comes from the leaf module (see
+// src/consoleSnapshotVersion.ts) so this module — and the release-ops
+// bundle built on top of it — never pulls in the builder's heavy
+// dependency tree. Only the TYPE is read from the builder module; type
+// imports are erased at compile time.
+import { CONSOLE_SNAPSHOT_SCHEMA_VERSION } from "./consoleSnapshotVersion.js";
+import type { ConsoleSnapshotV2 } from "./consoleSnapshot.js";
 
 /**
  * The stable production tag PREFIX (GY-M1-INT-001 §4).
@@ -104,6 +107,31 @@ export function versionedAssetUrl(repository: string, tag: string, assetName: st
 /** sha256 hex over the exact artifact bytes. */
 export function snapshotSha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Verify a `<sha256>␠␠<filename>` checksum file against the exact
+ * snapshot bytes — the same check the workflow runs as
+ * `sha256sum -c <file>` inside the download directory.
+ *
+ * LIVES HERE (not in snapshotPublicationSequence.ts) so the release-ops
+ * bundle graph (src/releaseOpsCli.ts) stays free of the strict schema
+ * parser's dependency tree: this module imports only `node:crypto`.
+ */
+export function verifyChecksumFile(snapshotBytes: Uint8Array, checksumBytes: Uint8Array, assetName: string): void {
+  const text = Buffer.from(checksumBytes).toString("utf8");
+  const match = /^([0-9a-f]{64})  ([^\n]+)\n?$/.exec(text);
+  if (!match) {
+    throw new Error(`checksum file is not sha256sum-compatible: ${JSON.stringify(text.slice(0, 120))}`);
+  }
+  const [, expected, file] = match;
+  if (file !== assetName) {
+    throw new Error(`checksum file names ${file}, expected ${assetName}`);
+  }
+  const actual = snapshotSha256(snapshotBytes);
+  if (actual !== expected) {
+    throw new Error(`checksum MISMATCH for ${assetName}: file says ${expected}, bytes hash to ${actual}`);
+  }
 }
 
 /** Error thrown by any publication-integrity or sequencing violation. */

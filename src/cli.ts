@@ -59,6 +59,15 @@ import {
   verifyReleaseAssetSet,
   type AssetScope,
 } from "./releaseOps.js";
+// The GitHub-facing command implementations live in the standalone
+// release-ops entry (src/releaseOpsCli.ts) so the privileged publication
+// job can run a ZERO-DEPENDENCY bundle of exactly that graph — the full
+// indexer CLI graph (web3, RPC transports, signing) must never be pulled
+// into the write-token execution boundary. cli.ts re-exports the command
+// functions so the behavioral tests keep driving the same entry points.
+import { cmdReleaseLatest, cmdVerifyReleaseAssets } from "./releaseOpsCli.js";
+
+export { cmdReleaseLatest, cmdVerifyReleaseAssets };
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
@@ -841,113 +850,6 @@ export function cmdVerifySnapshot(artifactPath: string, provenancePath: string):
   }
   console.log(`verify-snapshot: OK — schema v2 parse passed, sha256 ${provenance.snapshotSha256} verified over ${provenance.snapshotByteLength} bytes`);
   return 0;
-}
-
-/**
- * Read the GitHub API token from the environment WITHOUT ever printing it.
- * Returns null when absent (unauthenticated calls are valid for public
- * repos but carry a low rate limit — the workflow always supplies one).
- */
-function githubApiToken(): string | null {
-  return process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? null;
-}
-
-/**
- * `release-latest` — HARDENED rollback-pointer discovery (PR #5 remediation,
- * review Task 4). Replaces the previous `gh api ... 2>/dev/null || echo ""`
- * pattern that silently reinterpreted authentication failures, rate
- * limits, outages and malformed responses as "no previous release".
- *
- * Output protocol (machine-consumed by the workflow via GITHUB_OUTPUT):
- *   * kind=none|found  tag=<tag or empty>
- * `kind: none` is produced ONLY by a genuine HTTP 404 from
- * /releases/latest. Any other failure prints the typed category to
- * stderr and exits non-zero — the workflow aborts BEFORE any release
- * operation, leaving the stable reference untouched.
- */
-export async function cmdReleaseLatest(repository: string): Promise<number> {
-  const token = githubApiToken();
-  try {
-    const resolution = await resolveLatestRelease({ repository, ...(token ? { http: authedHttp(token) } : {}) });
-    if (resolution.kind === "none") {
-      console.error(`release-latest: ${resolution.detail}`);
-      console.log("kind=none");
-      console.log("tag=");
-    } else {
-      console.error(`release-latest: current latest release tag: ${resolution.tag}`);
-      console.log("kind=found");
-      console.log(`tag=${resolution.tag}`);
-    }
-    return 0;
-  } catch (err) {
-    if (err instanceof ReleaseOpsError) {
-      console.error(`release-latest: refusing to guess the rollback pointer — ${err.message}`);
-      return 1;
-    }
-    throw err;
-  }
-}
-
-/**
- * `verify-release-assets` — SAME-RELEASE asset verification (PR #5
- * remediation, review Task 5).
- *
- *   --scope versioned  Verify the three assets of ONE exact versioned
- *                      release through its immutable tag URLs: checksum
- *                      matches the exact snapshot bytes, provenance
- *                      verifies over the bytes, and the provenance sidecar
- *                      names the SAME tag.
- *   --scope latest     The POST-ACTIVATION stable-reference gate: FIRST
- *                      the repo-wide latest designation is resolved through
- *                      the authenticated API and must equal the activated
- *                      versioned tag (a pointer that moved — e.g. an
- *                      unrelated promotion — fails the run), THEN the three
- *                      assets are fetched through the CONSTANT public
- *                      latest URL and cross-checked exactly as above, so a
- *                      pointer race DURING the downloads cannot pass a
- *                      mixed artifact set off as one release's publication.
- *
- * Exit 0 = the fetched triple is one complete, internally consistent,
- * correctly-named artifact set. Exit 1 = any mismatch, missing sidecar,
- * pointer drift, or API failure — the workflow aborts (and, post-activation,
- * reports failure for operator investigation; the previously serving
- * release's bytes were never modified by this design).
- */
-export async function cmdVerifyReleaseAssets(args: {
-  repository: string;
-  tag: string;
-  scope: AssetScope;
-  expectedTag: string;
-}): Promise<number> {
-  const token = githubApiToken();
-  try {
-    if (args.scope === "latest") {
-      const resolution = await resolveLatestRelease({ repository: args.repository, ...(token ? { http: authedHttp(token) } : {}) });
-      if (resolution.kind === "none") {
-        console.error("verify-release-assets: no latest release is designated — the stable reference is missing; failing");
-        return 1;
-      }
-      if (resolution.tag !== args.expectedTag) {
-        console.error(
-          `verify-release-assets: the latest designation is '${resolution.tag}', expected the activated release '${args.expectedTag}' — an unrelated promotion moved the stable pointer; failing`,
-        );
-        return 1;
-      }
-    }
-    await verifyReleaseAssetSet({
-      repository: args.repository,
-      tag: args.tag,
-      scope: args.scope,
-      expectedTag: args.expectedTag,
-    });
-    console.error(
-      `verify-release-assets: OK — ${args.scope} scope resolved to ONE complete artifact set naming ${args.expectedTag} (checksum + provenance digest + tag cross-check)`,
-    );
-    return 0;
-  } catch (err) {
-    console.error(`verify-release-assets: FAILED — ${String((err as Error).message ?? err)}`);
-    return 1;
-  }
 }
 
 async function main(): Promise<number> {

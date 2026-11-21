@@ -53,10 +53,10 @@ import {
   verifySnapshotIntegrity,
   stableProvenanceUrl,
   stableSnapshotUrl,
+  verifyChecksumFile,
   versionedAssetUrl,
   type PublicationProvenance,
 } from "./snapshotPublication.js";
-import { verifyChecksumFile } from "./snapshotPublicationSequence.js";
 
 // ─── Error taxonomy ────────────────────────────────────────────────────────
 
