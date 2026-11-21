@@ -31,6 +31,18 @@ import { issueEvidenceBundle } from "./issue.js";
 import { verifyEvidenceBundle, summarizeVerifyResult } from "./verify.js";
 import { ReplayJournal } from "./journal.js";
 import { generateDisposableOracleSigner, resolveOracleSigner, publicKeyFingerprint } from "./sign.js";
+import { parseConsoleSnapshot } from "./consoleSnapshotParse.js";
+import {
+  buildPublicationProvenance,
+  verifySnapshotIntegrity,
+  versionedTagName,
+  snapshotSha256,
+  STABLE_TAG,
+  SNAPSHOT_ASSET_NAME,
+  PROVENANCE_ASSET_NAME,
+  CHECKSUM_ASSET_NAME,
+  type PublicationProvenance,
+} from "./snapshotPublication.js";
 import {
   buildConsoleSnapshot,
   CONSOLE_SNAPSHOT_SCHEMA_VERSION,
@@ -39,6 +51,7 @@ import {
   type SnapshotThresholds,
 } from "./consoleSnapshot.js";
 import { evaluateM1Sourcing, assertM1Sourcing } from "./m1Sourcing.js";
+import { buildM1WsolQuoteSideRpcFilter } from "./m1SourcingFilter.js";
 import { endpointKindFor, type Cluster } from "./provenance.js";
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
@@ -483,12 +496,20 @@ export async function cmdConsoleSnapshot(
   );
 
   // ---- Discovery cycle (identity-slice, mainnet-safe).
+  // M1 sourcing restriction (GY-M1-INT-001 §6): the enumeration itself is
+  // narrowed at the RPC BOUNDARY with the verified pc_mint@432 memcmp
+  // filter — only quote-side-WSOL AmmInfo accounts are returned, so the
+  // local caps can no longer hide an unfiltered multi-hundred-MB corpus.
+  // The filter is an M1-sourcing-only measure (never a settlement-
+  // orientation change), and the local D-01 gate below remains
+  // authoritative over the parsed records (defense in depth, fail-closed).
   const t0 = Date.now();
   const run = await discoverRaydiumV4Pools(conn, {
     cluster: config.discoveryCluster,
     rpcUrl: config.discoveryRpcUrl,
     maxPools: opts.maxPools,
     mode: "identity-slice",
+    rpcFilters: buildM1WsolQuoteSideRpcFilter(),
     ...(opts.discoveryFetchImpl !== undefined ? { fetchImpl: opts.discoveryFetchImpl } : {}),
   });
   health.recordSuccess("rpc-discovery", Date.now() - t0);
@@ -519,8 +540,49 @@ export async function cmdConsoleSnapshot(
   }
   const targets = supported.slice(0, opts.enrich);
   console.log(
-    `discovery: ${run.stats.parsedPools} parsed, ${wsolSupported.length} WSOL-supported, ${supported.length} m1-eligible (pc_mint WSOL), enriching ${targets.length}`,
+    `discovery: ${run.stats.rawAccounts} raw RPC accounts (pc_mint-WSOL memcmp-filtered), ${run.stats.parsedPools} parsed, ${wsolSupported.length} WSOL-supported, ${supported.length} m1-eligible (pc_mint WSOL), enriching ${targets.length}`,
   );
+
+  // ---- COMPLETENESS SAFEGUARDS (GY-M1-INT-001 §7): a truncated or
+  // partially enriched run must never pass as a complete production
+  // snapshot. Two distinct completeness dimensions are evaluated and
+  // reported separately, recorded as schema-valid `failures` entries
+  // (free-form stage; the strict v2 consumer contract accepts them), and
+  // FORCE the command to exit non-zero so the publication pipeline can
+  // never treat the artifact as publication-ready:
+  //
+  //   * DISCOVERY completeness — every account the (memcmp-filtered) RPC
+  //     response returned was iterated; the local `--max-pools` cap did
+  //     not cut the candidate universe short.
+  //   * ENRICHMENT completeness — every m1-eligible pool was targeted
+  //     (the `--enrich` cap did not shrink the candidate list) and every
+  //     targeted pool was enriched without a stage failure.
+  //
+  // The existing sampling semantics are NOT silently changed: the caps
+  // keep their defaults and meaning — an operator who wants a complete
+  // artifact must raise them until no truncation is reported.
+  const discoveryIncomplete = run.stats.truncated;
+  if (discoveryIncomplete) {
+    const reason =
+      `discovery incomplete: the local --max-pools cap (${opts.maxPools}) stopped ` +
+      `iteration after ${run.stats.iteratedAccounts} of ${run.stats.rawAccounts} raw RPC accounts ` +
+      `— ${run.stats.rawAccounts - run.stats.iteratedAccounts} pc_mint-WSOL account(s) were never parsed; ` +
+      `this artifact must NOT be treated as a complete production snapshot ` +
+      `(raise --max-pools until the filtered corpus is fully covered)`;
+    failures.push({ stage: "discovery-completeness", reason });
+    console.error(`console-snapshot: COMPLETENESS — ${reason}`);
+  }
+  const enrichmentCapped = supported.length > targets.length;
+  if (enrichmentCapped) {
+    const reason =
+      `enrichment incomplete: the local --enrich cap (${opts.enrich}) targeted only ` +
+      `${targets.length} of ${supported.length} m1-eligible pool(s) — ` +
+      `${supported.length - targets.length} candidate(s) were never enriched; ` +
+      `this artifact must NOT be treated as a complete production snapshot ` +
+      `(raise --enrich until every m1-eligible pool is enriched)`;
+    failures.push({ stage: "enrichment-completeness", reason });
+    console.error(`console-snapshot: COMPLETENESS — ${reason}`);
+  }
 
   // ---- Per-pool enrichment: vault reserves, LP supply, memecoin decimals, last swap.
   const activityIndexer =
@@ -620,11 +682,159 @@ export async function cmdConsoleSnapshot(
   const out = join(config.dataDir, "console-snapshot.json");
   mkdirSync(config.dataDir, { recursive: true });
   writeJson(out, snapshot);
+  const enrichedCount = snapshot.counts.enriched;
+  const enrichFailures = failures.filter((f) => f.stage === "enrich").length;
+  const enrichmentFailed = enrichFailures > 0 || enrichments.size < targets.length;
+  if (enrichmentFailed && !enrichmentCapped) {
+    const reason =
+      `enrichment incomplete: ${enrichFailures} enrich-stage failure(s) — ` +
+      `${enrichments.size} of ${targets.length} targeted pool(s) produced facts; ` +
+      `this artifact must NOT be treated as a complete production snapshot`;
+    failures.push({ stage: "enrichment-completeness", reason });
+    console.error(`console-snapshot: COMPLETENESS — ${reason}`);
+    // Re-persist so the on-disk artifact carries the completeness marker too.
+    snapshot.failures = failures;
+    writeJson(out, snapshot);
+  }
   writeJson(join(config.dataDir, HEALTH_FILE), health.snapshot());
   console.log(
-    `console-snapshot: v${CONSOLE_SNAPSHOT_SCHEMA_VERSION}, ${snapshot.counts.enriched} pool(s) enriched, ${failures.length} failure(s) → ${out}`,
+    `console-snapshot: v${CONSOLE_SNAPSHOT_SCHEMA_VERSION}, ${enrichedCount} pool(s) enriched, ${failures.length} failure(s), ` +
+      `completeness: discovery=${discoveryIncomplete ? "INCOMPLETE" : "complete"} enrichment=${enrichmentCapped || enrichmentFailed ? "INCOMPLETE" : "complete"} → ${out}`,
   );
-  return snapshot.counts.enriched > 0 ? 0 : 1;
+  // Fail-closed exit: a complete production snapshot requires the
+  // enriched pool list to be non-empty AND both completeness dimensions
+  // to be satisfied. An incomplete artifact is still WRITTEN (for
+  // diagnostics) but the non-zero exit code refuses to endorse it, so
+  // the publication pipeline can never mistake it for publication-ready.
+  return enrichedCount > 0 && !discoveryIncomplete && !enrichmentCapped && !enrichmentFailed ? 0 : 1;
+}
+
+/** Failure stages that mark an artifact as INCOMPLETE (never publication-ready). */
+const COMPLETENESS_STAGES = ["discovery-completeness", "enrichment-completeness"] as const;
+
+/**
+ * `publish-snapshot` — the manual publication entry point (GY-M1-INT-001
+ * §4, §10): generate the schema-v2 artifact with the M1 quote-side RPC
+ * filter, validate it with the strict parser, derive the provenance
+ * sidecar + SHA-256 checksum from the EXACT artifact bytes, verify the
+ * integrity, and stage all three files in the data dir for the
+ * workflow's release job. Read-only chain-side; no release is created
+ * here, no tag is touched — publication decisions stay in the workflow.
+ *
+ * Fail-closed: ANY incompleteness, schema violation or integrity
+ * mismatch exits non-zero and stages nothing.
+ */
+export async function cmdPublishSnapshot(
+  config: PipelineConfig,
+  opts: {
+    maxPools: number;
+    enrich: number;
+    maxAgeHours: number;
+    /** Test/diagnostic seams (mirrors `cmdConsoleSnapshot`): inject the
+     *  discovery/verification connections or the discovery gPA transport
+     *  instead of dialing the configured endpoints. Production callers
+     *  never pass these. */
+    discoveryConnection?: Connection | undefined;
+    verificationConnection?: Connection | undefined;
+    discoveryFetchImpl?: typeof fetch | undefined;
+    activityIndexer?: ActivityIndexerLive | undefined;
+  },
+): Promise<number> {
+  const generateCode = await cmdConsoleSnapshot(config, {
+    maxPools: opts.maxPools,
+    enrich: opts.enrich,
+    maxAgeHours: opts.maxAgeHours,
+    discoveryConnection: opts.discoveryConnection,
+    verificationConnection: opts.verificationConnection,
+    discoveryFetchImpl: opts.discoveryFetchImpl,
+    activityIndexer: opts.activityIndexer,
+  });
+  if (generateCode !== 0) {
+    console.error("publish-snapshot: generation or completeness validation failed — nothing staged, nothing published");
+    return 1;
+  }
+  const out = join(config.dataDir, SNAPSHOT_ASSET_NAME);
+  const bytes = new Uint8Array(readFileSync(out));
+  const raw = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
+  const snapshot = parseConsoleSnapshot(raw); // strict schema-v2 gate
+
+  const completenessFailures = snapshot.failures.filter((f) => (COMPLETENESS_STAGES as readonly string[]).includes(f.stage));
+  if (completenessFailures.length > 0 || snapshot.pools.length === 0) {
+    for (const f of completenessFailures) console.error(`publish-snapshot: ${f.stage} — ${f.reason}`);
+    console.error("publish-snapshot: artifact is INCOMPLETE — refusing to stage it for publication");
+    return 1;
+  }
+
+  const sourceCommitSha = indexerGitHead();
+  const versionedTag = versionedTagName(snapshot.generatedAtUnixMs, sourceCommitSha);
+  const provenance = buildPublicationProvenance(snapshot, bytes, {
+    sourceCommitSha,
+    workflowRunId: process.env.GITHUB_RUN_ID ?? null,
+    workflowAttempt: process.env.GITHUB_RUN_ATTEMPT ?? null,
+    repository: process.env.GITHUB_REPOSITORY ?? null,
+    versionedTag,
+  });
+  verifySnapshotIntegrity(bytes, provenance); // belt-and-braces: gate the staged bytes themselves
+
+  const provPath = join(config.dataDir, PROVENANCE_ASSET_NAME);
+  const checksumPath = join(config.dataDir, CHECKSUM_ASSET_NAME);
+  writeJson(provPath, provenance);
+  // sha256sum-compatible line over the EXACT artifact bytes staged above.
+  writeFileSync(checksumPath, `${snapshotSha256(bytes)}  ${SNAPSHOT_ASSET_NAME}\n`, { encoding: "utf8" });
+
+  console.log(`publish-snapshot: artifact verified — schema v${snapshot.schemaVersion}, ${snapshot.pools.length} pool(s), complete`);
+  console.log(`publish-snapshot: sha256=${provenance.snapshotSha256} bytes=${provenance.snapshotByteLength}`);
+  console.log(`publish-snapshot: versioned tag → ${versionedTag} (stable reference: ${STABLE_TAG}, advanced only after verification)`);
+  console.log(`publish-snapshot: staged → ${out}, ${provPath}, ${checksumPath}`);
+  return 0;
+}
+
+/**
+ * `verify-snapshot <artifact> <provenance>` — the independent
+ * re-verification gate the workflow runs AFTER downloading the staged
+ * artifact (before release publication) and again against the asset
+ * downloaded BACK from the versioned release. Strict schema-v2 parse +
+ * SHA-256/byte-length integrity + completeness gate, in that order.
+ */
+export function cmdVerifySnapshot(artifactPath: string, provenancePath: string): number {
+  let bytes: Uint8Array;
+  let rawProvenance: unknown;
+  try {
+    bytes = new Uint8Array(readFileSync(artifactPath));
+    rawProvenance = JSON.parse(readFileSync(provenancePath, "utf8")) as unknown;
+  } catch (err) {
+    console.error(`verify-snapshot: could not read inputs — ${String((err as Error).message ?? err)}`);
+    return 1;
+  }
+  if (typeof rawProvenance !== "object" || rawProvenance === null) {
+    console.error("verify-snapshot: provenance sidecar is not an object");
+    return 1;
+  }
+  const provenance = rawProvenance as PublicationProvenance;
+
+  // Gate 1: the strict schema-v2 parser (same contract the console runs).
+  try {
+    parseConsoleSnapshot(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
+  } catch (err) {
+    console.error(`verify-snapshot: artifact FAILED the strict schema-v2 parse — refusing (${String((err as Error).message ?? err)})`);
+    return 1;
+  }
+  // Gate 2: integrity of the exact bytes against the sidecar.
+  try {
+    verifySnapshotIntegrity(bytes, provenance);
+  } catch (err) {
+    console.error(String((err as Error).message ?? err));
+    return 1;
+  }
+  // Gate 3: the artifact must carry actual enriched content — an empty
+  // publication can never be a production snapshot.
+  const enrichedInProvenance = typeof provenance.counts?.enriched === "number" ? provenance.counts.enriched : 0;
+  if (!(enrichedInProvenance > 0)) {
+    console.error("verify-snapshot: provenance reports zero enriched pools — refusing to endorse an empty snapshot");
+    return 1;
+  }
+  console.log(`verify-snapshot: OK — schema v2 parse passed, sha256 ${provenance.snapshotSha256} verified over ${provenance.snapshotByteLength} bytes`);
+  return 0;
 }
 
 async function main(): Promise<number> {
@@ -665,6 +875,29 @@ async function main(): Promise<number> {
         maxAgeHours: num("--max-age-hours", 24),
       });
     }
+    case "publish-snapshot": {
+      const args = process.argv.slice(3);
+      const num = (flag: string, fallback: number): number => {
+        const i = args.indexOf(flag);
+        if (i < 0) return fallback;
+        const v = Number(args[i + 1]);
+        if (!Number.isInteger(v) || v <= 0) throw new Error(`${flag} must be a positive integer`);
+        return v;
+      };
+      return cmdPublishSnapshot(config, {
+        maxPools: num("--max-pools", 120),
+        enrich: num("--enrich", 24),
+        maxAgeHours: num("--max-age-hours", 24),
+      });
+    }
+    case "verify-snapshot": {
+      const [artifact, prov] = process.argv.slice(3);
+      if (!artifact || !prov) {
+        console.error("usage: grave-indexer verify-snapshot <artifact.json> <provenance.json>");
+        return 1;
+      }
+      return cmdVerifySnapshot(artifact, prov);
+    }
     case "health":
       return cmdHealth(config);
     default:
@@ -677,6 +910,13 @@ Usage:
   grave-indexer console-snapshot
                                Produce the typed secret-free console artifact
                                [--max-pools 120] [--enrich 24] [--max-age-hours 24]
+  grave-indexer publish-snapshot
+                               Generate + validate + stage the console artifact with its
+                               provenance sidecar and SHA-256 checksum (manual publication
+                               pipeline; [--max-pools] [--enrich] [--max-age-hours])
+  grave-indexer verify-snapshot <artifact.json> <provenance.json>
+                               Re-verify an artifact: strict schema-v2 parse + SHA-256/
+                               byte-length integrity against the provenance sidecar
   grave-indexer health         Print the latest health snapshot
 
 Key env (see docs/ORACLE_PIPELINE.md):

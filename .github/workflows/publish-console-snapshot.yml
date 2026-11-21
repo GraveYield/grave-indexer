@@ -1,0 +1,230 @@
+name: publish-console-snapshot
+
+# Manual-only ConsoleSnapshot publication (GY-M1-INT-001 §4, §8).
+#
+# TRIGGER: `workflow_dispatch` ONLY. No schedule, no cron, no push, no
+# pull_request publication — a production snapshot is an explicit,
+# auditable operator decision.
+#
+# WHAT IT DOES (in order, fail-closed):
+#   1. generate — build the indexer (frozen lockfile), run
+#      `publish-snapshot`: real discovery with the verified RPC-level
+#      pc_mint==WSOL memcmp filter, strict schema-v2 validation,
+#      provenance sidecar + SHA-256 checksum derived from the exact
+#      artifact bytes, completeness gate (discovery + enrichment).
+#      NOTHING is published unless this job is green.
+#   2. publish  — download the staged artifact, RE-VERIFY the checksum
+#      and the schema-v2 contract against the downloaded bytes, create
+#      the immutable versioned release (timestamp + source commit; a
+#      pre-existing versioned tag FAILS the run instead of clobbering),
+#      upload the three assets, download them BACK from the public
+#      release URL and re-verify, and only then replace the assets on
+#      the stable `console-snapshot-prod` release in place.
+#
+# LAST-KNOWN-GOOD PRESERVATION: every failure before the final asset
+# replacement leaves the stable release untouched. The stable update is
+# a replace-in-place of the three assets (same tag, same names, constant
+# URL) — NOT a tag move (tag move = delete release + tag + recreate,
+# which cannot preserve the previous stable artifact). The replacement
+# itself is not atomic (seconds-long window in which the asset URL can
+# 404 — the console reports that honestly as "missing", never as wrong
+# data); the previous bytes are only surrendered in the same operation
+# that lands the verified replacement.
+#
+# PERMISSIONS: least privilege — `contents: read` for generation, and
+# `contents: write` ONLY on the release job (needed to create releases
+# and upload assets). No secrets are read into logs; RPC endpoints come
+# from repository secrets and are never echoed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pools:
+        description: "--max-pools for the filtered discovery corpus (must cover ALL pc_mint-WSOL accounts; an undersized value FAILS the run)"
+        required: false
+        default: "5000"
+      enrich:
+        description: "--enrich (must cover every m1-eligible pool; an undersized value FAILS the run)"
+        required: false
+        default: "500"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-console-snapshot
+  cancel-in-progress: false # never kill a publication mid-release
+
+jobs:
+  generate:
+    name: generate + validate + stage artifact
+    runs-on: ubuntu-latest
+    env:
+      DISCOVERY_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
+      DEVNET_RPC_URL: ${{ secrets.DEVNET_RPC_URL }}
+      DATA_DIR: ./data
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0 # real git head for the provenance source commit
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - name: Build vendored SDK (pinned protocol submodule)
+        run: pnpm run build:sdk
+      - name: Typecheck
+        run: pnpm exec tsc -p tsconfig.typecheck.json --noEmit
+      - name: Generate + validate + stage the snapshot artifact
+        # publish-snapshot FAILS (non-zero) on any schema violation,
+        # integrity mismatch or completeness violation — this step is the
+        # publication gate; nothing downstream runs if it fails.
+        run: |
+          node --import tsx/esm src/cli.ts publish-snapshot \
+            --max-pools "${{ inputs.max_pools || '5000' }}" \
+            --enrich "${{ inputs.enrich || '500' }}"
+      - name: Verify the staged artifact (independent re-check)
+        run: |
+          node --import tsx/esm src/cli.ts verify-snapshot \
+            data/console-snapshot.json data/console-snapshot-provenance.json
+      - name: Upload staged publication bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-publication-bundle
+          path: |
+            data/console-snapshot.json
+            data/console-snapshot-provenance.json
+            data/console-snapshot.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: verify + publish versioned release + advance stable
+    needs: generate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the versioned release + update stable assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download the staged publication bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: snapshot-publication-bundle
+          path: bundle
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: Re-verify the downloaded artifact BEFORE any publication
+        run: |
+          node --import tsx/esm src/cli.ts verify-snapshot \
+            bundle/console-snapshot.json bundle/console-snapshot-provenance.json
+      - name: Read publication facts from the provenance sidecar
+        id: facts
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('bundle/console-snapshot-provenance.json','utf8')).versionedTag)")
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then echo "no versioned tag in provenance"; exit 1; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "versioned tag: $TAG"
+      - name: Fail safely if the versioned tag already exists (no clobber)
+        run: |
+          TAG="${{ steps.facts.outputs.tag }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
+            echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"
+            exit 1
+          fi
+      - name: Publish the immutable versioned release
+        run: |
+          TAG="${{ steps.facts.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "$GITHUB_SHA" \
+            --title "ConsoleSnapshot v2 — $TAG" \
+            --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256."
+          gh release upload "$TAG" \
+            --repo "$REPO" \
+            bundle/console-snapshot.json \
+            bundle/console-snapshot-provenance.json \
+            bundle/console-snapshot.sha256
+      - name: Download the versioned assets BACK and re-verify (public URL, unauthenticated)
+        run: |
+          TAG="${{ steps.facts.outputs.tag }}"
+          mkdir -p roundtrip
+          curl -fsSL -o roundtrip/console-snapshot.json \
+            "https://github.com/$REPO/releases/download/$TAG/console-snapshot.json"
+          curl -fsSL -o roundtrip/console-snapshot-provenance.json \
+            "https://github.com/$REPO/releases/download/$TAG/console-snapshot-provenance.json"
+          node --import tsx/esm src/cli.ts verify-snapshot \
+            roundtrip/console-snapshot.json roundtrip/console-snapshot-provenance.json
+          echo "roundtrip verification passed — the versioned release is live and publicly readable"
+      - name: Advance the stable reference (replace assets in place, last step)
+        # Only reached when: artifact complete + schema-valid + versioned
+        # release published + roundtrip-verified. The stable release
+        # keeps its tag and asset names (constant URL); this replaces the
+        # three assets in place. First run bootstraps the stable release
+        # at the versioned commit.
+        run: |
+          TAG="${{ steps.facts.outputs.tag }}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "versioned release confirmed"
+          else
+            echo "versioned release missing — refusing to advance the stable reference"; exit 1
+          fi
+          if gh release view "console-snapshot-prod" --repo "$REPO" >/dev/null 2>&1; then
+            echo "stable release exists — replacing assets in place (last-known-good preserved until this point)"
+            gh release upload "console-snapshot-prod" \
+              --repo "$REPO" --clobber \
+              bundle/console-snapshot.json \
+              bundle/console-snapshot-provenance.json \
+              bundle/console-snapshot.sha256
+          else
+            echo "stable release absent — bootstrapping it at $TAG"
+            gh release create "console-snapshot-prod" \
+              --repo "$REPO" \
+              --target "$GITHUB_SHA" \
+              --title "ConsoleSnapshot production (stable reference)" \
+              --notes "Rolling stable production artifact. Asset names and URL are constant; contents are replaced only after the immutable versioned release has been published and verified. See the versioned releases for history."
+            gh release upload "console-snapshot-prod" \
+              --repo "$REPO" \
+              bundle/console-snapshot.json \
+              bundle/console-snapshot-provenance.json \
+              bundle/console-snapshot.sha256
+          fi
+          echo "stable reference updated: https://github.com/$REPO/releases/download/console-snapshot-prod/console-snapshot.json"
+      - name: Verify the stable artifact (post-advance spot check)
+        run: |
+          mkdir -p stable-check
+          curl -fsSL -o stable-check/console-snapshot.json \
+            "https://github.com/$REPO/releases/download/console-snapshot-prod/console-snapshot.json"
+          curl -fsSL -o stable-check/console-snapshot-provenance.json \
+            "https://github.com/$REPO/releases/download/console-snapshot-prod/console-snapshot-provenance.json"
+          node --import tsx/esm src/cli.ts verify-snapshot \
+            stable-check/console-snapshot.json stable-check/console-snapshot-provenance.json
+          echo "stable reference serves a verified, complete schema-v2 artifact"
+      - name: Publication summary
+        run: |
+          {
+            echo "## ConsoleSnapshot publication"
+            echo "- versioned release: \`${{ steps.facts.outputs.tag }}\`"
+            echo "- stable reference: \`console-snapshot-prod\` (assets replaced in place)"
+            echo "- stable URL: https://github.com/$REPO/releases/download/console-snapshot-prod/console-snapshot.json"
+            echo '- Console configuration: `GY_SNAPSHOT_URL` = the stable URL above'
+            echo
+            echo '```json'
+            cat bundle/console-snapshot-provenance.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
