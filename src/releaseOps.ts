@@ -419,10 +419,25 @@ export async function verifyReleaseAssetSet(args: {
       args.scope === "versioned" ? args.tag : null,
       authedHttp(args.authToken),
     );
-    if (args.scope === "versioned" && record.tag_name !== args.tag) {
+    // Record-identity gate, applied BEFORE any asset download (fifth-round
+    // race fix): the fetched record must name the tag this verification is
+    // authorized to inspect.
+    //   * scope "versioned": the record must be the release `args.tag`.
+    //   * scope "latest": the record must still be `args.expectedTag`.
+    //     The caller (`cmdVerifyReleaseAssets`) already checked the latest
+    //     designation, but between that check and THIS record lookup a
+    //     concurrent promotion can move the repo-wide pointer. This gate
+    //     closes that race: an unexpected record is rejected immediately —
+    //     no asset is downloaded from it, the run does not retry against
+    //     the new latest release, and the unexpected record is never
+    //     treated as valid.
+    const expectedRecordTag = args.scope === "versioned" ? args.tag : args.expectedTag;
+    if (record.tag_name !== expectedRecordTag) {
       throw new ReleaseOpsError(
         "MALFORMED_RESPONSE",
-        `release lookup returned tag_name ${String(record.tag_name ?? "<none>")}, expected ${args.tag} — refusing to verify a mismatched release record`,
+        args.scope === "versioned"
+          ? `release lookup returned tag_name ${String(record.tag_name ?? "<none>")}, expected ${args.tag} — refusing to verify a mismatched release record`
+          : `latest-release lookup returned tag_name ${String(record.tag_name ?? "<none>")}, expected ${args.expectedTag} — the latest designation changed or resolved to an unexpected release between the designation check and the record lookup; refusing to download assets from an unexpected release`,
         200,
       );
     }

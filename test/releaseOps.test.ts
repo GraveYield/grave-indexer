@@ -624,6 +624,84 @@ describe("verifyReleaseAssetSet / cmdVerifyReleaseAssets — authenticated API t
     globalThis.fetch = realFetch;
   });
 
+  // ─── Latest-designation race (fifth-round fix) ────────────────────────────
+  // The caller checked the latest designation, but the record lookup inside
+  // verifyReleaseAssetSet is a SECOND /releases/latest request. A concurrent
+  // promotion between the two must fail closed BEFORE any asset download.
+
+  test("REGRESSION (latest-designation race): designation check passes, subsequent record lookup returns a DIFFERENT tag → typed failure, ZERO asset downloads", async () => {
+    process.env.GH_TOKEN = READ_TOKEN;
+    const latestHits: string[] = [];
+    const assetAttempted: string[] = [];
+    const unexpectedAssetUrl = `${assetBase}/9`; // would be fetched if the unexpected record were trusted
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      // Call #1: resolveLatestRelease's designation lookup — names the EXPECTED tag.
+      // Call #2: fetchReleaseRecord(null) inside verifyReleaseAssetSet — the
+      // designation has "moved": a different release is now latest.
+      if (url === `https://api.github.com/repos/${REPO}/releases/latest`) {
+        latestHits.push(url);
+        const tag = latestHits.length === 1 ? TAG_B : TAG_A;
+        return new Response(
+          JSON.stringify({ tag_name: tag, assets: [{ name: SNAPSHOT_ASSET_NAME, url: unexpectedAssetUrl }] }),
+          { status: 200 },
+        );
+      }
+      assetAttempted.push(url);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    let exit = -1;
+    let thrown: unknown = null;
+    try {
+      exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "latest", expectedTag: TAG_B });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      delete process.env.GH_TOKEN;
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(thrown, null, "the CLI layer converts the typed error into exit code 1 (no throw escapes)");
+    assert.equal(exit, 1, "the raced verification fails closed");
+    assert.equal(latestHits.length, 2, "exactly the designation lookup and the record lookup happened");
+    assert.deepEqual(assetAttempted, [], "no asset of the unexpected release was downloaded");
+  });
+
+  test("REGRESSION (latest-designation race): verifyReleaseAssetSet itself rejects an unexpected latest record with a typed error BEFORE any asset fetch", async () => {
+    const assetAttempted: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === `https://api.github.com/repos/${REPO}/releases/latest`) {
+        // The record names a DIFFERENT tag than expectedTag — the designation
+        // moved between the caller's check and this lookup.
+        return new Response(
+          JSON.stringify({ tag_name: TAG_A, assets: [{ name: SNAPSHOT_ASSET_NAME, url: `${assetBase}/9` }] }),
+          { status: 200 },
+        );
+      }
+      assetAttempted.push(url);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    let thrown: unknown = null;
+    try {
+      await verifyReleaseAssetSet({ repository: REPO, tag: TAG_B, scope: "latest", expectedTag: TAG_B, authToken: READ_TOKEN });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(thrown instanceof ReleaseOpsError, "the production verification function throws a typed ReleaseOpsError");
+    const opsErr = thrown as ReleaseOpsError;
+    assert.equal(opsErr.category, "MALFORMED_RESPONSE", "the existing mismatch classification is reused");
+    assert.match(
+      opsErr.message,
+      /latest designation changed or resolved to an unexpected release/,
+      "the diagnostic names the race condition",
+    );
+    assert.ok(opsErr.message.includes(TAG_A), "the diagnostic names the unexpected tag");
+    assert.deepEqual(assetAttempted, [], "NO asset download was attempted against the unexpected release");
+    globalThis.fetch = realFetch;
+  });
+
   test("tokenless environment: the CLI does not authenticate even when a URL responds (explicit contract)", async () => {
     delete process.env.GH_TOKEN;
     delete process.env.GITHUB_TOKEN;
