@@ -37,14 +37,21 @@ layer monkeypatched — the full error-classification matrix (404/200/401/
 403-permission/403-rate-limit/429/5xx/network/malformed/unexpected) and the
 pointer-drift rejection.
 
-### 1.3 Guard-refusal rehearsal in Actions (real workflow run, zero release operations)
+### 1.3 Guard-refusal rehearsal in Actions — PREPARED, not dispatchable from this branch
 
-`.github/workflows/rehearsal-publication.yml` was dispatched in
-`GraveYield/grave-indexer` on the PR branch to prove that its HARD GUARD
-refuses to run anywhere except the designated rehearsal repository:
-the run must abort at the first step, before any release operation,
-with no side effects. (Run URL/ID recorded in the PR remediation report
-and in section 3 below.)
+`.github/workflows/rehearsal-publication.yml` is committed on this branch
+with a HARD GUARD whose first step refuses to run anywhere except
+`GraveYield/grave-indexer-pub-rehearsal`. Dispatching it here (in
+`grave-indexer`, on the PR branch) was ATTEMPTED and is NOT possible
+before merge: GitHub registers `workflow_dispatch` workflows only from
+the default branch (`POST /actions/workflows/rehearsal-publication.yml/
+dispatches` → 404 while the file exists only on this branch). The guard's
+correctness is therefore pinned structurally by
+`test/publishWorkflow.test.ts` (guard is the FIRST step, aborts with
+exit 1, and no command may target the production repository); the live
+guard-refusal run can be executed after merge or on the rehearsal repo
+(no production release operation can occur either way — the guard aborts
+first).
 
 ## 2. What could NOT be executed, and why
 
