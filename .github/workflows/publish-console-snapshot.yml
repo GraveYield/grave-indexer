@@ -1,33 +1,63 @@
 name: publish-console-snapshot
 
-# Manual-only ConsoleSnapshot publication (GY-M1-INT-001 §4, §8; stable
-# reference redesign per the GY-M1-INT-001 correction, owner-approved
-# investigation §4.3).
+# Manual-only ConsoleSnapshot publication (GY-M1-INT-001 §4, §8; PR #5
+# remediation — independent review Tasks 1-5).
 #
 # TRIGGER: `workflow_dispatch` ONLY. No schedule, no cron, no push, no
 # pull_request publication — a production snapshot is an explicit,
 # auditable operator decision.
 #
-# STABLE REFERENCE — LATEST-RELEASE PROMOTION (replaces the superseded
-# clobber design): every publication is an IMMUTABLE, versioned release
-# (`console-snapshot-prod-<UTC timestamp>-<source commit>`, created with
-# `--latest=false` so it does NOT move the stable pointer on creation).
-# The stable retrieval reference is the repo-wide "latest release"
-# designation, served through the CONSTANT unauthenticated URL
+# EXECUTION RESTRICTION (review Task 1): the workflow is restricted to
+# the `main` branch at TWO independent layers:
+#   1. a job-level `if: github.ref == 'refs/heads/main'` condition on
+#      BOTH jobs — a dispatch against any other ref skips both jobs
+#      outright, so release-writing steps are unreachable;
+#   2. an explicit guard step at the top of each job that re-checks
+#      GITHUB_REF == refs/heads/main (defense in depth; also covers a
+#      ref given as a short name or a tag — `refs/heads/main` is matched
+#      EXACTLY, so `main-tag`, `refs/tags/main` or any other ref fails).
+# Verified repository configuration (2026-11-21, REST API): the default
+# branch is NOT covered by a classic branch-protection rule; the active
+# repository ruleset ("enhancing indexer") enforces deletion- and
+# non-fast-forward protection plus code-quality checks on all branches
+# but does NOT require pull requests. Restricting this workflow to
+# `refs/heads/main` therefore limits WHO dispatches production
+# publication to those with push access to main, but the owner must
+# still add a pull-request requirement on `main` (external repository
+# configuration; see docs/SNAPSHOT_PUBLICATION.md §8) — this workflow
+# cannot configure repository protection itself.
+#
+# SOURCE COMMIT FIDELITY (review Task 1 #4): both jobs check out the
+# EXACT commit Actions selected (`ref: ${{ github.sha }}`) and assert
+# `git rev-parse HEAD` equals that SHA. The provenance sidecar's
+# `indexerSourceCommitSha` is `git rev-parse HEAD` from this checkout,
+# so it provably refers to the actual reviewed commit.
+#
+# STABLE REFERENCE — LATEST-RELEASE PROMOTION (ARCHITECTURE DECISION
+# PENDING OWNER APPROVAL — review Task 2): every publication is an
+# immutable versioned release (`console-snapshot-prod-<UTC
+# timestamp>-<source commit>`, created with `--latest=false` so it does
+# NOT move the stable pointer on creation). The stable retrieval
+# reference is the repo-wide "latest release" designation, served
+# through the CONSTANT unauthenticated URL
 #   https://github.com/<repo>/releases/latest/download/console-snapshot.json
 # Activation is a SINGLE metadata operation (`gh release edit <tag>
 # --latest`, API PATCH make_latest=true) that moves the whole pointer at
 # once — no asset is ever deleted or overwritten, so the stable URL
 # always resolves to ONE complete release's assets: the previous
-# artifact until activation, the new artifact after. A failed run at ANY
-# point before activation leaves the previous last-known-good artifact
-# serving; rollback is a second single metadata operation on the
-# previous release's tag. The superseded design (three-asset clobber on
-# a permanent `console-snapshot-prod` release) is rejected precisely
-# because per-asset replacement is NOT atomic: GitHub deletes an old
-# asset before creating the new one, so a mid-upload failure or a racing
-# fetch could observe 404s or mismatched snapshot/provenance pairs, and
-# a failed upload could permanently destroy the last-known-good bytes.
+# artifact until activation, the new artifact after. A failed run at
+# ANY point before activation leaves the previous last-known-good
+# artifact serving; rollback is a second single metadata operation on
+# the previous release's tag (recorded BEFORE any release operation,
+# see the rollback step). The repo-wide-latest mechanism is a MATERIAL
+# architecture change relative to the owner-approved dedicated
+# `console-snapshot-prod` reference: an unrelated release could take
+# over the pointer. It is retained ONLY as the interim implementation
+# with an explicit owner-approval gate and a documented exclusive
+# promotion policy (docs/SNAPSHOT_PUBLICATION.md §9); an unrelated
+# promotion is additionally DETECTED post-activation (the stable
+# verification requires the latest designation to equal the activated
+# tag) and fails the run.
 #
 # WHAT IT DOES (in order, fail-closed):
 #   1. generate — build the indexer (frozen lockfile), run
@@ -38,24 +68,54 @@ name: publish-console-snapshot
 #      NOTHING is published unless this job is green.
 #   2. publish  — download the staged artifact, RE-VERIFY schema-v2 and
 #      integrity against the downloaded bytes, abort on an existing
-#      versioned tag (immutability; never clobber), record the current
-#      latest release (rollback pointer), create the versioned release
-#      with --latest=false, upload the three assets, download them BACK
-#      through the same unauthenticated path the Console will use and
-#      re-verify (schema + sha256sum -c + provenance tag), and ONLY then
-#      promote the release to "latest" with one metadata operation and
-#      re-verify the stable URL serves exactly the activated bytes.
+#      versioned tag or release (immutability; never clobber; the tag
+#      gate distinguishes "absent" from "exists" from "ls-remote
+#      failed" — an API failure is NEVER treated as "tag absent"),
+#      record the current latest release through the hardened
+#      `release-latest` gate (only a genuine HTTP 404 means "no
+#      previous release"; auth/permission/rate-limit/outage/malformed
+#      failures abort), create the versioned release with
+#      --latest=false, upload the three assets, verify all three assets
+#      of THAT EXACT VERSIONED RELEASE through its tag URLs with
+#      same-release cross-checks (`verify-release-assets --scope
+#      versioned`), and ONLY then promote the release to "latest" with
+#      one metadata operation and re-verify BOTH that the latest
+#      designation equals the activated tag AND that the stable URL
+#      serves exactly one complete artifact set naming that tag
+#      (`verify-release-assets --scope latest`).
+#
+# TOKEN EXPOSURE (review Task 1 #5): the write-capable GH_TOKEN is NOT
+# set at job level. It is attached ONLY to the individual steps that
+# call the GitHub API/CLI (duplicate-tag/release-collision gate,
+# rollback discovery, release create/upload, promotion, authenticated
+# stable-pointer resolution). Dependency installation, builds, typecheck,
+# verification CLI runs and unauthenticated asset downloads never see a
+# write-capable token. No secrets are read into logs; RPC endpoints come
+# from repository secrets and are never echoed. Actions are pinned to
+# full commit SHAs (this workflow is the only one that can mutate
+# production state, so it is pinned harder than the CI workflows).
 #
 # PERMISSIONS: least privilege — `contents: read` for generation, and
 # `contents: write` ONLY on the release job (needed to create releases
-# and flip the latest designation). No secrets are read into logs; RPC
-# endpoints come from repository secrets and are never echoed. Actions
-# are pinned to full commit SHAs (this workflow is the only one that can
-# mutate production state, so it is pinned harder than the CI workflows).
+# and flip the latest designation). An untrusted pull_request context
+# cannot reach any step: workflow_dispatch is the only trigger, both
+# jobs are gated to refs/heads/main, and the workflow-level default is
+# read-only.
 #
 # CONCURRENCY: one publication at a time, queued (never cancelled
 # mid-run) — a cancelled publication must never leave a half-activated
 # stable reference behind.
+#
+# RELEASE PROTECTION MODEL (review Task 3): VERIFIED repository
+# settings show NO tag-protection ruleset and no verifiable
+# GitHub-enforced immutable-releases configuration (as of 2026-11-21).
+# Immutability is therefore a WORKFLOW-LEVEL convention here, honestly
+# documented: releases are created with --latest=false, assets are
+# never re-uploaded or deleted, `--clobber` is never used, and any tag
+# or release collision fails closed. Enabling GitHub's immutable
+# releases feature is an owner decision that would additionally require
+# a draft-first sequence change (documented in
+# docs/SNAPSHOT_PUBLICATION.md §8) BEFORE it is switched on.
 
 on:
   workflow_dispatch:
@@ -79,6 +139,9 @@ concurrency:
 jobs:
   generate:
     name: generate + validate + stage artifact
+    # Layer 1 of the main-only restriction: a dispatch on any other ref
+    # skips this job (and therefore the whole workflow) entirely.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     env:
       DISCOVERY_RPC_URL: ${{ secrets.MAINNET_RPC_URL }}
@@ -86,11 +149,29 @@ jobs:
       DATA_DIR: ./data
       MAX_POOLS: ${{ inputs.max_pools || '5000' }}
       ENRICH: ${{ inputs.enrich || '500' }}
+      CHECKOUT_SHA: ${{ github.sha }}
     steps:
+      # Layer 2 of the main-only restriction: explicit ref guard.
+      - name: Guard — production publication runs ONLY from refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "refusing to run: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
         with:
+          ref: ${{ github.sha }} # the EXACT commit Actions selected — never a moving branch head
           submodules: recursive
           fetch-depth: 0 # real git head for the provenance source commit
+      - name: Assert the checked-out commit is the workflow's selected commit
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          echo "checked out commit: $ACTUAL"
+          if [ "$ACTUAL" != "$CHECKOUT_SHA" ]; then
+            echo "checkout mismatch: HEAD ($ACTUAL) != selected commit ($CHECKOUT_SHA) — refusing to generate provenance from an unverified source"
+            exit 1
+          fi
+          echo "provenance source commit will be the actual checked-out commit: $ACTUAL"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
         with:
           node-version: 24
@@ -114,6 +195,8 @@ jobs:
         # publish-snapshot FAILS (non-zero) on any schema violation,
         # integrity mismatch or completeness violation — this step is the
         # publication gate; nothing downstream runs if it fails.
+        # NOTE: this step receives NO GitHub token — it only needs the
+        # RPC secrets above and the git checkout.
         run: |
           node --import tsx/esm src/cli.ts publish-snapshot \
             --max-pools "$MAX_POOLS" \
@@ -136,16 +219,25 @@ jobs:
   publish:
     name: verify + publish versioned release + activate stable (latest-release promotion)
     needs: generate
+    # Layer 1 of the main-only restriction on the release-writing job.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the versioned release + flip the latest designation
     env:
-      GH_TOKEN: ${{ github.token }}
+      # NOTE: no GH_TOKEN here — the write-capable token is attached
+      # per-step (below) so it never reaches dependency installation,
+      # builds, or verification steps that do not need it.
       REPO: ${{ github.repository }}
       STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
-      STABLE_PROVENANCE_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot-provenance.json
-      STABLE_CHECKSUM_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.sha256
+      CHECKOUT_SHA: ${{ github.sha }}
     steps:
+      - name: Guard — release-writing steps run ONLY from refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "refusing to publish: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            exit 1
+          fi
       - name: Download the staged publication bundle
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact v4
         with:
@@ -153,8 +245,15 @@ jobs:
           path: bundle
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
         with:
+          ref: ${{ github.sha }} # same explicit-commit fidelity as the generate job
           submodules: recursive
           fetch-depth: 0
+      - name: Assert the checked-out commit is the workflow's selected commit
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "$CHECKOUT_SHA" ]; then
+            echo "checkout mismatch: HEAD ($ACTUAL) != selected commit ($CHECKOUT_SHA)"; exit 1
+          fi
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
         with:
           node-version: 24
@@ -181,28 +280,64 @@ jobs:
           esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "versioned tag: $TAG"
-      - name: Fail safely if the versioned tag already exists (immutability, no clobber)
+      - name: Fail safely on an existing versioned tag or release collision (immutability, no clobber)
+        # Explicit three-way handling: exit 2 = genuinely absent (safe),
+        # exit 0 = EXISTS (abort), ANY other status = the gate itself
+        # failed (network/auth/API) — NEVER interpreted as "absent".
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
-            echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"
-            exit 1
+          status=0
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1 || status=$?
+          case "$status" in
+            2) echo "versioned tag $TAG does not exist — safe to publish" ;;
+            0) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
+            *) echo "tag-collision gate FAILED (git ls-remote exit $status — network, auth or API problem); refusing to treat this as 'tag absent'"; exit 1 ;;
+          esac
+          # Belt: an existing RELEASE for this tag also aborts (422 would
+          # be a mid-run surprise; make the collision explicit and early).
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "a release for tag $TAG already exists — aborting (stable reference untouched)"; exit 1
           fi
-      - name: Record the current stable pointer (rollback reference)
+      - name: Record the current stable pointer (rollback reference; aborts on ANY discovery failure)
+        # Hardened (review Task 4): `release-latest` exits non-zero on
+        # authentication failure, permission failure, rate limit, API
+        # outage, network failure or malformed response — only a genuine
+        # HTTP 404 yields kind=none ("first publication"). The pointer is
+        # recorded BEFORE any release operation and written to the run
+        # summary immediately, so even a failed run shows the exact
+        # rollback target.
         id: rollback
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only
         run: |
-          PREV=$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rollback.out
+          kind=$(sed -n 's/^kind=//p' /tmp/rollback.out)
+          tag=$(sed -n 's/^tag=//p' /tmp/rollback.out)
+          if [ "$kind" = "found" ]; then PREV="$tag"; else PREV=""; fi
           echo "previous latest tag: ${PREV:-<none — first publication>}"
           echo "previous_latest_tag=$PREV" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Rollback pointer (recorded BEFORE any release operation)"
+            echo "- previous latest release: \`${PREV:-<none — first publication>}\`"
+            echo "- to restore it after activation: \`gh release edit ${PREV:-<tag>} --repo $REPO --latest\`"
+            echo "- rollback is verified only if the follow-up stable check confirms this release serves the stable URL"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish the immutable versioned release (explicitly NOT latest)
         # `--latest=false` pins the stable pointer: the release must NOT
         # become the stable reference on creation. Assets are uploaded in
         # a separate command (required for --latest=false to hold).
+        # Release creation (422 on any collision) and upload failures
+        # abort the run BEFORE activation — the previous release keeps
+        # serving the stable URL throughout.
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
           gh release create "$TAG" \
             --repo "$REPO" \
-            --target "$GITHUB_SHA" \
+            --target "$CHECKOUT_SHA" \
             --latest=false \
             --title "ConsoleSnapshot v2 — $TAG" \
             --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the public URL and the latest-release promotion succeeds."
@@ -211,29 +346,27 @@ jobs:
             bundle/console-snapshot.json \
             bundle/console-snapshot-provenance.json \
             bundle/console-snapshot.sha256
-      - name: Download the versioned assets BACK and re-verify (public URL, unauthenticated)
+      - name: Verify the versioned release's OWN assets (same-release cross-check, public unauthenticated tag URLs)
+        # Review Task 5: all three assets are verified against the EXACT
+        # versioned release — checksum over the exact snapshot bytes,
+        # provenance digest over the bytes, and the provenance sidecar
+        # must NAME this release's tag, so a mixed artifact set (files
+        # resolved from different releases) can never pass. This step
+        # receives NO GitHub token — the tag URLs are public.
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
-          mkdir -p roundtrip
-          curl -fsSL -o roundtrip/console-snapshot.json \
-            "https://github.com/$REPO/releases/download/$TAG/console-snapshot.json"
-          curl -fsSL -o roundtrip/console-snapshot-provenance.json \
-            "https://github.com/$REPO/releases/download/$TAG/console-snapshot-provenance.json"
-          curl -fsSL -o roundtrip/console-snapshot.sha256 \
-            "https://github.com/$REPO/releases/download/$TAG/console-snapshot.sha256"
-          node --import tsx/esm src/cli.ts verify-snapshot \
-            roundtrip/console-snapshot.json roundtrip/console-snapshot-provenance.json
-          (cd roundtrip && sha256sum -c console-snapshot.sha256)
-          PROV_TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('roundtrip/console-snapshot-provenance.json','utf8')).versionedTag)")
-          [ "$PROV_TAG" = "$TAG" ] || { echo "provenance names $PROV_TAG, expected $TAG"; exit 1; }
-          echo "roundtrip verification passed — the versioned release is live, publicly readable, and internally consistent"
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
       - name: Activate the stable reference (single latest-release promotion)
         # Only reached when: artifact complete + schema-valid + integrity
-        # verified + versioned release published + roundtrip-verified.
-        # ONE metadata operation moves the whole stable pointer; no asset
-        # is deleted or overwritten, so the previous last-known-good
-        # artifact remains fully available (its release is untouched) and
-        # a failure here still serves the OLD artifact.
+        # verified + versioned release published + same-release asset
+        # verification passed. ONE metadata operation moves the whole
+        # stable pointer; no asset is deleted or overwritten, so the
+        # previous last-known-good artifact remains fully available (its
+        # release is untouched) and a failure here still serves the OLD
+        # artifact.
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
@@ -243,19 +376,22 @@ jobs:
           fi
           gh release edit "$TAG" --repo "$REPO" --latest
           echo "stable reference activated: $STABLE_SNAPSHOT_URL"
-      - name: Verify the stable URL serves the activated artifact (post-activation spot check)
+      - name: Verify the stable reference serves the activated artifact (post-activation gate)
+        # Review Task 5 #7/#8: the post-activation check requires (a) the
+        # repo-wide latest designation (queried through the authenticated
+        # API) to equal the activated versioned tag — an unrelated
+        # promotion that moved the pointer FAILS the run; and (b) the
+        # three assets fetched through the constant public latest URL to
+        # be ONE release's complete artifact set naming that tag
+        # (checksum + digest + provenance-tag cross-check), so a pointer
+        # race DURING the downloads cannot bless a mixed artifact set.
+        env:
+          GH_TOKEN: ${{ github.token }} # scoped to this step only (authenticated pointer query)
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
-          mkdir -p stable-check
-          curl -fsSL -o stable-check/console-snapshot.json "$STABLE_SNAPSHOT_URL"
-          curl -fsSL -o stable-check/console-snapshot-provenance.json "$STABLE_PROVENANCE_URL"
-          curl -fsSL -o stable-check/console-snapshot.sha256 "$STABLE_CHECKSUM_URL"
-          node --import tsx/esm src/cli.ts verify-snapshot \
-            stable-check/console-snapshot.json stable-check/console-snapshot-provenance.json
-          (cd stable-check && sha256sum -c console-snapshot.sha256)
-          PROV_TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('stable-check/console-snapshot-provenance.json','utf8')).versionedTag)")
-          [ "$PROV_TAG" = "$TAG" ] || { echo "stable URL serves provenance for $PROV_TAG, expected $TAG"; exit 1; }
-          echo "stable reference verified: it serves exactly the activated versioned release's bytes"
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
+          echo "stable reference verified: the latest designation AND the public stable URL serve exactly the activated versioned release's bytes"
       - name: Publication summary (includes rollback pointer)
         run: |
           TAG="${{ steps.facts.outputs.tag }}"
@@ -266,7 +402,7 @@ jobs:
             echo "- stable reference: \`latest\` release designation (activated via a single metadata promotion)"
             echo "- stable URL: $STABLE_SNAPSHOT_URL"
             echo "- rollback pointer (previous latest): \`${PREV:-<none — first publication>}\`"
-            echo "- rollback procedure: \`gh release edit $PREV --repo $REPO --latest\` (restores the previous immutable release as the stable reference)"
+            echo "- rollback procedure: \`gh release edit $PREV --repo $REPO --latest\` (restores the previous immutable release as the stable reference; then re-run verify-release-assets --scope latest --expected-tag $PREV to confirm)"
             echo "- Console configuration: \`GY_SNAPSHOT_URL\` = the stable URL above"
             echo
             echo '```json'

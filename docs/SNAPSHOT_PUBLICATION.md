@@ -189,3 +189,169 @@ moves the pointer to a release whose asset set was already fully
 verified. The overall publication (generate → upload → verify →
 activate → verify) is a multi-step process, not atomic; its safety
 comes from ordering plus immutability, not from a single transaction.
+
+## 8. VERIFIED repository protection model (PR #5 remediation — review Task 3)
+
+Inspected 2026-11-21 via the authenticated GitHub REST API with the
+owner-provided token (evidence recorded in the PR remediation report):
+
+| Configuration | Verified value | Consequence |
+| --- | --- | --- |
+| Branch protection on `main` | **ABSENT** (`GET /branches/main/protection` → 404 "Branch not protected") | Push access to `main` = direct commit access; the workflow's `refs/heads/main` restriction limits dispatchers to people with push access, but no PR requirement is enforced for the branch itself |
+| Repository ruleset "enhancing indexer" (id 27244228, active) | Applies to `~DEFAULT_BRANCH` and `~ALL`; rules: deletion, non_fast_forward, code_quality, copilot_code_review; no bypass actors | `main` cannot be deleted or force-pushed, but the ruleset does NOT require pull requests and does NOT protect tags |
+| Tag-protection rulesets | **NONE** (the only ruleset targets branches) | Versioned snapshot tags can be created, updated or deleted by anyone with push access — tag immutability is NOT GitHub-enforced |
+| Immutable releases (GitHub feature) | **NOT VERIFIABLE** via the REST API (no endpoint exposes the setting; probing returned 404). Verifying it requires owner access to Settings → Releases or a write probe | The workflow must NOT assume assets are locked after upload |
+| Releases / tags in the repository | **NONE exist** (no release, no tag) | The production stable reference is not yet bootstrapped; the first publication is the genuine first-publication path |
+
+### What this means for the publication sequence
+
+1. **Immutability is a WORKFLOW-LEVEL convention here, not a
+   GitHub-enforced property.** The design is honest about this: releases
+   are created `--latest=false`, assets are never re-uploaded or
+   deleted, `--clobber` is never used, and any tag or release collision
+   fails closed BEFORE creation. Nothing in the workflow relies on
+   GitHub preventing an asset modification — it relies on the workflow
+   never issuing one, plus the auditability of the release history.
+2. **Tag collision handling is explicit three-way** (hardened in this
+   remediation): `git ls-remote --exit-code` exit 2 = genuinely absent
+   (proceed), exit 0 = exists (abort), ANY other exit = the gate itself
+   failed (abort — never interpreted as "absent"). An existing RELEASE
+   for the tag also aborts via `gh release view`.
+3. **Compatibility with GitHub's immutable-releases feature:** the
+   current sequence (create a published, empty release → upload assets)
+   is compatible with the CURRENT model but would FAIL once immutable
+   releases are enabled, because assets cannot be added to an already
+   published release under that feature. If the owner enables immutable
+   releases, the sequence MUST first be changed to draft-first (create
+   draft → upload → publish with explicit `make_latest=false` → verify →
+   promote), and the publish-time behavior (that un-drafting does not
+   silently move the latest designation) must be re-verified on the
+   rehearsal target first. **Do not enable immutable releases before
+   that change is implemented and rehearsed.** This is an owner action,
+   not something this PR does.
+4. **A failed or partial upload cannot leave an unusable promoted
+   release:** the partial release is never designated latest (the
+   roundtrip verification precedes promotion), so the previous
+   artifact keeps serving. The orphan versioned release remains visible
+   in the release history for inspection — that is by design (audit),
+   and it can be deleted by an operator without touching the stable
+   reference.
+
+### Owner/admin actions identified (NOT performed by this PR)
+
+* Add a pull-request requirement (and required checks) to `main` via
+  branch protection or a ruleset — the ruleset currently lacks a
+  `pull_request` rule.
+* Decide whether to enable GitHub's immutable releases; if yes, the
+  draft-first sequence change above must land first.
+* Optionally add tag-protection rules for the
+  `console-snapshot-prod-*` namespace so versioned snapshot tags become
+  GitHub-enforced immutable.
+
+## 9. Stable-reference architecture decision (PR #5 remediation — review Task 2)
+
+The originally approved GY-M1-INT-001 design specified a DEDICATED
+stable reference named `console-snapshot-prod`. PR #5 implemented the
+repo-wide latest-release promotion instead — a MATERIAL architecture
+change that this remediation does NOT treat as owner-approved. Both
+alternatives are documented here; the decision is an explicit OWNER
+APPROVAL GATE.
+
+### Option A — dedicated stable reference (`console-snapshot-prod`)
+
+Keep a permanent stable release/tag named `console-snapshot-prod` and
+make it always point at the last-known-good artifact.
+
+* **Safety requirement it must satisfy:** the currently served artifact
+  stays available until the replacement is verified and activated; no
+  missing-asset window; no mixed snapshot/provenance set.
+* **The GitHub-native mechanisms available, and why each fails the
+  requirement:**
+  1. *Asset clobbering on the stable release* (`gh release upload
+     --clobber`) — REJECTED (see §2): per-asset delete-then-create is
+     not atomic; a failed upload can permanently destroy the
+     last-known-good bytes.
+  2. *A pointer artifact* (a small stable file naming the versioned
+     release's URL) — the pointer file itself needs a stable, atomically
+     updatable location: the same problem one level down. Consuming it
+     ALSO requires a Console change (the Console fetches one fixed URL
+     and validates schema-v2; a pointer indirection is not in the
+     shipped consumer contract), i.e. an explicit Console-side scope
+     change.
+  3. *GitHub Pages* hosting a pointer file — separate deployment
+     pipeline and a second production system; a new production
+     architecture that requires owner authorization and cannot be
+     invented by this PR.
+* **Status: NOT implementable with the required safety property on
+  GitHub natively today.** If the owner requires Option A, the realistic
+  path is option 2 or 3 above plus an authorized Console change — a
+  decision and a scope extension that belong to the owner, not to this
+  PR.
+
+### Option B — repository-wide latest release (current implementation)
+
+Publish immutable versioned releases and promote one to "latest" after
+full verification (§3). The stable URL is the constant
+`releases/latest/download/console-snapshot.json`.
+
+* **What it buys:** the last-known-good property with GitHub-native
+  semantics only (verified live: one release's bytes via one redirect,
+  pointer = single metadata field, drafts/prereleases excluded).
+* **What it costs:** the pointer is REPO-WIDE. An unrelated
+  non-draft, non-prerelease release would take it over. Required
+  compensating policy (documented, NOT technically enforceable from
+  inside this repository's workflows):
+  1. **Exclusive promotion policy:** every non-draft, non-prerelease
+     release in `grave-indexer` must be a console-snapshot versioned
+     release; other content must be released elsewhere or flagged
+     prerelease/draft.
+  2. **Operational responsibility:** the owner (or a delegated
+     maintainer) owns release hygiene in this repository; any other
+     workflow or actor that can create releases is in scope of this
+     policy.
+  3. **Rollback mechanism:** `gh release edit <previous-tag> --latest`
+     + `verify-release-assets --scope latest --expected-tag
+     <previous-tag>` (the workflow prints both in its run summary).
+  4. **Detection (implemented):** the post-activation gate fails the
+     run if the latest designation does not equal the activated tag —
+     so a racing unrelated promotion is at least never mistaken for a
+     successful publication.
+* **Status: implemented as the interim mechanism. It remains subject to
+  the owner's explicit approval of the repo-wide-latest architecture
+  and the exclusive promotion policy above.** This PR does not claim
+  that approval; the decision is restated as a blocker in the PR report.
+
+### The decision the owner is asked to make
+
+> Approve one of: (A) dedicated stable reference, accepting that it
+> requires a pointer-artifact/Pages mechanism AND a Console change, or
+> (B) repo-wide latest-release promotion, accepting the exclusive
+> promotion policy and the residual repo-wide-pointer risk. Until the
+> decision is recorded, no production publication should be dispatched.
+
+## 10. Remediation hardening (PR #5 — review Tasks 1, 4, 5)
+
+* **Execution restriction (Task 1):** both jobs carry
+  `if: github.ref == 'refs/heads/main'` AND an explicit guard step; the
+  checkout is pinned to `github.sha` and asserts `git rev-parse HEAD`
+  equals it, so the provenance `indexerSourceCommitSha` is the actual
+  checked-out commit. The write-capable token is attached per-step to
+  the GitHub API/CLI steps only — never to dependency installation,
+  builds, or local verification.
+* **Rollback-pointer discovery (Task 4):** the previous
+  `gh api ... 2>/dev/null || echo ""` pattern is replaced by
+  `release-latest` (src/releaseOps.ts): only a genuine HTTP 404 yields
+  "first publication"; AUTHENTICATION, PERMISSION, RATE_LIMIT,
+  API_OUTAGE, NETWORK, MALFORMED_RESPONSE and UNEXPECTED_STATUS are
+  typed aborts. The pointer is recorded and written to the run summary
+  BEFORE any release operation.
+* **Same-release verification (Task 5):** `verify-release-assets
+  --scope versioned` verifies all three assets of ONE exact versioned
+  release (checksum over the exact bytes, provenance digest, and the
+  provenance must NAME that release's tag — a cross-release mixture is
+  detectable because only the release's own sidecar carries its tag).
+  The post-activation gate `--scope latest` additionally requires the
+  repo-wide latest designation (authenticated API query) to equal the
+  activated tag before the three stable-URL files are cross-checked, so
+  neither pointer drift nor an in-flight promotion race can bless a
+  mixed artifact set.

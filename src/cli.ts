@@ -52,6 +52,13 @@ import {
 import { evaluateM1Sourcing, assertM1Sourcing } from "./m1Sourcing.js";
 import { buildM1WsolQuoteSideRpcFilter } from "./m1SourcingFilter.js";
 import { endpointKindFor, type Cluster } from "./provenance.js";
+import {
+  ReleaseOpsError,
+  authedHttp,
+  resolveLatestRelease,
+  verifyReleaseAssetSet,
+  type AssetScope,
+} from "./releaseOps.js";
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
@@ -836,6 +843,113 @@ export function cmdVerifySnapshot(artifactPath: string, provenancePath: string):
   return 0;
 }
 
+/**
+ * Read the GitHub API token from the environment WITHOUT ever printing it.
+ * Returns null when absent (unauthenticated calls are valid for public
+ * repos but carry a low rate limit — the workflow always supplies one).
+ */
+function githubApiToken(): string | null {
+  return process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? null;
+}
+
+/**
+ * `release-latest` — HARDENED rollback-pointer discovery (PR #5 remediation,
+ * review Task 4). Replaces the previous `gh api ... 2>/dev/null || echo ""`
+ * pattern that silently reinterpreted authentication failures, rate
+ * limits, outages and malformed responses as "no previous release".
+ *
+ * Output protocol (machine-consumed by the workflow via GITHUB_OUTPUT):
+ *   * kind=none|found  tag=<tag or empty>
+ * `kind: none` is produced ONLY by a genuine HTTP 404 from
+ * /releases/latest. Any other failure prints the typed category to
+ * stderr and exits non-zero — the workflow aborts BEFORE any release
+ * operation, leaving the stable reference untouched.
+ */
+export async function cmdReleaseLatest(repository: string): Promise<number> {
+  const token = githubApiToken();
+  try {
+    const resolution = await resolveLatestRelease({ repository, ...(token ? { http: authedHttp(token) } : {}) });
+    if (resolution.kind === "none") {
+      console.error(`release-latest: ${resolution.detail}`);
+      console.log("kind=none");
+      console.log("tag=");
+    } else {
+      console.error(`release-latest: current latest release tag: ${resolution.tag}`);
+      console.log("kind=found");
+      console.log(`tag=${resolution.tag}`);
+    }
+    return 0;
+  } catch (err) {
+    if (err instanceof ReleaseOpsError) {
+      console.error(`release-latest: refusing to guess the rollback pointer — ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+/**
+ * `verify-release-assets` — SAME-RELEASE asset verification (PR #5
+ * remediation, review Task 5).
+ *
+ *   --scope versioned  Verify the three assets of ONE exact versioned
+ *                      release through its immutable tag URLs: checksum
+ *                      matches the exact snapshot bytes, provenance
+ *                      verifies over the bytes, and the provenance sidecar
+ *                      names the SAME tag.
+ *   --scope latest     The POST-ACTIVATION stable-reference gate: FIRST
+ *                      the repo-wide latest designation is resolved through
+ *                      the authenticated API and must equal the activated
+ *                      versioned tag (a pointer that moved — e.g. an
+ *                      unrelated promotion — fails the run), THEN the three
+ *                      assets are fetched through the CONSTANT public
+ *                      latest URL and cross-checked exactly as above, so a
+ *                      pointer race DURING the downloads cannot pass a
+ *                      mixed artifact set off as one release's publication.
+ *
+ * Exit 0 = the fetched triple is one complete, internally consistent,
+ * correctly-named artifact set. Exit 1 = any mismatch, missing sidecar,
+ * pointer drift, or API failure — the workflow aborts (and, post-activation,
+ * reports failure for operator investigation; the previously serving
+ * release's bytes were never modified by this design).
+ */
+export async function cmdVerifyReleaseAssets(args: {
+  repository: string;
+  tag: string;
+  scope: AssetScope;
+  expectedTag: string;
+}): Promise<number> {
+  const token = githubApiToken();
+  try {
+    if (args.scope === "latest") {
+      const resolution = await resolveLatestRelease({ repository: args.repository, ...(token ? { http: authedHttp(token) } : {}) });
+      if (resolution.kind === "none") {
+        console.error("verify-release-assets: no latest release is designated — the stable reference is missing; failing");
+        return 1;
+      }
+      if (resolution.tag !== args.expectedTag) {
+        console.error(
+          `verify-release-assets: the latest designation is '${resolution.tag}', expected the activated release '${args.expectedTag}' — an unrelated promotion moved the stable pointer; failing`,
+        );
+        return 1;
+      }
+    }
+    await verifyReleaseAssetSet({
+      repository: args.repository,
+      tag: args.tag,
+      scope: args.scope,
+      expectedTag: args.expectedTag,
+    });
+    console.error(
+      `verify-release-assets: OK — ${args.scope} scope resolved to ONE complete artifact set naming ${args.expectedTag} (checksum + provenance digest + tag cross-check)`,
+    );
+    return 0;
+  } catch (err) {
+    console.error(`verify-release-assets: FAILED — ${String((err as Error).message ?? err)}`);
+    return 1;
+  }
+}
+
 async function main(): Promise<number> {
   const config = loadPipelineConfig();
   const command = process.argv[2] ?? "help";
@@ -897,6 +1011,26 @@ async function main(): Promise<number> {
       }
       return cmdVerifySnapshot(artifact, prov);
     }
+    case "release-latest": {
+      const repo = process.argv.slice(3).find((a) => !a.startsWith("--"));
+      if (!repo) {
+        console.error("usage: grave-indexer release-latest <owner/repo>");
+        return 1;
+      }
+      return cmdReleaseLatest(repo);
+    }
+    case "verify-release-assets": {
+      const argv = process.argv.slice(3);
+      const repo = argv.find((a) => !a.startsWith("--"));
+      const scope = argv.includes("--scope") ? argv[argv.indexOf("--scope") + 1] : undefined;
+      const tag = argv.includes("--tag") ? argv[argv.indexOf("--tag") + 1] : undefined;
+      const expected = argv.includes("--expected-tag") ? argv[argv.indexOf("--expected-tag") + 1] : undefined;
+      if (!repo || !scope || !tag || !expected || !(["versioned", "latest"] as const).includes(scope as AssetScope)) {
+        console.error("usage: grave-indexer verify-release-assets <owner/repo> --tag <versioned-tag> --scope versioned|latest --expected-tag <versioned-tag>");
+        return 1;
+      }
+      return cmdVerifyReleaseAssets({ repository: repo, tag, scope: scope as AssetScope, expectedTag: expected });
+    }
     case "health":
       return cmdHealth(config);
     default:
@@ -916,6 +1050,14 @@ Usage:
   grave-indexer verify-snapshot <artifact.json> <provenance.json>
                                Re-verify an artifact: strict schema-v2 parse + SHA-256/
                                byte-length integrity against the provenance sidecar
+  grave-indexer release-latest <owner/repo>
+                               Hardened rollback-pointer discovery: kind=none ONLY on a
+                               genuine HTTP 404; auth/permission/rate-limit/outage/
+                               malformed failures exit non-zero (never guessed)
+  grave-indexer verify-release-assets <owner/repo> --tag <tag> --scope versioned|latest --expected-tag <tag>
+                               Same-release verification of snapshot + provenance +
+                               checksum; --scope latest additionally requires the
+                               repo-wide latest designation to equal the expected tag
   grave-indexer health         Print the latest health snapshot
 
 Key env (see docs/ORACLE_PIPELINE.md):

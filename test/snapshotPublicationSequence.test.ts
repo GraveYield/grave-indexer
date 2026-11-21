@@ -439,7 +439,138 @@ describe("failure injection — last-known-good preservation", () => {
   });
 });
 
-// ─── Release-store semantics mirrors ────────────────────────────────────────
+// ─── Mixed-release race scenarios (PR #5 remediation — review Task 5) ──────
+
+describe("mixed-release races — the stable gate must reject a cross-release mixture", () => {
+  async function seed(store: InMemoryReleaseStore, tag: string, bundle: PublicationBundle): Promise<void> {
+    await store.createRelease(tag, { makeLatest: false });
+    await store.uploadAsset(tag, SNAPSHOT_ASSET_NAME, bundle.snapshotBytes);
+    await store.uploadAsset(tag, PROVENANCE_ASSET_NAME, bundle.provenanceBytes);
+    await store.uploadAsset(tag, CHECKSUM_ASSET_NAME, bundle.checksumBytes);
+    await store.markLatest(tag);
+  }
+
+  /**
+   * The post-activation verification logic (the same cross-checks
+   * `verifyReleaseAssetSet` performs), executed over the in-memory store:
+   * checksum over the exact bytes, provenance digest over the bytes, and
+   * the provenance must NAME the activated tag.
+   */
+  async function stableGateOverStore(store: InMemoryReleaseStore, activatedTag: string): Promise<void> {
+    const { verifyReleaseAssetSet } = await import("../src/releaseOps.js");
+    await verifyReleaseAssetSet({
+      repository: "GraveYield/grave-indexer",
+      tag: activatedTag,
+      scope: "latest",
+      expectedTag: activatedTag,
+      fetchAsset: (url) => {
+        const name = url.split("/").pop() ?? "";
+        return store.fetchAssetByLatest(name);
+      },
+    });
+  }
+
+  test("latest pointer changes between the three stable downloads → the gate FAILS, mixture never accepted", async () => {
+    const store = new InMemoryReleaseStore();
+    const prev = freshBundle(NOW_MS - 3_600_000);
+    const next = freshBundle(NOW_MS);
+    await seed(store, prev.tag, prev.bundle);
+    await seed(store, next.tag, next.bundle);
+    await store.markLatest(next.tag);
+
+    // The race: fetch #1 (snapshot) sees the NEW designation; fetches #2/#3
+    // see the OLD release (an unrelated promotion flipped the pointer back).
+    let fetches = 0;
+    await assert.rejects(
+      () =>
+        stableGateOverStore({
+          ...store,
+          fetchAssetByLatest: async (name: string) => {
+            fetches++;
+            if (fetches === 1) return store.fetchAssetByLatest(name); // new release
+            return store.fetchAssetByTag(prev.tag, name); // old release (raced pointer)
+          },
+        } as InMemoryReleaseStore, next.tag),
+      /provenance names|MIXED|checksum/,
+      "a mixed artifact set must never pass the stable gate",
+    );
+    assert.ok(fetches === 3, "all three fetches raced; the cross-check stopped the acceptance");
+  });
+
+  test("snapshot from one release + provenance from another → the gate's cross-check rejects it", async () => {
+    const store = new InMemoryReleaseStore();
+    const prev = freshBundle(NOW_MS - 3_600_000);
+    const next = freshBundle(NOW_MS);
+    await seed(store, prev.tag, prev.bundle);
+    await seed(store, next.tag, next.bundle);
+    await store.markLatest(next.tag);
+    await assert.rejects(
+      () =>
+        stableGateOverStore({
+          ...store,
+          fetchAssetByLatest: async (name: string) =>
+            name === SNAPSHOT_ASSET_NAME ? store.fetchAssetByTag(next.tag, name) : store.fetchAssetByTag(prev.tag, name),
+        } as InMemoryReleaseStore, next.tag),
+      /provenance names|MIXED|checksum/,
+    );
+  });
+
+  test("checksum from a different release beside the activated snapshot → the gate rejects it", async () => {
+    const store = new InMemoryReleaseStore();
+    const prev = freshBundle(NOW_MS - 3_600_000);
+    const next = freshBundle(NOW_MS);
+    await seed(store, prev.tag, prev.bundle);
+    await seed(store, next.tag, next.bundle);
+    await store.markLatest(next.tag);
+    await assert.rejects(
+      () =>
+        stableGateOverStore({
+          ...store,
+          fetchAssetByLatest: async (name: string) =>
+            name === CHECKSUM_ASSET_NAME ? store.fetchAssetByTag(prev.tag, name) : store.fetchAssetByTag(next.tag, name),
+        } as InMemoryReleaseStore, next.tag),
+      /checksum MISMATCH/,
+    );
+  });
+
+  test("missing sidecar on the designated release → the gate rejects it (HTTP 404)", async () => {
+    const store = new InMemoryReleaseStore();
+    const next = freshBundle(NOW_MS);
+    await store.createRelease(next.tag, { makeLatest: false });
+    await store.uploadAsset(next.tag, SNAPSHOT_ASSET_NAME, next.bundle.snapshotBytes);
+    await store.uploadAsset(next.tag, CHECKSUM_ASSET_NAME, next.bundle.checksumBytes);
+    await store.markLatest(next.tag); // provenance never uploaded (partial publication)
+    await assert.rejects(() => stableGateOverStore(store, next.tag), /404|provenance/);
+  });
+
+  test("a CONSISTENT designated release passes the same gate (same-release verification, end to end)", async () => {
+    const store = new InMemoryReleaseStore();
+    const prev = freshBundle(NOW_MS - 3_600_000);
+    const next = freshBundle(NOW_MS);
+    await seed(store, prev.tag, prev.bundle);
+    await seed(store, next.tag, next.bundle);
+    await store.markLatest(next.tag);
+    await assert.doesNotReject(() => stableGateOverStore(store, next.tag));
+    // And the previous release remains fully reachable by tag (rollback intact).
+    const oldSnapshot = await store.fetchAssetByTag(prev.tag, SNAPSHOT_ASSET_NAME);
+    verifyChecksumFile(oldSnapshot, await store.fetchAssetByTag(prev.tag, CHECKSUM_ASSET_NAME), SNAPSHOT_ASSET_NAME);
+  });
+
+  test("the gate refuses when the designation resolves to a release whose provenance names ANOTHER tag", async () => {
+    const store = new InMemoryReleaseStore();
+    const next = freshBundle(NOW_MS);
+    // A release whose sidecar claims to be a different publication.
+    const mislabeled = {
+      ...next.bundle,
+      provenanceBytes: new TextEncoder().encode(
+        JSON.stringify({ ...next.bundle.provenance, versionedTag: "console-snapshot-prod-20990101T000000Z-notrack" }),
+      ),
+      provenance: { ...next.bundle.provenance, versionedTag: "console-snapshot-prod-20990101T000000Z-notrack" },
+    };
+    await seed(store, next.tag, mislabeled as PublicationBundle);
+    await assert.rejects(() => stableGateOverStore(store, next.tag), /provenance names|MIXED/);
+  });
+});
 
 describe("InMemoryReleaseStore — GitHub semantics mirrors", () => {
   test("createRelease with makeLatest:false never moves the designation", async () => {

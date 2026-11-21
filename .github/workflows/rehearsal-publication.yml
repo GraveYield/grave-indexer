@@ -1,0 +1,257 @@
+name: rehearsal-publication
+
+# NON-PRODUCTION publication rehearsal (PR #5 remediation — review
+# Task 6). This workflow exists ONLY to rehearse the real GitHub
+# release operations of publish-console-snapshot.yml against a clearly
+# separate, clearly named non-production target:
+#
+#     GraveYield/grave-indexer-pub-rehearsal
+#
+# HARD SAFETY GUARD: the FIRST step refuses to run anywhere else. If
+# this file is ever dispatched in GraveYield/grave-indexer (or any other
+# repository), it aborts BEFORE any release operation. It must never
+# create, modify, or promote anything in a production repository, and it
+# never touches the production stable reference or production assets.
+#
+# The fixture bundle comes from test/fixturePublicationBundle.ts — the
+# REAL production builders, offline: no RPC, no secrets, no keys.
+#
+# SCENARIOS (workflow_dispatch input):
+#   happy            full publication sequence + rollback drill
+#   partial-upload   upload only the snapshot asset; verification must
+#                    fail; latest designation must be unchanged; the
+#                    previously active artifact must remain retrievable
+#   promotion-failure promotion of a missing release must fail; stable
+#                    pointer unchanged
+#   incomplete-artifact  an incomplete bundle must be refused and never
+#                    promoted (no release created)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "rehearsal scenario: happy | partial-upload | promotion-failure | incomplete-artifact"
+        required: false
+        default: "happy"
+
+permissions:
+  contents: write # releases in the REHEARSAL repository only (guarded below)
+
+concurrency:
+  group: rehearsal-publication
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    name: rehearsal (${{ inputs.scenario || 'happy' }})
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }} # write access is valid ONLY in the rehearsal repo (guard below)
+      SCENARIO: ${{ inputs.scenario || 'happy' }}
+      CHECKOUT_SHA: ${{ github.sha }}
+    steps:
+      - name: HARD GUARD — this rehearsal may run ONLY in the designated non-production repository
+        run: |
+          if [ "$REPO" != "GraveYield/grave-indexer-pub-rehearsal" ]; then
+            echo "REFUSING TO RUN: rehearsal-publication is hard-guarded to GraveYield/grave-indexer-pub-rehearsal."
+            echo "This run is in: $REPO — aborting before any release operation."
+            exit 1
+          fi
+          echo "rehearsal target confirmed: $REPO (non-production)"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@f53f5227a9e83886ab598c617f3c170fab62f0d3 # pnpm/action-setup v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: Record the run identity (for the rehearsal report)
+        run: |
+          {
+            echo "## Publication rehearsal record"
+            echo "- repository: \`$REPO\`"
+            echo "- workflow run: [\`${GITHUB_RUN_ID}\`](https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID) (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- commit: \`$CHECKOUT_SHA\`"
+            echo "- scenario: \`$SCENARIO\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: incomplete artifact is never promoted ──────────────
+      - name: Build an INCOMPLETE fixture bundle (zero enriched pools)
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: node --import tsx/esm test/fixturePublicationBundle.ts --out data-incomplete --incomplete
+      - name: verify-snapshot must REFUSE the incomplete bundle
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: |
+          if node --import tsx/esm src/cli.ts verify-snapshot \
+              data-incomplete/console-snapshot.json data-incomplete/console-snapshot-provenance.json; then
+            echo "SAFETY FAILURE: verify-snapshot ACCEPTED an incomplete artifact"; exit 1
+          fi
+          echo "verified: verify-snapshot refuses the incomplete artifact (non-zero exit)"
+      - name: Incomplete artifact must never be promoted (no release may exist for it)
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data-incomplete/console-snapshot-provenance.json','utf8')).versionedTag)")
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "SAFETY FAILURE: a release exists for the incomplete artifact's tag $TAG"; exit 1
+          fi
+          echo "verified: no release exists for the incomplete artifact's tag ($TAG) — nothing was published"
+      - name: Rehearsal result (incomplete-artifact)
+        if: env.SCENARIO == 'incomplete-artifact' && always()
+        run: |
+          echo "- outcome: incomplete artifact refused + not promoted" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: promotion failure leaves the pointer untouched ─────
+      - name: Promotion of a MISSING release must fail; stable pointer unchanged
+        if: env.SCENARIO == 'promotion-failure'
+        run: |
+          MISSING="console-snapshot-prod-20990101T000000Z-notrack"
+          if gh release edit "$MISSING" --repo "$REPO" --latest >/dev/null 2>&1; then
+            echo "SAFETY FAILURE: promoting a missing release unexpectedly succeeded"; exit 1
+          fi
+          echo "verified: promotion of missing release $MISSING fails (non-zero)"
+          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rl.out || {
+            echo "release-latest discovery failed during promotion-failure scenario"; exit 1; }
+          kind=$(sed -n 's/^kind=//p' /tmp/rl.out); tag=$(sed -n 's/^tag=//p' /tmp/rl.out)
+          echo "- outcome: promotion failure observed; latest designation after failure: \`${tag:-<none>}\` ($kind)" >> "$GITHUB_STEP_SUMMARY"
+          echo "promotion-failure rehearsal OK (latest designation: ${tag:-<none — first publication>})"
+
+      # ── Scenario: partial upload (versioned release missing sidecars) ─
+      - name: Build a COMPLETE fixture bundle
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy'
+        run: node --import tsx/esm test/fixturePublicationBundle.ts --out data
+      - name: Record the current latest designation (rollback reference for this drill)
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy'
+        id: rollback
+        run: |
+          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rl.out
+          kind=$(sed -n 's/^kind=//p' /tmp/rl.out); tag=$(sed -n 's/^tag=//p' /tmp/rl.out)
+          if [ "$kind" = "found" ]; then PREV="$tag"; else PREV=""; fi
+          echo "previous_latest_tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "- rollback reference at drill start: \`${PREV:-<none — first publication>}\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Create the versioned release and upload ONLY the snapshot asset (partial upload)
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
+          echo "tag=$TAG" >> "$GITHUB_ENV"
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false \
+            --title "Rehearsal partial upload — $TAG" --notes "Rehearsal: partial upload scenario (non-production)."
+          gh release upload "$TAG" --repo "$REPO" data/console-snapshot.json
+          echo "partial release created: $TAG (snapshot asset only)"
+      - name: Same-release verification MUST FAIL on the partial release
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          if node --import tsx/esm src/cli.ts verify-release-assets \
+              "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"; then
+            echo "SAFETY FAILURE: verification PASSED on a partial release (missing sidecars)"; exit 1
+          fi
+          echo "verified: same-release verification rejects the partial release (missing provenance/checksum → non-zero)"
+      - name: The stable reference must be UNCHANGED after the failed publication
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          PREV="${{ steps.rollback.outputs.previous_latest_tag }}"
+          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rl.out
+          kind=$(sed -n 's/^kind=//p' /tmp/rl.out); tag=$(sed -n 's/^tag=//p' /tmp/rl.out)
+          NOW="${tag:-}"
+          if [ "$NOW" != "$PREV" ]; then
+            echo "SAFETY FAILURE: latest designation moved after a FAILED publication (was '${PREV:-<none>}', now '${NOW:-<none>}')"; exit 1
+          fi
+          echo "verified: latest designation unchanged after partial-upload failure (${NOW:-<none — first publication>})"
+      - name: The previously active artifact must remain retrievable after the failed publication
+        if: env.SCENARIO == 'partial-upload' && steps.rollback.outputs.previous_latest_tag != ''
+        run: |
+          PREV="${{ steps.rollback.outputs.previous_latest_tag }}"
+          mkdir -p prev-check
+          for f in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            code=$(curl -s -o "prev-check/$f" -w "%{http_code}" -L \
+              "https://github.com/$REPO/releases/download/$PREV/$f")
+            [ "$code" = "200" ] || { echo "SAFETY FAILURE: previous artifact asset $f on $PREV returned HTTP $code"; exit 1; }
+          done
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$PREV" --scope versioned --expected-tag "$PREV"
+          echo "verified: the previously active release ($PREV) is fully retrievable and internally consistent"
+      - name: Cleanup the partial rehearsal release
+        if: env.SCENARIO == 'partial-upload' && always()
+        run: |
+          TAG=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)}catch{console.log('')}")
+          if [ -n "$TAG" ] && gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+            echo "cleanup: partial rehearsal release $TAG deleted"
+          fi
+          echo "- outcome: partial upload rejected; stable pointer unchanged; previous artifact retrievable" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: happy path + rollback drill ─────────────────────────
+      - name: Publish the versioned release (created explicitly NOT latest)
+        if: env.SCENARIO == 'happy'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
+          echo "tag=$TAG" >> "$GITHUB_ENV"
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false \
+            --title "Rehearsal ConsoleSnapshot v2 — $TAG" \
+            --notes "Rehearsal publication (non-production): immutable versioned release, created with --latest=false."
+          gh release upload "$TAG" --repo "$REPO" \
+            data/console-snapshot.json data/console-snapshot-provenance.json data/console-snapshot.sha256
+          echo "versioned release published: $TAG"
+      - name: Verify the versioned release's own assets (same-release cross-check)
+        if: env.SCENARIO == 'happy'
+        run: |
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
+          echo "verified: versioned release assets are one complete, consistent artifact set (public unauthenticated tag URLs)"
+      - name: The versioned release must NOT be the stable reference before promotion
+        if: env.SCENARIO == 'happy'
+        run: |
+          PREV="${{ steps.rollback.outputs.previous_latest_tag }}"
+          node --import tsx/esm src/cli.ts release-latest "$REPO" > /tmp/rl.out
+          tag=$(sed -n 's/^tag=//p' /tmp/rl.out); kind=$(sed -n 's/^kind=//p' /tmp/rl.out)
+          NOW="${tag:-}"
+          if [ "$NOW" = "$TAG" ]; then
+            echo "SAFETY FAILURE: the versioned release took the latest designation BEFORE promotion"; exit 1
+          fi
+          if [ "${PREV:-}" != "$NOW" ]; then
+            echo "SAFETY FAILURE: latest designation drifted (was '${PREV:-<none>}', now '${NOW:-<none>}')"; exit 1
+          fi
+          echo "verified: creating + uploading with --latest=false did NOT move the stable pointer (${NOW:-<none — first publication>})"
+      - name: Activate the stable reference (single metadata promotion)
+        if: env.SCENARIO == 'happy'
+        run: |
+          gh release edit "$TAG" --repo "$REPO" --latest
+          echo "promoted $TAG to latest (single metadata operation)"
+      - name: Verify the stable reference serves the activated artifact
+        if: env.SCENARIO == 'happy'
+        run: |
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
+          echo "verified: latest designation == activated tag AND the public stable URL serves one complete artifact set naming it"
+      - name: Rollback drill — restore the previous release as the stable reference
+        if: env.SCENARIO == 'happy' && steps.rollback.outputs.previous_latest_tag != ''
+        run: |
+          PREV="${{ steps.rollback.outputs.previous_latest_tag }}"
+          gh release edit "$PREV" --repo "$REPO" --latest
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$PREV" --scope latest --expected-tag "$PREV"
+          echo "verified: rollback to $PREV succeeded AND the stable URL serves the restored release's complete artifact set"
+      - name: Re-promote the rehearsal release (restore post-rollback state)
+        if: env.SCENARIO == 'happy' && steps.rollback.outputs.previous_latest_tag != ''
+        run: |
+          gh release edit "$TAG" --repo "$REPO" --latest
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
+          echo "verified: re-promotion of $TAG confirmed through the stable URL"
+      - name: Rehearsal result (happy)
+        if: env.SCENARIO == 'happy'
+        run: |
+          PREV="${{ steps.rollback.outputs.previous_latest_tag }}"
+          {
+            echo "- versioned release created + uploaded: \`$TAG\`"
+            echo "- same-release verification: PASS"
+            echo "- promotion + stable verification: PASS"
+            echo "- rollback drill: ${PREV:+PASS (restored $PREV, then re-promoted $TAG)}"
+            echo "- rehearsal OK"
+          } >> "$GITHUB_STEP_SUMMARY"
