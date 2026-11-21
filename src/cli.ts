@@ -37,7 +37,6 @@ import {
   verifySnapshotIntegrity,
   versionedTagName,
   snapshotSha256,
-  STABLE_TAG,
   SNAPSHOT_ASSET_NAME,
   PROVENANCE_ASSET_NAME,
   CHECKSUM_ASSET_NAME,
@@ -784,7 +783,7 @@ export async function cmdPublishSnapshot(
 
   console.log(`publish-snapshot: artifact verified — schema v${snapshot.schemaVersion}, ${snapshot.pools.length} pool(s), complete`);
   console.log(`publish-snapshot: sha256=${provenance.snapshotSha256} bytes=${provenance.snapshotByteLength}`);
-  console.log(`publish-snapshot: versioned tag → ${versionedTag} (stable reference: ${STABLE_TAG}, advanced only after verification)`);
+  console.log(`publish-snapshot: versioned tag → ${versionedTag} (stable reference: latest-release promotion, activated only after roundtrip verification)`);
   console.log(`publish-snapshot: staged → ${out}, ${provPath}, ${checksumPath}`);
   return 0;
 }

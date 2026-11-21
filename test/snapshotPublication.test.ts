@@ -15,7 +15,8 @@
 //   * the stable reference may advance ONLY after versioned publication
 //     AND post-publication verification — every unmet condition aborts
 //     with the last-known-good stable artifact untouched;
-//   * the stable update is replace-in-place, never a tag move.
+//   * the stable update is a latest-release promotion (single metadata
+//     operation; the previous release and its assets are never touched).
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
@@ -35,13 +36,23 @@ import {
   verifySnapshotIntegrity,
   versionedTagName,
   assertVersionedTagAvailable,
+  assertVersionedTagFormat,
   assertStableAdvanceAllowed,
+  assertStableReferenceServesVerifiedArtifact,
   describeStableReferenceUpdate,
   snapshotSha256,
+  stableSnapshotUrl,
+  stableProvenanceUrl,
+  stableChecksumUrl,
+  versionedAssetUrl,
+  VERSIONED_TAG_PATTERN,
   SnapshotPublicationError,
   PUBLICATION_PROVENANCE_KEYS,
   PUBLICATION_STEPS,
   STABLE_TAG,
+  SNAPSHOT_ASSET_NAME,
+  PROVENANCE_ASSET_NAME,
+  CHECKSUM_ASSET_NAME,
   type PublicationProvenance,
   type PublicationContext,
 } from "../src/snapshotPublication.js";
@@ -51,6 +62,7 @@ import { buildAmmInfo, synth } from "./fixtures.js";
 // ─── A real schema-valid snapshot built through the real builder ────────────
 
 const NOW_MS = 1_800_000_000_000;
+const SOURCE = "b".repeat(40);
 
 function discoveredRecord(seed: number): DiscoveredPoolRecord {
   const poolAddress = synth(seed);
@@ -306,21 +318,36 @@ describe("stable reference update ordering", () => {
     versionedAssetsVerified: true,
   };
 
-  test("the approved stable tag is console-snapshot-prod", () => {
+  test("the stable tag string survives only as the versioned-tag PREFIX (no mutable stable release)", () => {
     assert.equal(STABLE_TAG, "console-snapshot-prod");
   });
 
-  test("the step order is fail-closed: stable advance is LAST, after asset verification", () => {
+  test("the stable URLs are the CONSTANT latest-release paths (plain fetch, no auth)", () => {
+    const repo = "GraveYield/grave-indexer";
+    assert.equal(stableSnapshotUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot.json`);
+    assert.equal(stableProvenanceUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot-provenance.json`);
+    assert.equal(stableChecksumUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot.sha256`);
+  });
+
+  test("versioned asset URLs are immutable tag-scoped paths", () => {
+    const repo = "GraveYield/grave-indexer";
+    const tag = versionedTagName(NOW_MS, "c".repeat(40));
+    assert.equal(versionedAssetUrl(repo, tag, SNAPSHOT_ASSET_NAME), `https://github.com/${repo}/releases/download/${tag}/console-snapshot.json`);
+  });
+
+  test("the step order is fail-closed: activation is followed by a stable-URL re-verification", () => {
     assert.deepEqual(PUBLICATION_STEPS, [
       "generate",
       "validate-schema",
       "verify-integrity",
       "publish-versioned-release",
       "verify-versioned-assets",
-      "advance-stable-reference",
+      "activate-stable-latest",
+      "verify-stable-reference",
     ]);
-    assert.ok(PUBLICATION_STEPS.indexOf("advance-stable-reference") > PUBLICATION_STEPS.indexOf("verify-versioned-assets"));
+    assert.ok(PUBLICATION_STEPS.indexOf("activate-stable-latest") > PUBLICATION_STEPS.indexOf("verify-versioned-assets"));
     assert.ok(PUBLICATION_STEPS.indexOf("verify-versioned-assets") > PUBLICATION_STEPS.indexOf("publish-versioned-release"));
+    assert.ok(PUBLICATION_STEPS.indexOf("verify-stable-reference") > PUBLICATION_STEPS.indexOf("activate-stable-latest"));
   });
 
   test("a fully verified sequence may advance the stable reference", () => {
@@ -370,11 +397,45 @@ describe("stable reference update ordering", () => {
     }
   });
 
-  test("the stable update is documented as replace-in-place (never a tag move)", () => {
+  test("the stable update is documented as a latest-release promotion (never asset clobbering)", () => {
     const doc = describeStableReferenceUpdate();
-    assert.ok(doc.includes("replace-in-place"));
-    assert.ok(doc.includes("console-snapshot-prod"));
-    assert.ok(doc.toLowerCase().includes("not atomic"), "the non-atomic window is disclosed, not hidden");
-    assert.ok(doc.includes("never removed before"), "last-known-good preservation is stated");
+    assert.ok(doc.includes("latest-release promotion"), "the mechanism is named");
+    assert.ok(doc.includes("make_latest=true"), "the single metadata operation is identified");
+    assert.ok(doc.includes("releases/latest/download/console-snapshot.json"), "the stable URL is named");
+    assert.ok(doc.includes("never modified or deleted"), "last-known-good preservation is stated");
+    assert.ok(doc.includes("re-promoting"), "rollback is stated");
+    assert.ok(!doc.toLowerCase().includes("clobber") || doc.toLowerCase().includes("rejected"), "clobbering is not the mechanism");
+  });
+
+  test("the stable reference must serve the ACTIVATED versioned artifact (post-activation gate)", () => {
+    const { snapshot, bytes } = realSnapshot();
+    const tag = versionedTagName(NOW_MS, SOURCE);
+    const prov = buildPublicationProvenance(snapshot, bytes, { ...BASE_CTX, versionedTag: tag });
+    // Positive: the activated bytes + naming sidecar pass.
+    assert.doesNotThrow(() =>
+      assertStableReferenceServesVerifiedArtifact({ fetchedSnapshotBytes: bytes, fetchedProvenance: prov, activatedTag: tag }),
+    );
+    // A stale stable URL (previous publication's sidecar) is refused.
+    const staleTag = versionedTagName(NOW_MS - 1_000, "9".repeat(40));
+    assert.throws(
+      () => assertStableReferenceServesVerifiedArtifact({ fetchedSnapshotBytes: bytes, fetchedProvenance: prov, activatedTag: staleTag }),
+      /NOT serving the activated artifact/,
+    );
+    // Tampered stable bytes are refused (digest gate).
+    const tampered = bytes.slice();
+    tampered[tampered.length - 2] = (tampered[tampered.length - 2] ?? 0) ^ 0x01;
+    assert.throws(
+      () => assertStableReferenceServesVerifiedArtifact({ fetchedSnapshotBytes: tampered, fetchedProvenance: prov, activatedTag: tag }),
+      /SHA-256 mismatch/,
+    );
+  });
+
+  test("the strict versioned-tag shape gates what may be interpolated into workflow commands", () => {
+    assert.match(versionedTagName(NOW_MS, SOURCE), VERSIONED_TAG_PATTERN);
+    assert.match(versionedTagName(NOW_MS, null), VERSIONED_TAG_PATTERN);
+    assert.doesNotThrow(() => assertVersionedTagFormat(versionedTagName(NOW_MS, SOURCE)));
+    for (const hostile of ["", "; rm -rf /", "console-snapshot-prod", "console-snapshot-prod-20260101T000000Z", "console-snapshot-prod-20260101T000000Z-DEADBEEFDEAD", "console-snapshot-prod-20260101T000000Z-0123456789abc"]) {
+      assert.throws(() => assertVersionedTagFormat(hostile), SnapshotPublicationError, `hostile tag ${JSON.stringify(hostile)} refused`);
+    }
   });
 });

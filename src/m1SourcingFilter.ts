@@ -16,12 +16,20 @@
 // VERIFIED ACCOUNT LAYOUT (do not edit without re-verifying):
 //
 //   Raydium V4 `AmmInfo` — authoritative source:
-//   raydium-io/raydium-amm, `program/src/state.rs` (master), struct
-//   `#[repr(C, packed)] AmmInfo`, verified field-by-field on
-//   2026-11-21 against the master source AND the byte-locked vendored
-//   SDK (`vendor/protocol/sdk/src/raydiumV4.ts`, OFF.PC_VAULT_MINT:
-//   432, RAYDIUM_V4_AMM_INFO_SIZE: 752 — the same layout the on-chain
-//   grave-scanner adapter asserts).
+//   raydium-io/raydium-amm, `program/src/state.rs`, struct
+//   `#[repr(C, packed)] AmmInfo`, verified field-by-field on 2026-11-21
+//   against the PINNED upstream commit
+//   27f461dd439086c774055f771b253fb0fbc52008 (the most recent commit
+//   touching program/src/state.rs, 2026-07-23 — commit-specific URL:
+//   https://github.com/raydium-io/raydium-amm/blob/27f461dd439086c774055f771b253fb0fbc52008/program/src/state.rs
+//   — `git diff 27f461dd..HEAD -- program/src/state.rs` is empty, so
+//   master HEAD carries the identical layout) AND the byte-locked
+//   vendored SDK (`vendor/protocol/sdk/src/raydiumV4.ts`,
+//   OFF.PC_VAULT_MINT: 432, RAYDIUM_V4_AMM_INFO_SIZE: 752 — the same
+//   layout the on-chain grave-scanner adapter asserts). The pinned
+//   commit and offset are asserted by test/m1SourcingFilter.test.ts —
+//   any upstream change to the struct fails the pinned-commit assertion
+//   and must be re-verified, never silently adopted.
 //
 //   Offset math (packed struct, little-endian scalars):
 //     status            u64   @   0
@@ -80,6 +88,20 @@
 import { PublicKey } from "@solana/web3.js";
 import bs58 from "bs58";
 import { WSOL_MINT } from "@graveyield/sdk";
+
+/**
+ * The exact upstream commit whose `program/src/state.rs` was used for
+ * the AmmInfo layout verification (the most recent commit touching that
+ * file at verification time). Commit-specific source URL in
+ * `RAYDIUM_V4_LAYOUT_SOURCE_URL`; pinned by test/m1SourcingFilter.test.ts.
+ * Do NOT update this constant just because upstream moved — any
+ * mismatch must be re-verified field-by-field and documented.
+ */
+export const RAYDIUM_V4_LAYOUT_SOURCE_COMMIT = "27f461dd439086c774055f771b253fb0fbc52008";
+
+/** Commit-specific URL of the verified layout source (reproducibility). */
+export const RAYDIUM_V4_LAYOUT_SOURCE_URL =
+  "https://github.com/raydium-io/raydium-amm/blob/27f461dd439086c774055f771b253fb0fbc52008/program/src/state.rs";
 
 /**
  * Raydium V4 AmmInfo `pc_vault_mint` byte offset — VERIFIED against the

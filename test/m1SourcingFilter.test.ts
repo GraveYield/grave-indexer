@@ -14,12 +14,15 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import bs58 from "bs58";
+import { readFileSync } from "node:fs";
 
 import { PublicKey } from "@solana/web3.js";
 import { RAYDIUM_V4_AMM_INFO_SIZE, RAYDIUM_V4_PROGRAM_ID, WSOL_MINT } from "@graveyield/sdk";
 
 import { discoverRaydiumV4Pools, type DiscoverOptions } from "../src/discovery.js";
 import {
+  RAYDIUM_V4_LAYOUT_SOURCE_COMMIT,
+  RAYDIUM_V4_LAYOUT_SOURCE_URL,
   RAYDIUM_V4_PC_MINT_OFFSET,
   WSOL_MEMCMP_BYTES,
   WSOL_MINT_BYTES,
@@ -126,6 +129,31 @@ describe("Raydium V4 AmmInfo layout — authoritative offset verification", () =
     assert.deepEqual(data.slice(432, 464), FIXTURE_WSOL.toBytes());
     const coinSide = data.slice(400, 432);
     assert.notDeepEqual(coinSide, FIXTURE_WSOL.toBytes());
+  });
+
+  test("the layout source is PINNED to the exact upstream commit (reproducibility, GY-M1-INT-001 correction §6)", () => {
+    // The verification must cite a commit-specific source, not a moving
+    // branch. The pinned commit is the most recent commit touching
+    // program/src/state.rs at verification time (2026-11-21); the
+    // vendored SDK cross-check (OFF.PC_VAULT_MINT = 432, size 752) is
+    // asserted by the offset tests above and by the SDK's own byte
+    // layout. If upstream ever changes the struct, this constant must
+    // NOT be bumped silently — re-verify field-by-field and update
+    // docs/RAYDIUM_V4_LAYOUT_VERIFICATION.md first.
+    assert.equal(
+      RAYDIUM_V4_LAYOUT_SOURCE_COMMIT,
+      "27f461dd439086c774055f771b253fb0fbc52008",
+    );
+    assert.equal(
+      RAYDIUM_V4_LAYOUT_SOURCE_URL,
+      "https://github.com/raydium-io/raydium-amm/blob/27f461dd439086c774055f771b253fb0fbc52008/program/src/state.rs",
+      "the recorded source URL must be commit-specific",
+    );
+    // The documented record must stay in sync with the pinned commit.
+    const doc = readFileSync("docs/RAYDIUM_V4_LAYOUT_VERIFICATION.md", "utf8");
+    assert.ok(doc.includes(RAYDIUM_V4_LAYOUT_SOURCE_COMMIT), "the layout record cites the pinned commit");
+    assert.ok(doc.includes("OFF.PC_VAULT_MINT = 432") || doc.includes("PC_VAULT_MINT = 432"), "the record carries the vendored SDK cross-check");
+    assert.ok(doc.includes("752"), "the record carries the account size");
   });
 });
 

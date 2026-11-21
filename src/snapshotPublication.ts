@@ -21,11 +21,26 @@
 //
 //   3. RELEASE SEQUENCING — the pure ordering rules the publication
 //      workflow must follow: unique versioned tags that never clobber
-//      history, and a stable `console-snapshot-prod` reference that may
-//      only advance AFTER its versioned predecessor has been published
-//      AND verified. Any failure at any earlier step leaves the
-//      previously published stable reference untouched (last-known-good
-//      preservation).
+//      history, and a stable reference that may only move AFTER its
+//      versioned predecessor has been published AND verified. Any
+//      failure at any earlier step leaves the previously served stable
+//      reference untouched (last-known-good preservation).
+//
+// STABLE REFERENCE MECHANISM (GY-M1-INT-001 correction, owner-approved
+// investigation §4.3): the stable reference is GitHub's
+// "latest release" designation, NOT a mutable stable release whose
+// assets are clobbered in place. The stable URL is the CONSTANT
+// `https://github.com/<repo>/releases/latest/download/console-snapshot.json`.
+// The pointer flip is a single metadata operation on one release record
+// (`make_latest=true`); the previous release and its assets are never
+// touched, so the stable URL resolves to a COMPLETE old artifact or a
+// COMPLETE new artifact — never a mixture, never a missing-asset window.
+// The superseded clobber design is rejected precisely because a multi-
+// asset in-place replacement is not atomic: GitHub deletes the old
+// asset before creating the replacement, so a mid-upload failure (or a
+// fetch racing the swap) leaves the stable URL 404 or serving mismatched
+// snapshot/provenance pairs, and a failed upload can destroy the
+// last-known-good bytes permanently.
 //
 // SECURITY: the provenance is secret-free by construction — it carries
 // only the fields listed in `PUBLICATION_PROVENANCE_KEYS`, which tests
@@ -39,13 +54,50 @@ import {
   type ConsoleSnapshotV2,
 } from "./consoleSnapshot.js";
 
-/** The approved stable production tag (GY-M1-INT-001 §4). */
+/**
+ * The stable production tag PREFIX (GY-M1-INT-001 §4).
+ *
+ * NOTE ON SEMANTICS: there is deliberately NO mutable release named
+ * `console-snapshot-prod` in the corrected design. The string survives
+ * only as the versioned-tag prefix (`console-snapshot-prod-<stamp>-<commit>`)
+ * so historical tags stay recognizably production-snapshot tags. The
+ * stable RETRIEVAL reference is the repo-wide "latest release" pointer
+ * (see `stableSnapshotUrl`), not a fixed tag.
+ */
 export const STABLE_TAG = "console-snapshot-prod";
 
 /** Exact asset filenames published on every release (stable and versioned). */
 export const SNAPSHOT_ASSET_NAME = "console-snapshot.json";
 export const PROVENANCE_ASSET_NAME = "console-snapshot-provenance.json";
 export const CHECKSUM_ASSET_NAME = "console-snapshot.sha256";
+
+/**
+ * The stable, CONSTANT Console retrieval URL for a repository: the
+ * "latest release" asset path. Unauthenticated, redirect-following,
+ * plain-fetch compatible. Resolves to whatever release currently holds
+ * the repo-wide latest designation.
+ */
+export function stableSnapshotUrl(repository: string): string {
+  return `https://github.com/${repository}/releases/latest/download/${SNAPSHOT_ASSET_NAME}`;
+}
+
+/** Stable URL for the provenance sidecar (same latest-release mechanism). */
+export function stableProvenanceUrl(repository: string): string {
+  return `https://github.com/${repository}/releases/latest/download/${PROVENANCE_ASSET_NAME}`;
+}
+
+/** Stable URL for the SHA-256 checksum file (same latest-release mechanism). */
+export function stableChecksumUrl(repository: string): string {
+  return `https://github.com/${repository}/releases/latest/download/${CHECKSUM_ASSET_NAME}`;
+}
+
+/**
+ * A versioned release download URL (immutable: the assets on a versioned
+ * release are never replaced once uploaded).
+ */
+export function versionedAssetUrl(repository: string, tag: string, assetName: string): string {
+  return `https://github.com/${repository}/releases/download/${tag}/${assetName}`;
+}
 
 // ─── Integrity ─────────────────────────────────────────────────────────────
 
@@ -219,16 +271,45 @@ export function assertVersionedTagAvailable(newTag: string, existingTags: readon
   }
 }
 
+/**
+ * The exact tag shape produced by `versionedTagName`:
+ * `console-snapshot-prod-<YYYYMMDDTHHMMSSZ>-<12-hex-commit|notrack>`.
+ *
+ * The workflow validates the tag read back from the provenance sidecar
+ * against this pattern BEFORE the tag is interpolated into any shell or
+ * `gh` command — a malformed or hostile sidecar value can never reach a
+ * command line as a crafted argument.
+ */
+export const VERSIONED_TAG_PATTERN =
+  /^console-snapshot-prod-\d{8}T\d{6}Z-(?:[0-9a-f]{12}|notrack)$/;
+
+/** Validate a provenance-carried versioned tag against `VERSIONED_TAG_PATTERN`. */
+export function assertVersionedTagFormat(tag: string): void {
+  if (!VERSIONED_TAG_PATTERN.test(tag)) {
+    throw new SnapshotPublicationError(
+      `versioned tag ${JSON.stringify(tag)} does not match the expected shape ` +
+        `${STABLE_TAG}-<YYYYMMDDTHHMMSSZ>-<commit12|notrack> — refusing to publish with an unvalidated tag`,
+    );
+  }
+}
+
 // ─── Stable-reference sequencing ───────────────────────────────────────────
 
-/** The ordered publication steps (the workflow MUST execute them in this order). */
+/**
+ * The ordered publication steps (the workflow MUST execute them in this
+ * order). The stable reference is a PROMOTION (repo-wide latest-release
+ * designation), executed as one metadata operation AFTER the versioned
+ * release has been published AND its assets verified through the public
+ * unauthenticated path, and followed by a stable-URL re-verification.
+ */
 export const PUBLICATION_STEPS = [
   "generate",
   "validate-schema",
   "verify-integrity",
   "publish-versioned-release",
   "verify-versioned-assets",
-  "advance-stable-reference",
+  "activate-stable-latest",
+  "verify-stable-reference",
 ] as const;
 
 export type PublicationStep = (typeof PUBLICATION_STEPS)[number];
@@ -246,11 +327,11 @@ export interface StableAdvanceState {
 }
 
 /**
- * The stable reference may advance ONLY when the full versioned
- * sequence has succeeded and the artifact is complete. Any unmet
- * condition throws — the workflow catches it and exits non-zero,
- * leaving the previously published stable reference (the last known
- * good artifact) untouched.
+ * The stable reference (latest-release designation) may move ONLY when
+ * the full versioned sequence has succeeded and the artifact is
+ * complete. Any unmet condition throws — the workflow catches it and
+ * exits non-zero, leaving the previously designated latest release (the
+ * last known good artifact) untouched.
  */
 export function assertStableAdvanceAllowed(state: StableAdvanceState): void {
   if (!state.artifactComplete) {
@@ -272,33 +353,78 @@ export function assertStableAdvanceAllowed(state: StableAdvanceState): void {
 }
 
 /**
- * The stable reference update is a REPLACE-ASSETS operation on the
- * existing `console-snapshot-prod` release (same tag, same asset
- * names), NOT a tag move. Rationale (documented for audit):
+ * Post-activation gate: the artifact served by the STABLE URL must be
+ * byte-identical to the verified versioned publication. Checks (in
+ * order):
  *
- *   * Moving a tag on GitHub = delete tag + delete release + recreate
- *     both. Between the delete and the recreate the stable asset URL
- *     404s for the WHOLE window, and a partial failure leaves NO stable
- *     artifact at all — that operation cannot preserve the
- *     last-known-good artifact and is therefore rejected here.
- *   * Replacing release assets in place (upload with the same name)
- *     keeps the stable URL constant and only swaps bytes. The swap is
- *     NOT atomic (GitHub deletes the old asset, then creates the new
- *     one) — there is a short window (seconds) in which a fetch can
- *     observe the asset missing. The console maps that to the honest
- *     "missing / unavailable" state — never to wrong data — and the
- *     last-known-good artifact is destroyed only in the same instant
- *     the verified replacement lands.
- *   * The previous stable asset is never deleted BEFORE the new
- *     artifact has been published and verified on its immutable
- *     versioned release (enforced by `assertStableAdvanceAllowed`).
+ *   1. the stable provenance sidecar names the versioned tag being
+ *      activated (not the previous publication);
+ *   2. the stable snapshot bytes verify against that sidecar (digest +
+ *      length over the EXACT bytes, reusing `verifySnapshotIntegrity`).
+ *
+ * A failure here means the stable URL is NOT serving the new verified
+ * artifact (CDN lag, wrong designation, tampering) — the workflow must
+ * report failure for operator investigation, never success.
+ */
+export function assertStableReferenceServesVerifiedArtifact(args: {
+  fetchedSnapshotBytes: Uint8Array;
+  fetchedProvenance: PublicationProvenance;
+  activatedTag: string;
+}): void {
+  if (args.fetchedProvenance.versionedTag !== args.activatedTag) {
+    throw new SnapshotPublicationError(
+      `stable reference is NOT serving the activated artifact: provenance names ` +
+        `${args.fetchedProvenance.versionedTag ?? "<none>"}, expected ${args.activatedTag}`,
+    );
+  }
+  verifySnapshotIntegrity(args.fetchedSnapshotBytes, args.fetchedProvenance);
+}
+
+/**
+ * The stable reference update is a LATEST-RELEASE PROMOTION: a single
+ * metadata operation (`make_latest=true` on the verified versioned
+ * release record) that atomically re-points the repo-wide latest
+ * designation. Rationale (documented for audit):
+ *
+ *   * The superseded design — replacing the three assets on a permanent
+ *     `console-snapshot-prod` release via `gh release upload --clobber`
+ *     — is NOT atomic: GitHub deletes each old asset before creating
+ *     the new one, so the stable URL can 404 mid-swap, and a failed
+ *     upload after the first deletion permanently destroys the
+ *     last-known-good bytes. A client racing the swap can also receive
+ *     a NEW snapshot beside an OLD provenance (mismatched pair).
+ *   * With the promotion design, every publication lives on its own
+ *     immutable versioned release; the stable URL
+ *     (`releases/latest/download/console-snapshot.json`) always
+ *     resolves to ONE complete release's assets. The promotion moves
+ *     the whole pointer in one metadata update — the previous release
+ *     and its assets are never modified or deleted, so the old
+ *     artifact remains fully available until (and after) the moment
+ *     the new one is activated, and rollback is another single
+ *     metadata operation (`gh release edit <previous-tag> --latest`).
+ *   * The promotion step runs ONLY after the versioned release's
+ *     assets have been downloaded back through the public unauthenticated
+ *     path and re-verified (enforced by `assertStableAdvanceAllowed`);
+ *     post-activation verification re-confirms the stable URL serves
+ *     the activated bytes (`assertStableReferenceServesVerifiedArtifact`).
+ *
+ * Residual non-atomicity / disclosed risks (see docs/SNAPSHOT_PUBLICATION.md):
+ *   * "latest" is a REPO-WIDE designation — any other non-draft,
+ *     non-prerelease release created in this repository would move the
+ *     pointer. Mitigations: repository release policy, the workflow's
+ *     post-activation verification, and operator auditability.
+ *   * GitHub CDN caching on the latest-release path is short-lived;
+ *     consumers must re-fetch and rely on the sidecar digest for
+ *     integrity.
  */
 export function describeStableReferenceUpdate(): string {
   return (
-    "replace-in-place: upload console-snapshot.json / console-snapshot-provenance.json / " +
-    "console-snapshot.sha256 to the existing console-snapshot-prod release (same tag, same asset " +
-    "names, constant URL). Not atomic (brief 404 window during the asset clobber); the previous " +
-    "last-known-good artifact is never removed before the verified replacement exists on the " +
-    "immutable versioned release."
+    "latest-release promotion: the verified versioned release is activated with a single " +
+    "make_latest=true metadata operation (gh release edit <tag> --latest). The stable URL " +
+    "(releases/latest/download/console-snapshot.json) is constant and always resolves to one " +
+    "complete release's assets; the previous release is never modified or deleted, so the " +
+    "last-known-good artifact remains fully available until activation and can be restored by " +
+    "re-promoting its release. The previous assets are never removed before the verified " +
+    "replacement exists on its own immutable versioned release."
   );
 }
