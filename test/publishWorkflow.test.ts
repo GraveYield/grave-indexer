@@ -1950,3 +1950,255 @@ describe("rollback ownership — strict tag-object SHA identity (tenth round)", 
     assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
   });
 });
+
+// ─── Eleventh round — downstream rollback SHA-format validation ─────────────
+//
+// The dedicated downstream rollback job's Compare-before-rollback step
+// compared the live stable-reference object.sha with NEW_SHA by raw
+// equality ALONE. Two unusable values that happen to be equal — both
+// empty ("" == ""), or both malformed but identical — would have
+// authorized the rollback mutation without proving any tag-object
+// identity, violating the strict identity rule the in-job rollback and
+// the rehearsal rollback already enforce (tenth round). The correction
+// format-validates BOTH values against ^[0-9a-f]{40}$ BEFORE the
+// ownership comparison and fails closed (unknown state, no compare_ok
+// output, no mutation, operator intervention required) when either is
+// empty, malformed, unavailable, or otherwise unusable.
+//
+// These tests EXECUTE the actual compare step script extracted from the
+// workflow and — behind its real `compare_ok` gate — the actual mutation
+// step, against mocked `curl`/`gh` binaries. Refusal is proven by the
+// gate never opening and ZERO mutation commands being invoked, not by
+// string assertions. The mocked gh binary cannot reach GitHub, so even
+// the authorized case performs no real mutation.
+
+describe("publish-console-snapshot workflow — downstream rollback SHA-format validation (eleventh round)", () => {
+  const SHA_LIVE = "a".repeat(40); // a valid 40-hex sha (a different writer's object)
+  const SHA_NEW = "b".repeat(40); // a valid 40-hex sha (this run's captured created object)
+  const SHA_PREV = "c".repeat(40); // the recorded previous pointer's tag object
+  const MALFORMED = "not-a-sha-ZZZ"; // unusable: not 40 lowercase hex characters
+  const POINTER_JSON = JSON.stringify({
+    pointerSchema: "graveyield.console-snapshot-stable-pointer.v1",
+    stableRef: "console-snapshot-prod",
+    versionedTag: "console-snapshot-prod-20260101T000000Z-" + SHA_NEW,
+    sourceCommit: "d".repeat(40),
+  });
+
+  const wf = loadWorkflow();
+  const rollback = wf.jobs["rollback"]!;
+  const compareStep = rollback.steps.find((s) => s["id"] === "compare")!;
+  const mutateStep = rollback.steps.find((s) => s["id"] === "mutate")!;
+  const compareRun = compareStep["run"] as string;
+  const mutateRun = mutateStep["run"] as string;
+
+  // Mock curl: the compare step only reads the dedicated ref endpoint
+  // (`-o <file>` + `-w %{http_code}`). Serves the HTTP status and JSON
+  // body configured via env — ALWAYS overwriting the output file, so no
+  // state can leak between simulated runs.
+  const mockCurl = [
+    "#!/usr/bin/env bash",
+    "# test-harness mock: serves the configured ref state",
+    'outfile=""',
+    'prev=""',
+    'for a in "$@"; do',
+    '  if [ "$prev" = "-o" ]; then outfile="$a"; fi',
+    '  prev="$a"',
+    "done",
+    'if [ -n "$outfile" ]; then printf "%s" "$MOCK_REF_BODY" > "$outfile"; fi',
+    'printf "%s" "$MOCK_REF_CODE"',
+  ].join("\n");
+  // Mock gh: records every invocation (the ONLY way a mutation could be
+  // issued) and exits 0 — it cannot reach GitHub at all.
+  const mockGh = '#!/usr/bin/env bash\nprintf \'%s\\n\' "gh $*" >> "$MOCK_GH_LOG"\nexit 0\n';
+
+  interface SimResult {
+    compareStatus: number;
+    stdout: string;
+    summary: string;
+    outputs: string;
+    ghCalls: string[]; // every gh invocation recorded across the whole simulated chain
+    mutateRan: boolean; // whether the compare_ok gate opened
+  }
+
+  function runDownstreamRollback(env: Record<string, string>): SimResult {
+    const dir = mkdtempSync(join(tmpdir(), "wf-shaformat-sim-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "curl"), mockCurl, { mode: 0o755 });
+    writeFileSync(join(bin, "gh"), mockGh, { mode: 0o755 });
+    const summaryPath = join(dir, "summary.md");
+    const ghLogPath = join(dir, "gh.log");
+    writeFileSync(summaryPath, "");
+    writeFileSync(ghLogPath, "");
+    const runScript = (script: string, outputPath: string): { status: number; stdout: string } => {
+      writeFileSync(outputPath, "");
+      const scriptPath = join(dir, "step.sh");
+      writeFileSync(scriptPath, script);
+      try {
+        const stdout = execFileSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", scriptPath], {
+          encoding: "utf8",
+          cwd: dir,
+          env: {
+            PATH: `${bin}:${process.env.PATH ?? ""}`,
+            HOME: process.env.HOME ?? dir,
+            GITHUB_STEP_SUMMARY: summaryPath,
+            GITHUB_OUTPUT: outputPath,
+            MOCK_GH_LOG: ghLogPath,
+            ...env,
+          },
+        });
+        return { status: 0, stdout };
+      } catch (err) {
+        const e = err as { status?: number | null; stdout?: string };
+        return { status: e.status ?? 1, stdout: String(e.stdout ?? "") };
+      }
+    };
+    // 1) the actual compare step decides; its outputs open (or keep shut)
+    //    the same gate the workflow's `if:` condition reads.
+    const compareOut = join(dir, "compare-outputs.txt");
+    const cmp = runScript(compareRun, compareOut);
+    const outputs = readFileSync(compareOut, "utf8");
+    // 2) the actual mutation step runs ONLY when the compare authorized
+    //    the rollback (mirrors `if: steps.compare.outputs.compare_ok == 'true'`).
+    let mutateRan = false;
+    if (/(^|\n)compare_ok=true/.test(outputs)) {
+      mutateRan = true;
+      runScript(mutateRun, join(dir, "mutate-outputs.txt"));
+    }
+    const result: SimResult = {
+      compareStatus: cmp.status,
+      stdout: cmp.stdout,
+      summary: readFileSync(summaryPath, "utf8"),
+      outputs,
+      ghCalls: readFileSync(ghLogPath, "utf8").split("\n").filter((l) => l.startsWith("gh ")),
+      mutateRan,
+    };
+    rmSync(dir, { recursive: true, force: true });
+    return result;
+  }
+
+  const refBody = (sha: string) =>
+    JSON.stringify({ ref: "refs/tags/console-snapshot-prod", object: { sha, type: "tag" } });
+
+  function baseEnv(overrides: Record<string, string>): Record<string, string> {
+    return {
+      REPO: "GraveYield/grave-indexer",
+      NEW_SHA: SHA_NEW,
+      GH_TOKEN: "sim-read-only-token",
+      MOCK_REF_CODE: "200",
+      MOCK_REF_BODY: refBody(SHA_NEW),
+      // mutation-step env (consumed only when the gate opens)
+      REF_MODE: "update",
+      PREV_POINTER_JSON: POINTER_JSON,
+      PREV_VERSIONED_TAG: "console-snapshot-prod-20251231T000000Z-" + SHA_PREV,
+      ...overrides,
+    };
+  }
+
+  // ── structural pins: the validation exists, runs BEFORE the ownership
+  //    comparison, and the mutation stays behind the compare_ok gate ──
+  test("the compare step format-validates BOTH identity values against ^[0-9a-f]{40}$ BEFORE the ownership comparison (read-only token)", () => {
+    assert.equal(stepEnv(compareStep)["GH_TOKEN"], "${{ github.token }}", "the comparison runs with the READ-ONLY automatic token");
+    assert.equal(stepEnv(compareStep)["NEW_SHA"], "${{ needs.promote.outputs.new_tag_object_sha }}", "the comparison anchors on THIS run's captured created tag-object sha");
+    const checks = [...compareRun.matchAll(/printf '%s' "\$(NEW_SHA|sha)" \| grep -Eq '\^\[0-9a-f\]\{40\}\$'/g)].map((m) => m[1]);
+    assert.ok(checks.includes("NEW_SHA"), "NEW_SHA is format-validated against ^[0-9a-f]{40}$ before any ownership decision");
+    assert.ok(checks.includes("sha"), "the live ref's object.sha is format-validated against the SAME exact format");
+    const firstCheck = compareRun.indexOf("grep -Eq '^[0-9a-f]{40}$'");
+    const ownershipComparison = compareRun.indexOf('[ "$sha" != "$NEW_SHA" ]');
+    const gateOutput = compareRun.indexOf("compare_ok=true");
+    assert.ok(firstCheck > -1 && ownershipComparison > -1, "both the validation and the ownership comparison exist");
+    assert.ok(firstCheck < ownershipComparison, "the format validation runs BEFORE the ownership comparison — an equal-but-invalid pair can never be compared");
+    assert.ok(ownershipComparison < gateOutput, "compare_ok is written only AFTER the exact-equality check");
+  });
+
+  test("the mutation step remains gated on compare_ok with the step-scoped PAT — validation failures cannot reach it", () => {
+    assert.equal(mutateStep["if"], "steps.compare.outputs.compare_ok == 'true'", "the mutation is unreachable unless the comparison authorized it");
+    assert.equal(stepEnv(mutateStep)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the PAT remains scoped to the mutation step only");
+    assert.ok(!compareRun.includes("GY_RELEASE_PAT"), "the compare step never touches the write credential");
+    assert.ok(!/gh api --method (POST|PATCH|DELETE)/.test(compareRun), "the compare step itself issues NO gh api mutation — it is a pure read-only classification step");
+  });
+
+  // ── Case A: both SHA values empty ──
+  test("Case A — NEW_SHA empty AND the live ref returns an empty sha: refuse, classify UNKNOWN, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ NEW_SHA: "", MOCK_REF_BODY: refBody("") }));
+    assert.notEqual(res.compareStatus, 0, "the compare FAILS CLOSED instead of authorizing a rollback");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.ok(!res.mutateRan, "the gated mutation step never runs");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is invoked — equal-but-empty values never prove identity");
+    assert.match(res.stdout, /UNKNOWN STATE/, "the state is classified as unknown");
+    assert.match(res.stdout, /identity cannot be established/, "the run reports that identity cannot be established");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  // ── Case B: both SHA values malformed but identical ──
+  test("Case B — NEW_SHA malformed AND the live ref returns the SAME malformed value: refuse, classify UNKNOWN, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ NEW_SHA: MALFORMED, MOCK_REF_BODY: refBody(MALFORMED) }));
+    assert.notEqual(res.compareStatus, 0, "identical-but-malformed values FAIL CLOSED instead of authorizing a rollback");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.ok(!res.mutateRan, "the gated mutation step never runs");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is invoked — equal-but-malformed values never prove identity");
+    assert.match(res.stdout, /UNKNOWN STATE/, "the state is classified as unknown");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  // extra: a valid captured sha with a MALFORMED live sha exercises the
+  // live-side validation branch
+  test("extra — valid captured NEW_SHA but a malformed live object.sha: refuse, classify UNKNOWN, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ NEW_SHA: SHA_NEW, MOCK_REF_BODY: refBody(MALFORMED) }));
+    assert.notEqual(res.compareStatus, 0, "a malformed live sha FAILS CLOSED even when the captured sha is valid");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.deepEqual(res.ghCalls, [], "NO mutation is invoked against an unusable live identity value");
+    assert.match(res.stdout, /UNKNOWN STATE/, "the state is classified as unknown");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  // ── Case C: valid matching SHA values ──
+  test("Case C — both values valid 40-hex and EXACTLY equal: comparison passes and rollback authorization is established (no real mutation)", () => {
+    const res = runDownstreamRollback(baseEnv({}));
+    assert.equal(res.compareStatus, 0, "two valid, exactly equal 40-hex SHAs authorize the rollback");
+    assert.match(res.outputs, /compare_ok=true/, "the rollback authorization output is set");
+    assert.match(res.stdout, /compare OK/, "the comparison passes explicitly");
+    assert.ok(res.mutateRan, "the gated mutation step runs behind the authorization");
+    // The only "mutations" here are against the in-sandbox mock binary —
+    // they prove the gate OPENS; nothing reaches GitHub.
+    assert.ok(
+      res.ghCalls.some((l) => l.includes("--method POST") && l.includes("/git/tags")),
+      "the previous pointer tag object is re-created (authorization flows to the mutation step)",
+    );
+    assert.ok(
+      res.ghCalls.some((l) => l.includes("--method PATCH") && l.includes("/git/refs/tags/console-snapshot-prod")),
+      "the ref is moved back via the repository-qualified PATCH",
+    );
+  });
+
+  // ── Case D: valid but different SHA values ──
+  test("Case D — both values valid 40-hex but DIFFERENT: refuse, operator intervention, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ MOCK_REF_BODY: refBody(SHA_LIVE) }));
+    assert.notEqual(res.compareStatus, 0, "a moved pointer (different valid sha) REFUSES the rollback");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.ok(!res.mutateRan, "the gated mutation step never runs");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is invoked against a pointer that moved independently");
+    assert.match(res.stdout, /refusing to overwrite a moved pointer/, "the refusal is explicit");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  // ── extra hardening: missing API fields and failed lookups ──
+  test("extra — the ref response is missing the object.sha field entirely: refuse, classify UNKNOWN, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ MOCK_REF_BODY: "{}" }));
+    assert.notEqual(res.compareStatus, 0, "a missing object.sha FAILS CLOSED (never compares an empty value)");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.deepEqual(res.ghCalls, [], "NO mutation is invoked on a response without an object.sha");
+    assert.match(res.stdout, /UNKNOWN STATE/, "the state is classified as unknown");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  test("extra — failed reference lookup (unexpected HTTP status): refuse, no mutation", () => {
+    const res = runDownstreamRollback(baseEnv({ MOCK_REF_CODE: "500", MOCK_REF_BODY: "" }));
+    assert.notEqual(res.compareStatus, 0, "a failed reference lookup refuses to authorize anything");
+    assert.ok(!res.outputs.includes("compare_ok=true"), "the rollback authorization output is never set");
+    assert.ok(!res.mutateRan, "the gated mutation step never runs");
+    assert.deepEqual(res.ghCalls, [], "NO mutation is invoked from an unreadable remote state");
+    assert.match(res.stdout, /unexpected HTTP/, "the failed lookup is reported as an unexpected state");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+});

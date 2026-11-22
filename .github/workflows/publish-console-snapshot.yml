@@ -1568,10 +1568,28 @@ jobs:
         # request that was killed mid-flight), the promote job's marker
         # semantics already attempted its in-job rollback; this job's
         # comparison re-establishes ground truth BEFORE it mutates
-        # anything. Three-way classification: 200 + matching sha = safe to
-        # roll back; 200 + different sha / 404 = the pointer moved or was
-        # deleted independently — REFUSE (operator intervention); any
-        # other status = the gate itself failed — REFUSE (fail closed).
+        # anything.
+        #
+        # ELEVENTH-ROUND CORRECTION (SHA-format validation): BOTH identity
+        # values are format-validated BEFORE any ownership comparison —
+        # NEW_SHA (this run's captured created tag-object sha) and the
+        # live ref's observed object.sha must each match
+        # ^[0-9a-f]{40}$ exactly (40 lowercase hexadecimal characters).
+        # A raw equality check alone could authorize a rollback mutation
+        # when both values are EMPTY ("" == "") or both are MALFORMED but
+        # equal — neither proves tag-object identity, so neither may open
+        # the mutation gate. If either value is empty, malformed,
+        # unavailable, or otherwise unusable, the state is classified as
+        # UNKNOWN and the step FAILS CLOSED: no compare_ok output, no
+        # mutation, operator intervention required. Ownership is NEVER
+        # inferred from pointer JSON, annotated-tag message, source
+        # commit, release tag, or asset digest — only exact equality
+        # between two valid 40-character tag-object SHAs establishes it.
+        # Classification: 200 + both values valid and exactly equal = safe
+        # to roll back; 200 + both valid but different / 404 = the pointer
+        # moved or was deleted independently — REFUSE (operator
+        # intervention); any other status = the gate itself failed —
+        # REFUSE (fail closed).
         id: compare
         env:
           NEW_SHA: ${{ needs.promote.outputs.new_tag_object_sha }}
@@ -1591,6 +1609,40 @@ jobs:
               {
                 echo "- observed stable ref object.sha: \`${sha:-<none>}\` (HTTP 200)"
               } >> "$GITHUB_STEP_SUMMARY"
+              # SHA-FORMAT VALIDATION (eleventh round) — fail closed on any
+              # unusable identity value BEFORE the ownership comparison:
+              # an empty or malformed captured sha, or an empty or
+              # malformed live object.sha, means the state is UNKNOWN.
+              # Equal-but-invalid values (both empty, both malformed and
+              # identical) are NOT identity — the mutation gate stays shut.
+              if ! printf '%s' "$NEW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED (UNKNOWN STATE)"
+                  echo "The captured tag-object sha for this run is empty, malformed, or unavailable"
+                  echo "(\`${NEW_SHA:-<empty>}\`) — it must be exactly 40 lowercase hexadecimal characters."
+                  echo "The identity of the live reference cannot be established, so NO rollback"
+                  echo "mutation is authorized (equal-but-invalid values never prove identity)."
+                  echo "Inspect the current pointer and this run's versioned release, then restore"
+                  echo "manually if required — see docs/SNAPSHOT_PUBLICATION.md §13.3."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED (UNKNOWN STATE): the captured NEW_SHA is empty, malformed, or unusable ('$NEW_SHA') — identity cannot be established; fail closed, no mutation"
+                exit 1
+              fi
+              if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED (UNKNOWN STATE)"
+                  echo "The live stable reference returned an unusable object.sha (\`${sha:-<empty>}\`) — it must be"
+                  echo "exactly 40 lowercase hexadecimal characters. The identity of the live reference"
+                  echo "cannot be established, so NO rollback mutation is authorized (equal-but-invalid"
+                  echo "values never prove identity)."
+                  echo "Inspect the current pointer and this run's versioned release, then restore"
+                  echo "manually if required — see docs/SNAPSHOT_PUBLICATION.md §13.3."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED (UNKNOWN STATE): the live stable ref returned an unusable object.sha ('$sha') — identity cannot be established; fail closed, no mutation"
+                exit 1
+              fi
               if [ "$sha" != "$NEW_SHA" ]; then
                 {
                   echo
@@ -1623,7 +1675,11 @@ jobs:
               ;;
             *)
               {
-                echo "- observed: unexpected HTTP $code"
+                echo
+                echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED (UNKNOWN STATE)"
+                echo "- observed: unexpected HTTP \`$code\` from the stable-reference read — the live state cannot be established"
+                echo "- no rollback authorization was issued and NO mutation was performed"
+                echo "- recovery requires manual inspection per docs/SNAPSHOT_PUBLICATION.md §13.3"
               } >> "$GITHUB_STEP_SUMMARY"
               echo "rollback compare gate FAILED (unexpected HTTP $code); refusing to treat this as a comparable state"
               exit 1
