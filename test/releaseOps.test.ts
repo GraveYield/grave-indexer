@@ -21,10 +21,13 @@ import { buildConsoleSnapshot, SNAPSHOT_THRESHOLD_FALLBACK, type ConsoleSnapshot
 import type { DiscoveredPoolRecord } from "../src/discovery.js";
 import {
   buildPublicationProvenance,
+  buildStablePointer,
+  parseStablePointer,
   CHECKSUM_ASSET_NAME,
   PROVENANCE_ASSET_NAME,
   SNAPSHOT_ASSET_NAME,
   snapshotSha256,
+  STABLE_POINTER_SCHEMA,
   versionedTagName,
   type PublicationProvenance,
 } from "../src/snapshotPublication.js";
@@ -32,13 +35,17 @@ import {
   RELEASE_OPS_ERROR_CATEGORIES,
   ReleaseOpsError,
   authedHttp,
+  buildStablePointerForRelease,
+  fetchStablePointer,
   resolveLatestRelease,
+  resolveStableRef,
   verifyReleaseAssetSet,
+  verifyStableReference,
   type FetchAssetImpl,
   type HttpImpl,
   type MinimalHttpResponse,
 } from "../src/releaseOps.js";
-import { cmdReleaseLatest, cmdVerifyReleaseAssets } from "../src/cli.js";
+import { cmdReleaseLatest, cmdVerifyReleaseAssets, cmdVerifyStable } from "../src/cli.js";
 
 // ─── Fixture machinery (real schema-v2 snapshots, same builders as prod) ───
 
@@ -719,6 +726,321 @@ describe("verifyReleaseAssetSet / cmdVerifyReleaseAssets — authenticated API t
     const exit = await cmdVerifyReleaseAssets({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B });
     assert.equal(exit, 0);
     assert.deepEqual(seenAuth, [], "no Authorization header is sent without a credential");
+    globalThis.fetch = realFetch;
+  });
+});
+
+// ─── Dedicated stable reference — identity chain (sixth round) ──────────────
+
+describe("resolveStableRef / fetchStablePointer / verifyStableReference — the dedicated console-snapshot-prod ref", () => {
+  const realFetch = globalThis.fetch;
+  const READ_TOKEN = "ghs_readonly-runner-token";
+  const REF_URL = `https://api.github.com/repos/${REPO}/git/ref/tags/console-snapshot-prod`;
+  const TAG_OBJECT_SHA = "a".repeat(40);
+  const ASSET_BASE = `https://api.github.com/repos/${REPO}/releases/assets`;
+  const requested: string[] = [];
+
+  /** The pointer JSON for a tag's verified bytes (with or without a previous record). */
+  function pointerFor(previous: { versionedTag: string; tagObjectSha: string } | null = null, tag: string = TAG_B): { json: string; sha256: string } {
+    const bytes = tag === TAG_B ? B : A;
+    const built = buildStablePointer({
+      versionedTag: tag,
+      sourceCommit: SOURCE_COMMIT,
+      publishedAtUnixMs: NOW_MS,
+      snapshotBytes: bytes.snapshot,
+      provenanceBytes: bytes.provenanceBytes,
+      checksumBytes: bytes.checksum,
+      previous,
+    });
+    return { json: built.pointerJson, sha256: TAG_OBJECT_SHA };
+  }
+
+interface FakeState {
+  refStatus?: number | undefined;
+  refObjectSha?: string | undefined;
+  tagObjectMessage?: string | undefined;
+  recordTag?: string | undefined;
+  recordAssets?: Array<{ name: string; url: string }> | undefined;
+  assetBytes?: Map<string, Uint8Array> | undefined;
+}
+
+  function installFake(state: FakeState): void {
+    requested.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url === REF_URL) {
+        if ((state.refStatus ?? 200) !== 200) return textResponse("error", state.refStatus ?? 500);
+        return new Response(JSON.stringify({ object: { sha: state.refObjectSha ?? TAG_OBJECT_SHA, type: "tag" } }), { status: 200 });
+      }
+      if (url.startsWith(`https://api.github.com/repos/${REPO}/git/tags/`)) {
+        if (state.tagObjectMessage === undefined) return textResponse("not found", 404);
+        return new Response(JSON.stringify({ message: state.tagObjectMessage, object: { sha: SOURCE_COMMIT, type: "commit" } }), { status: 200 });
+      }
+      if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+        return new Response(JSON.stringify({ tag_name: state.recordTag ?? TAG_B, assets: state.recordAssets ?? [] }), { status: 200 });
+      }
+      const bytes = state.assetBytes?.get(url);
+      if (bytes) return binaryResponse(bytes);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+  }
+
+  function assetState(): FakeState {
+    return {
+      recordAssets: [
+        { name: SNAPSHOT_ASSET_NAME, url: `${ASSET_BASE}/1` },
+        { name: PROVENANCE_ASSET_NAME, url: `${ASSET_BASE}/2` },
+        { name: CHECKSUM_ASSET_NAME, url: `${ASSET_BASE}/3` },
+      ],
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, B.provenanceBytes],
+        [`${ASSET_BASE}/3`, B.checksum],
+      ]),
+    };
+  }
+
+  test("HAPPY PATH: the stable ref resolves to the intended release's verified asset set (full identity chain)", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json });
+    const stable = await verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN });
+    assert.equal(stable.pointer.versionedTag, TAG_B, "the pointer names the expected release");
+    assert.equal(stable.pointer.sourceCommit, SOURCE_COMMIT, "the pointer names the release commit");
+    assert.equal(stable.tagObjectSha, TAG_OBJECT_SHA);
+    // The identity chain queried ONLY the dedicated ref — never /releases/latest.
+    assert.ok(!requested.some((u) => u.includes("/releases/latest")), "stable-reference verification is independent of the repo-wide latest designation");
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (stable ref → unexpected release): the pointer names a DIFFERENT tag than expected → typed failure, ZERO asset downloads", async () => {
+    const pointer = pointerFor();
+    const mispointed = JSON.stringify({ ...JSON.parse(pointer.json), versionedTag: TAG_A });
+    installFake({ ...assetState(), tagObjectMessage: mispointed });
+    let thrown: unknown = null;
+    try {
+      await verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(thrown instanceof ReleaseOpsError, "a typed ReleaseOpsError is thrown");
+    assert.equal((thrown as ReleaseOpsError).category, "MALFORMED_RESPONSE");
+    assert.match((thrown as ReleaseOpsError).message, /points to .* expected/, "the diagnostic names the unexpected pointer target");
+    assert.ok(!requested.some((u) => u.startsWith(`${ASSET_BASE}/`)), "NO asset of the unexpected release was downloaded");
+  });
+
+  test("REGRESSION (reference changes during verification): the record for the pointer's tag returns a DIFFERENT tag_name → typed failure", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, recordTag: TAG_A });
+    let thrown: unknown = null;
+    try {
+      await verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(thrown instanceof ReleaseOpsError);
+    assert.equal((thrown as ReleaseOpsError).category, "MALFORMED_RESPONSE");
+    assert.match((thrown as ReleaseOpsError).message, /mismatched release record/);
+    assert.ok(!requested.some((u) => u.startsWith(`${ASSET_BASE}/`)), "no assets are fetched from the mismatched record");
+  });
+
+  test("REGRESSION (cross-release mixture): snapshot from the pointer's release + provenance from ANOTHER release → rejected", async () => {
+    const pointer = pointerFor();
+    installFake({
+      recordAssets: [
+        { name: SNAPSHOT_ASSET_NAME, url: `${ASSET_BASE}/1` },
+        { name: PROVENANCE_ASSET_NAME, url: `${ASSET_BASE}/2` },
+        { name: CHECKSUM_ASSET_NAME, url: `${ASSET_BASE}/3` },
+      ],
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, A.provenanceBytes],
+        [`${ASSET_BASE}/3`, B.checksum],
+      ]),
+      tagObjectMessage: pointer.json,
+    });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      /cross-release identification|checksum|MIXED/,
+      "a cross-release mixture can never pass the identity chain",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (missing sidecar): the pointer's release lacks the provenance asset → NOT_FOUND, fail closed", async () => {
+    const pointer = pointerFor();
+    installFake({
+      recordAssets: [
+        { name: SNAPSHOT_ASSET_NAME, url: `${ASSET_BASE}/1` },
+        { name: CHECKSUM_ASSET_NAME, url: `${ASSET_BASE}/3` },
+      ],
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/3`, B.checksum],
+      ]),
+      tagObjectMessage: pointer.json,
+    });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "NOT_FOUND",
+      "an incomplete artifact set is refused",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (invalid provenance): a non-JSON provenance sidecar → typed MALFORMED_RESPONSE", async () => {
+    const pointer = pointerFor();
+    installFake({
+      recordAssets: assetState().recordAssets,
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, new TextEncoder().encode("not-json")],
+        [`${ASSET_BASE}/3`, B.checksum],
+      ]),
+      tagObjectMessage: pointer.json,
+    });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (checksum mismatch): a checksum file disagreeing with the snapshot bytes → rejected", async () => {
+    const pointer = pointerFor();
+    installFake({
+      recordAssets: assetState().recordAssets,
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, B.provenanceBytes],
+        [`${ASSET_BASE}/3`, new TextEncoder().encode(`${"0".repeat(64)}  ${SNAPSHOT_ASSET_NAME}\n`)],
+      ]),
+      tagObjectMessage: pointer.json,
+    });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      /checksum/,
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (pointer digest divergence): the pointer's digests do not match the release's actual bytes → rejected", async () => {
+    const pointer = pointerFor();
+    const drifted = JSON.stringify({
+      ...JSON.parse(pointer.json),
+      snapshot: { name: SNAPSHOT_ASSET_NAME, sha256: "f".repeat(64), byteLength: 1 },
+    });
+    installFake({ ...assetState(), tagObjectMessage: drifted });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      /digest\/length mismatch/,
+      "the pointer must never bless bytes it does not name",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("REGRESSION (missing stable ref): a 404 ref is a typed NOT_FOUND for verification, and kind=none for discovery", async () => {
+    installFake({ refStatus: 404, ...assetState(), tagObjectMessage: pointerFor().json });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "NOT_FOUND",
+      "verification without a stable ref fails typed",
+    );
+    const resolution = await resolveStableRef({ repository: REPO, http: authedHttp(READ_TOKEN) });
+    assert.equal(resolution.kind, "none", "discovery classifies a genuine 404 as first-publication state");
+    globalThis.fetch = realFetch;
+  });
+
+  test("an unrelated release taking the latest designation does NOT affect stable-ref resolution", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json });
+    // Simulate GitHub serving an unrelated latest designation: the stable-ref
+    // chain simply never consults it (asserted by the URL log in the happy path).
+    const resolution = await resolveStableRef({ repository: REPO, http: authedHttp(READ_TOKEN) });
+    assert.equal(resolution.kind, "found", "the dedicated ref resolves normally");
+    const stable = await fetchStablePointer({ repository: REPO, tagObjectSha: resolution.tagObjectSha, http: authedHttp(READ_TOKEN) });
+    assert.equal(stable.pointer.versionedTag, TAG_B, "the pointer is untouched by unrelated releases");
+    globalThis.fetch = realFetch;
+  });
+
+  test("a 401 ref query is AUTHENTICATION; a malformed ref body is MALFORMED_RESPONSE (fail-closed classification)", async () => {
+    installFake({ refStatus: 401 });
+    await assert.rejects(
+      () => resolveStableRef({ repository: REPO, http: authedHttp(READ_TOKEN) }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "AUTHENTICATION",
+    );
+    globalThis.fetch = (async () => new Response(JSON.stringify({ object: { sha: "not-a-sha" } }), { status: 200 })) as typeof fetch;
+    await assert.rejects(
+      () => resolveStableRef({ repository: REPO, http: authedHttp(READ_TOKEN) }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("a tag object WITHOUT a parseable pointer message is rejected (not an annotated pointer tag)", async () => {
+    installFake({ ...assetState(), tagObjectMessage: "this is not the pointer you are looking for" });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE",
+      "a lightweight or unrelated tag object can never be interpreted as the stable pointer",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("buildStablePointerForRelease: verifies the release and builds the pointer JSON with the rollback record", async () => {
+    // The current stable ref carries the PREVIOUS publication's pointer (naming TAG_A).
+    const currentPointer = pointerFor(null, TAG_A);
+    installFake({
+      ...assetState(),
+      tagObjectMessage: currentPointer.json,
+    });
+    const built = await buildStablePointerForRelease({ repository: REPO, tag: TAG_B, expectedTag: TAG_B, authToken: READ_TOKEN });
+    assert.equal(built.pointer.versionedTag, TAG_B);
+    assert.equal(built.pointer.sourceCommit, SOURCE_COMMIT);
+    assert.equal(built.pointer.snapshot.sha256, snapshotSha256(B.snapshot), "the pointer digest is over the VERIFIED bytes");
+    assert.equal(built.previous?.versionedTag, TAG_A, "the current stable pointer is resolved as the rollback reference");
+    assert.equal(built.previous?.tagObjectSha, TAG_OBJECT_SHA, "the rollback reference carries the current tag object sha");
+    const reparsed = parseStablePointer(built.pointerJson);
+    assert.equal(reparsed.pointerSchema, STABLE_POINTER_SCHEMA, "the emitted JSON round-trips through the strict parser");
+    assert.equal(reparsed.previousVersionedTag, TAG_A, "the built pointer records the rollback target");
+    globalThis.fetch = realFetch;
+  });
+
+  test("buildStablePointerForRelease on a release whose provenance lacks a source commit → typed failure (no identifiable pointer)", async () => {
+    const noCommitProv = { ...B.provenance, indexerSourceCommitSha: null };
+    const noCommitBytes = new TextEncoder().encode(JSON.stringify(noCommitProv));
+    const noCommitChecksum = new TextEncoder().encode(`${snapshotSha256(B.snapshot)}  ${SNAPSHOT_ASSET_NAME}\n`);
+    installFake({
+      recordAssets: assetState().recordAssets,
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, noCommitBytes],
+        [`${ASSET_BASE}/3`, noCommitChecksum],
+      ]),
+      tagObjectMessage: pointerFor().json,
+    });
+    await assert.rejects(
+      () => buildStablePointerForRelease({ repository: REPO, tag: TAG_B, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE",
+      "the pointer cannot be built without an identifiable source commit",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("CLI: cmdVerifyStable exits 0 on the verified chain and 1 on an unexpected pointer target", async () => {
+    process.env.GH_TOKEN = READ_TOKEN;
+    installFake({ ...assetState(), tagObjectMessage: pointerFor().json });
+    const ok = await cmdVerifyStable({ repository: REPO, expectedTag: TAG_B });
+    assert.equal(ok, 0, "the verified identity chain passes the CLI gate");
+    const mispointed = JSON.stringify({ ...JSON.parse(pointerFor().json), versionedTag: TAG_A });
+    installFake({ ...assetState(), tagObjectMessage: mispointed });
+    const failed = await cmdVerifyStable({ repository: REPO, expectedTag: TAG_B });
+    assert.equal(failed, 1, "an unexpected pointer target fails the CLI gate");
+    delete process.env.GH_TOKEN;
     globalThis.fetch = realFetch;
   });
 });

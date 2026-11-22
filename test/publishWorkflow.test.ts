@@ -188,12 +188,12 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
     assert.match(runBlocks(publish!).join("\n"), /sha256sum -c console-snapshot\.sha256/, "the read-only gate job re-checks the checksum over the downloaded bytes");
     assert.match(runBlocks(release!).join("\n"), /sha256sum -c console-snapshot\.sha256/, "the PRIVILEGED release job re-checks the checksum over its own downloaded bytes before uploading");
     // The roundtrip and stable gates recompute the checksum over the exact
-    // downloaded bytes inside verifyReleaseAssetSet (verifyChecksumFile),
-    // exercised by test/releaseOps.test.ts; here we pin that the workflow
-    // invokes them at both scopes.
+    // downloaded bytes inside verifyReleaseAssetSet / verifyStableReference
+    // (verifyChecksumFile), exercised by test/releaseOps.test.ts; here we
+    // pin that the workflow invokes them at both gates.
     assert.match(runBlocks(verifyVersioned!).join("\n"), /--scope versioned/, "same-release roundtrip gate (read-only job, between upload and promotion)");
     const stableRuns = runBlocks(verifyStable!).join("\n");
-    assert.match(stableRuns, /--scope latest/, "post-activation stable gate (read-only job)");
+    assert.match(stableRuns, /verify-stable[\s\\]+\"\$REPO\" --expected-tag/, "post-activation stable-reference identity gate (read-only job)");
   });
 
   test("duplicate versioned tags abort before creation (authenticated three-way gates); releases are created explicitly NOT latest", () => {
@@ -212,26 +212,28 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
     // Cross-job ordering: release → verify-versioned → promote.
     assert.equal(promote!.needs?.includes("verify-versioned"), true, "promotion is gated on the same-release verification JOB");
     const promoteRuns = runBlocks(promote!).join("\n");
-    assert.match(promoteRuns, /gh release edit "\$TAG" --repo "\$REPO" --latest/, "the stable reference is activated by a single promotion command");
+    assert.match(promoteRuns, /git\/tags[\s\S]*--jq '\.sha'/, "the stable pointer is a NEW immutable annotated tag object (created via gh api)");
+    assert.match(promoteRuns, /git\/refs/, "the ref is moved with the atomic ref update (gh api)");
+    assert.match(promoteRuns, /console-snapshot-prod/, "the dedicated stable ref name is pinned");
     const releaseRuns = runBlocks(release!).join("\n");
     assert.match(releaseRuns, /--latest=false/, "the release job creates the release explicitly NOT latest");
     assert.ok(!/--latest(?!=false)/.test(releaseRuns), "the release job must NOT set the latest designation (only --latest=false)");
     const stableRuns = runBlocks(verifyStable!).join("\n");
-    assert.match(stableRuns, /--scope latest --expected-tag "\$TAG"/, "the stable gate cross-checks the activated tag");
-    assert.match(stableRuns, /verify-release-assets/, "the stable gate runs the same-release verification CLI");
+    assert.match(stableRuns, /--expected-tag "\$TAG"/, "the stable gate cross-checks the activated tag");
+    assert.match(stableRuns, /verify-stable/, "the stable gate runs the stable-reference identity CLI");
   });
 
-  test("the workflow records the previous latest tag as a rollback pointer (read-only discovery)", () => {
+  test("the workflow records the previous stable pointer as a rollback reference (read-only discovery)", () => {
     const runs = runBlocks(publish!).join("\n");
-    assert.match(runs, /release-latest/, "the current latest designation is read through the hardened gate before activation");
-    assert.match(runs, /previous_latest_tag/, "the rollback pointer is captured as a job output");
-    assert.match(runs, /rollback/, "the rollback pointer is surfaced in the summary");
+    assert.match(runs, /stable-pointer-current/, "the dedicated stable reference is read through the hardened gate before activation");
+    assert.match(runs, /previous_versioned_tag/, "the rollback reference is captured as a job output");
+    assert.match(runs, /rollback/, "the rollback reference is surfaced in the summary");
     const summaryStep = verifyStable!.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("ConsoleSnapshot publication")));
     assert.ok(summaryStep, "the final publication summary exists in the read-only verify-stable job");
     assert.equal(
       stepEnv(summaryStep!)["PREV"],
-      "${{ needs.publish.outputs.previous_latest_tag }}",
-      "the rollback pointer reaches the final publication summary through the validated job output",
+      "${{ needs.publish.outputs.previous_versioned_tag }}",
+      "the rollback reference reaches the final publication summary through the validated job output",
     );
   });
 
@@ -379,7 +381,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     assert.deepEqual(publish.permissions, { contents: "read" }, "publish declares contents:read explicitly — the review's finding was a write-capable token reaching custom code in this job");
     const runs = runBlocks(publish).join("\n");
     // The custom operations live here — under a read-only grant.
-    assert.match(runs, /node ops\/release-ops\.mjs release-latest/, "rollback discovery (custom code) runs in the read-only job");
+    assert.match(runs, /node ops\/release-ops\.mjs stable-pointer-current/, "rollback discovery (custom code) runs in the read-only job");
     assert.match(runs, /node -e "console\.log\(JSON\.parse/, "provenance parsing runs in the read-only job");
     // And nothing in this job can mutate releases. (The rollback summary
     // MENTIONS the rollback command in its documentation text, so only
@@ -387,19 +389,19 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(runs), "the read-only publish job performs NO release-mutating operation");
   });
 
-  test("custom `release-latest` execution receives a READ-ONLY credential, never a write-capable one", () => {
+  test("custom `stable-pointer-current` execution receives a READ-ONLY credential, never a write-capable one", () => {
     // Find the step that actually executes the custom bundle for rollback
     // discovery and inspect ITS job's effective permissions.
-    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("release-latest"));
+    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("stable-pointer-current"));
     assert.ok(step, "the rollback-discovery step exists");
     const perms = effectivePermissions(publish);
     assert.equal(perms["contents"], "read", "the job running custom discovery code grants only contents:read — github.token is read-only for EVERY step of it");
     const env = stepEnv(step!);
     assert.equal(env["GH_TOKEN"], "${{ github.token }}", "discovery authenticates with the workflow token, which is READ-ONLY because of the job grant");
-    // Belt-and-suspenders: no OTHER job that runs release-latest exists with write permission.
+    // Belt-and-suspenders: no OTHER job that runs stable-pointer-current exists with write permission.
     for (const [name, job] of privilegedJobs) {
       const runs = runBlocks(job).join("\n");
-      assert.ok(!runs.includes("release-latest"), `${name} (write-permission job) must not execute the custom release-latest code`);
+      assert.ok(!runs.includes("stable-pointer-current"), `${name} (write-permission job) must not execute the custom stable-pointer discovery code`);
     }
   });
 
@@ -451,15 +453,22 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     }
   });
 
-  test("only the EXPLICIT release-mutation steps receive GY_RELEASE_PAT; the only other token-bearing steps carry the READ-ONLY automatic token", () => {
+  test("only the EXPLICIT mutation steps receive GY_RELEASE_PAT; the only other token-bearing steps carry the READ-ONLY automatic token", () => {
+    // SIXTH ROUND: the mutation set is the versioned release (create +
+    // upload) PLUS the dedicated-ref activation (create the annotated
+    // pointer tag object + move the ref) PLUS the failure-path rollback
+    // (re-create the previous pointer object + re-point the ref, or
+    // delete the ref on first publication).
     const expectedMutations: Array<[string, RegExp]> = [
       ["release", /gh release create "\$TAG"/],
       ["release", /gh release upload "\$TAG"/],
-      ["promote", /gh release edit "\$TAG" --repo "\$REPO" --latest/],
+      ["promote", /git\/tags[\s\S]*git\/refs/s],
+      ["promote", /git\/tags[\s\S]*ROLLBACK FAILED/s],
     ];
-    // The ONLY authenticated non-mutation step allowed in the privileged
-    // jobs is the three-way tag-collision READ gate (automatic token).
-    const readOnlyGate = /git\/ref\/tags\/\$TAG/;
+    // The ONLY authenticated non-mutation steps allowed in the privileged
+    // jobs are the three-way READ gates (automatic token): the versioned
+    // tag-collision gate and the dedicated stable-ref gate.
+    const readOnlyGate = /git\/ref\/tags\/(\$TAG|console-snapshot-prod)/;
     const mutationsFound: string[] = [];
     for (const [name, job] of privilegedJobs) {
       for (const step of job.steps) {
@@ -467,15 +476,24 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         if (stepEnv(step)["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}") {
           // A PAT-bearing step MUST be one of the pinned mutations.
           const matched = expectedMutations.filter(([jn, re]) => jn === name && re.test(run));
-          assert.ok(matched.length > 0, `a GY_RELEASE_PAT-bearing step in ${name} is not a recognized release mutation: ${run.slice(0, 120)}`);
+          assert.ok(matched.length > 0, `a GY_RELEASE_PAT-bearing step in ${name} is not a recognized mutation: ${run.slice(0, 120)}`);
           assert.ok(!run.includes("node ") && !run.includes(".mjs"), "PAT-bearing steps execute only the pinned gh CLI, never custom code");
-          assert.ok(!/git\/ref\/tags/.test(run), "a PAT-bearing step must not double as a query gate");
+          // The rollback step re-reads the ref it just moved with the SAME
+          // credential to verify its own mutation — a read cannot escalate
+          // privileges; every other PAT step must not query.
+          const isRollback = run.includes("ROLLBACK FAILED") || run.includes("rollback VERIFIED");
+          if (!isRollback) {
+            assert.ok(!/git\/ref\/tags/.test(run), "a PAT-bearing step must not double as a query gate");
+          } else {
+            assert.ok(run.includes("rollback"), "the exempted PAT query step is the verified rollback");
+          }
           mutationsFound.push(...matched.map(() => name));
         } else if (stepEnv(step)["GH_TOKEN"] === "${{ github.token }}") {
-          // A github.token-bearing step in a privileged job must be the
-          // read-only collision gate — never a release mutation.
-          assert.ok(readOnlyGate.test(run), `a github.token step in ${name} must be the authenticated read-only tag-collision gate: ${run.slice(0, 120)}`);
+          // A github.token-bearing step in a privileged job must be a
+          // read-only gate — never a mutation.
+          assert.ok(readOnlyGate.test(run) || run.includes("READ-BACK"), `a github.token step in ${name} must be an authenticated read-only gate: ${run.slice(0, 120)}`);
           assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(run), `the read-only gate in ${name} must not mutate releases`);
+          assert.ok(!/git\/(refs|tags)\"/.test(run) || run.includes("READ-BACK") || readOnlyGate.test(run), "a github.token step must not mutate the git data (read-only gates and read-back only)");
         } else if (hasTokenEnv(step)) {
           assert.fail(`a token env with an unexpected value exists in ${name}: ${JSON.stringify(stepEnv(step))}`);
         } else {
@@ -489,7 +507,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       assert.ok(!("GH_TOKEN" in (job.env ?? {})) && !("GITHUB_TOKEN" in (job.env ?? {})), `${name} must not declare GH_TOKEN/GITHUB_TOKEN at JOB level (it would leak to every step)`);
       assert.ok(!("GY_RELEASE_PAT" in (job.env ?? {})), `${name} must not declare GY_RELEASE_PAT at JOB level (it would leak to every step)`);
     }
-    assert.deepEqual(mutationsFound.sort(), ["promote", "release", "release"], "exactly three privileged mutation COMMANDS use the PAT: create, upload, promote (create+upload share one step)");
+    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release"], "exactly four privileged mutation COMMANDS use the PAT: release create, release upload, stable-ref activation, rollback (create+upload share one step)");
   });
 
   test("no workflow-level or job-level env exposes the release credential anywhere", () => {
@@ -510,7 +528,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       const value = stepEnv(step)["GH_TOKEN"];
       const run = (step["run"] as string) ?? "";
       if (value === "${{ secrets.GY_RELEASE_PAT }}") {
-        assert.ok(/gh release (create|upload|edit)/.test(run), `a GY_RELEASE_PAT step must be a release mutation (found: ${run.slice(0, 80)})`);
+        assert.ok(/gh release (create|upload|edit)|git\/(tags|refs)/.test(run), `a GY_RELEASE_PAT step must be a pinned mutation (found: ${run.slice(0, 80)})`);
         patStepCount += 1;
       } else if (value === "${{ github.token }}") {
         assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(run), `the automatic token must never drive a release mutation (found: ${run.slice(0, 80)})`);
@@ -519,7 +537,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         assert.fail(`GH_TOKEN env references an unsanctioned credential source: ${String(value)}`);
       }
     }
-    assert.equal(patStepCount, 2, "exactly TWO steps carry the release-write PAT (release create+upload, promote)");
+    assert.equal(patStepCount, 3, "exactly THREE steps carry the release-write PAT (release create+upload, stable-ref activation, rollback)");
     assert.ok(automaticTokenStepCount >= 4, "every authenticated query step uses the READ-ONLY automatic token");
   });
 
@@ -531,7 +549,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
           assert.ok(!hasTokenEnv(step), `${uses} in ${job.name ?? "(unnamed)"} must not receive a GitHub token (it authenticates with the artifact-scoped runtime token)`);
         }
         const run = (step["run"] as string) ?? "";
-        const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("--scope latest") || run.includes("verify-snapshot");
+        const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("verify-stable") || run.includes("verify-snapshot") || run.includes("stable-pointer-build");
         if (isVerification) {
           // No job is write-capable anymore; the check pins that custom
           // verification code never runs where a write grant exists AND
@@ -550,16 +568,17 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
   });
 
   test("read-only rollback discovery remains possible AND the post-activation gate stays read-only", () => {
-    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("release-latest"));
+    const step = publish.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("stable-pointer-current"));
     assert.ok(step, "rollback discovery exists in the read-only publish job");
     assert.equal(publish.permissions?.["contents"], "read", "discovery runs under a read-only grant");
     assert.equal(stepEnv(step!)["GH_TOKEN"], "${{ github.token }}", "discovery uses the READ-ONLY workflow token, never the PAT");
     // Post-activation gate: read-only token, no mutation.
     assert.deepEqual(verifyStable.permissions, { contents: "read" }, "verify-stable declares the read-only grant explicitly");
-    const gate = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope latest")));
+    const gate = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("verify-stable")));
     assert.ok(gate, "the stable gate step exists");
     assert.equal(stepEnv(gate!)["GH_TOKEN"], "${{ github.token }}", "the stable gate authenticates with the READ-ONLY workflow token");
     assert.ok(!runBlocks(verifyStable).join("\n").includes("gh release"), "the stable gate performs NO release-mutating operations");
+    assert.ok(!/^\s*(gh api --method (POST|PATCH|DELETE)|gh api -X (POST|PATCH|DELETE))/m.test(runBlocks(verifyStable).join("\n")), "the stable gate performs NO git-data-mutating operations (mentions in documentation text are not commands)");
   });
 
   test("permissions stay least-privilege: seven read-only jobs, no write-permission job anywhere", () => {
@@ -578,9 +597,9 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
   const allJobs = Object.entries(wf.jobs);
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
-  test("the PAT appears ONLY inside the step-level env of the two release-mutation steps", () => {
+  test("the PAT appears ONLY inside the step-level env of the three mutation steps", () => {
     // Every literal occurrence of the secret reference in the file must be
-    // either a comment mention or one of the two sanctioned step env values.
+    // either a comment mention or one of the three sanctioned step env values.
     let envOccurrences = 0;
     for (const [, job] of allJobs) {
       for (const step of job.steps) {
@@ -588,10 +607,10 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         if (env["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}") envOccurrences += 1;
       }
     }
-    assert.equal(envOccurrences, 2, "exactly TWO step env blocks reference the PAT (release create+upload step, promote step)");
+    assert.equal(envOccurrences, 3, "exactly THREE step env blocks reference the PAT (release create+upload, stable-ref activation, rollback)");
     // The remaining occurrences must be comments only.
     const stripped = raw.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
-    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 2, "outside comments, the PAT reference appears ONLY in the two sanctioned step env values");
+    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 3, "outside comments, the PAT reference appears ONLY in the three sanctioned step env values");
   });
 
   test("no build, test, generation, verification, artifact, checkout or dependency step receives the PAT in any form", () => {
@@ -602,8 +621,9 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         const run = (step["run"] as string) ?? "";
         const carriesPat = "GY_RELEASE_PAT" in env || JSON.stringify(step).includes("secrets.GY_RELEASE_PAT");
         if (!carriesPat) continue;
-        // The ONLY PAT-bearing steps are the pinned gh release mutations.
-        assert.ok(/gh release (create|upload|edit)/.test(run), `${name}: a PAT-bearing step must be a release mutation`);
+        // The ONLY PAT-bearing steps are the pinned mutations: the gh
+        // release mutations and the dedicated-ref gh api mutations.
+        assert.ok(/gh release (create|upload|edit)|git\/(tags|refs)/.test(run), `${name}: a PAT-bearing step must be a pinned mutation`);
         assert.ok(!uses, `a PAT-bearing step must not be an action (${uses})`);
         assert.ok(!/node|pnpm|npm|npx|\.mjs|checkout|tsx/.test(run), `a PAT-bearing step must not execute custom code or dependencies`);
       }
@@ -634,9 +654,9 @@ describe("publish-console-snapshot workflow — rollback discovery hardening (re
   const publish = wf.jobs["publish"]!;
   const release = wf.jobs["release"]!;
 
-  test("rollback discovery uses the typed `release-latest` gate, not error-suppressed gh api", () => {
+  test("rollback discovery uses the typed `stable-pointer-current` gate, not error-suppressed gh api", () => {
     const runs = runBlocks(publish).join("\n");
-    assert.match(runs, /release-latest/, "the hardened discovery CLI is used");
+    assert.match(runs, /stable-pointer-current/, "the hardened discovery CLI is used");
     assert.ok(!runs.includes("2>/dev/null || echo"), "the old suppress-all-errors pattern is GONE");
     assert.ok(!runs.includes('--jq ".tag_name" 2>/dev/null'), "no raw gh api latest query that can silently fail into 'none'");
   });
@@ -670,16 +690,16 @@ describe("publish-console-snapshot workflow — rollback discovery hardening (re
     assert.equal(publish.permissions?.["contents"], "read", "the belt check's token is READ-ONLY because the job grants only contents:read");
   });
 
-  test("the rollback pointer is recorded BEFORE any release operation (job chain enforces the order)", () => {
+  test("the rollback reference is recorded BEFORE any release operation (job chain enforces the order)", () => {
     const steps = publish.steps;
     const runs = steps.map((s) => (typeof s["run"] === "string" ? (s["run"] as string) : ""));
-    const rollbackIdx = runs.findIndex((r) => r.includes("previous_latest_tag"));
+    const rollbackIdx = runs.findIndex((r) => r.includes("previous_versioned_tag"));
     assert.ok(rollbackIdx > -1, "rollback discovery runs in the publish job");
     const rollbackRun = runs[rollbackIdx] ?? "";
     assert.match(rollbackRun, /GITHUB_STEP_SUMMARY/, "the pointer is written to the run summary at discovery time");
     // The release job (which performs the first mutation) DEPENDS on publish.
     assert.equal(release.needs?.includes("publish"), true, "release creation is unreachable until the rollback pointer has been recorded (needs chain)");
-    assert.equal(publish.outputs?.["previous_latest_tag"], "${{ steps.rollback.outputs.previous_latest_tag }}", "the pointer crosses the job boundary as a job output");
+    assert.equal(publish.outputs?.["previous_versioned_tag"], "${{ steps.rollback.outputs.previous_versioned_tag }}", "the pointer crosses the job boundary as a job output");
   });
 });
 
@@ -698,12 +718,12 @@ describe("publish-console-snapshot workflow — same-release verification (revie
     assert.match(runs, /verify-release-assets[\s\S]*--scope versioned/, "versioned verification uses the same-release CLI gate");
   });
 
-  test("post-activation verification requires BOTH the designation match AND the stable-URL artifact check", () => {
+  test("post-activation verification requires the full identity chain over the dedicated ref", () => {
     const runs = runBlocks(verifyStable).join("\n");
-    assert.match(runs, /verify-release-assets[\s\S]*--scope latest/, "the stable gate checks the latest designation");
+    assert.match(runs, /verify-stable[\s\S]*--expected-tag/, "the stable gate verifies the dedicated stable reference's identity chain");
     const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
     assert.ok(!raw.includes("latest/download/console-snapshot.json\""), "raw curl of separate latest URLs is no longer the verification mechanism");
-    assert.ok(!/curl[\s\S]*stable-check/.test(raw), "the three-separate-curl stable check is replaced by the same-release gate");
+    assert.ok(!/curl[\s\S]*stable-check/.test(raw), "the three-separate-curl stable check is replaced by the identity gate");
   });
 
   test("verification and promotion run in the required order ACROSS JOBS", () => {
@@ -715,11 +735,11 @@ describe("publish-console-snapshot workflow — same-release verification (revie
     assert.equal(verifyVersioned.needs?.includes("release"), true, "same-release verification follows upload (job boundary)");
     assert.equal(promote.needs?.includes("verify-versioned"), true, "promotion follows verification (job boundary)");
     assert.equal(verifyStable.needs?.includes("promote"), true, "post-activation verification follows promotion (job boundary)");
-    // The promotion job contains exactly ONE gh command — the metadata flip.
-    const promoteRuns = runBlocks(promote);
-    const ghSteps = promoteRuns.filter((r) => /gh release /.test(r));
-    assert.equal(ghSteps.length, 1, "the promotion job performs exactly one GitHub release operation");
-    assert.match(ghSteps[0] ?? "", /gh release edit "\$TAG" --repo "\$REPO" --latest/);
+    // The promotion job's mutation set is pinned: the activation step
+    // (create tag object + move ref) and the failure-path rollback.
+    const promoteRuns = runBlocks(promote).join("\n");
+    assert.match(promoteRuns, /git\/tags[\s\S]*git\/refs/s, "the activation creates the pointer object and moves the ref");
+    assert.ok(!promoteRuns.includes("gh release edit"), "the retired latest-release promotion is GONE");
   });
 
   test("the activated tag crosses every job boundary through validated outputs and is re-checked for shape", () => {
@@ -733,7 +753,7 @@ describe("publish-console-snapshot workflow — same-release verification (revie
       const shapeStep = job.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("strict versioned-tag shape") || (s["run"] as string).includes("fails the strict versioned-tag shape")));
       assert.ok(shapeStep, `${name} re-validates the tag shape before use`);
     }
-    const stableGateStep = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("--scope latest")));
+    const stableGateStep = verifyStable.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("verify-stable")) && (s["run"] as string).includes("--expected-tag"));
     assert.ok(stableGateStep, "the stable gate step exists");
     assert.equal(
       ((stableGateStep!["env"] ?? {}) as Record<string, unknown>)["TAG"],
@@ -794,5 +814,95 @@ describe("rehearsal-publication workflow — hard non-production guard", () => {
   test("the rehearsal NEVER references the production release PAT (GY_RELEASE_PAT)", () => {
     const rawRehearsal = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
     assert.ok(!rawRehearsal.includes("GY_RELEASE_PAT"), "the production release credential must never be wired into the rehearsal workflow");
+  });
+});
+
+// ─── Sixth round — the dedicated `console-snapshot-prod` stable reference ───
+
+describe("publish-console-snapshot workflow — dedicated stable reference (owner-selected architecture)", () => {
+  const wf = loadWorkflow();
+  const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
+  const stripped = raw.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+  const promote = wf.jobs["promote"]!;
+  const publish = wf.jobs["publish"]!;
+  const verifyVersioned = wf.jobs["verify-versioned"]!;
+  const verifyStable = wf.jobs["verify-stable"]!;
+
+  test("the workflow NEVER depends on the repo-wide latest designation anywhere in its execution path", () => {
+    assert.ok(!stripped.includes("releases/latest"), "no releases/latest URL appears outside comments");
+    assert.ok(!stripped.includes("gh release edit"), "no latest-release promotion command exists");
+    assert.ok(!stripped.includes("make_latest"), "no make_latest designation operation exists");
+    assert.ok(!stripped.includes("--latest ") && !/\--latest$/.test(stripped), "--latest appears only as --latest=false");
+    assert.match(stripped, /--latest=false/, "versioned releases are still explicitly NOT latest");
+  });
+
+  test("the dedicated stable ref name is pinned and every ref mutation addresses it", () => {
+    assert.match(stripped, /console-snapshot-prod/, "the stable ref name appears in the execution path");
+    // Every ref mutation in the privileged job addresses the dedicated ref
+    // (via the literal name or the job-level STABLE_REF constant).
+    const promoteRuns = runBlocks(promote).join("\n");
+    assert.match(promoteRuns, /-f ref="\$STABLE_REF"/, "ref creation uses the dedicated ref constant");
+    assert.match(promoteRuns, /--method PATCH "\$STABLE_REF"/, "ref update uses the dedicated ref constant");
+    assert.equal(promote.env?.["STABLE_REF"], "refs/tags/console-snapshot-prod", "the job pins the exact dedicated ref name");
+  });
+
+  test("the pointer JSON is re-validated at the promote boundary (token-free jq gate) before any privileged command consumes it", () => {
+    const runs = runBlocks(verifyVersioned).join("\n");
+    assert.match(runs, /stable-pointer-build/, "the pointer is built by the read-only verify-versioned job");
+    const promoteRuns = runBlocks(promote).join("\n");
+    assert.match(promoteRuns, /pointerSchema[\s\S]*console-snapshot-stable-pointer\.v1/, "the pointer schema discriminator is pinned at the boundary");
+    assert.match(promoteRuns, /versionedTag == \$tag/, "the pointer must name the boundary tag");
+    assert.match(promoteRuns, /sourceCommit == \$commit/, "the pointer must name the asserted checkout commit");
+    const jqStep = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("pointerSchema")));
+    assert.ok(jqStep, "the pointer-validation step exists");
+    assert.equal(stepEnv(jqStep!)["GH_TOKEN"], undefined, "the pointer validation is TOKEN-FREE (pure jq over the boundary output)");
+    // The pointer crosses the job boundary as a validated output.
+    assert.equal(verifyVersioned.outputs?.["pointer_json"], "${{ steps.pointer.outputs.pointer_json }}", "verify-versioned exposes the pointer JSON");
+    const activateStep = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("git/tags") && (s["run"] as string).includes("git/refs")));
+    assert.equal(stepEnv(activateStep!)["POINTER_JSON"], "${{ needs.verify-versioned.outputs.pointer_json }}", "the activation consumes exactly the validated pointer output");
+  });
+
+  test("activation creates a NEW immutable annotated tag object and moves the ref with ONE atomic update", () => {
+    const runs = runBlocks(promote).join("\n");
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/tags"/, "the pointer object is created via POST /git/tags (immutable git object)");
+    assert.match(runs, /-f type="commit"/, "the tag object points at the release commit");
+    assert.match(runs, /-f message="\$POINTER_JSON"/, "the pointer JSON is the tag-object message");
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/refs"/, "first publication CREATES the ref");
+    assert.match(runs, /--method PATCH "\$STABLE_REF"/, "subsequent publications move the ref with ONE PATCH");
+    assert.match(runs, /-F force=true/, "the ref move is the single atomic update");
+    assert.ok(!runs.includes("--clobber"), "no asset is ever clobbered");
+  });
+
+  test("read-back verification exists and is READ-ONLY (ref sha + message equality)", () => {
+    const readback = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("READ-BACK MISMATCH")));
+    assert.ok(readback, "the read-back verification step exists");
+    assert.equal(stepEnv(readback!)["GH_TOKEN"], "${{ github.token }}", "read-back authenticates with the READ-ONLY automatic token");
+    const runs = (readback!["run"] as string) ?? "";
+    assert.match(runs, /\[ "\$sha" != "\$NEW_SHA" \]/, "the ref must resolve to the created object sha");
+    assert.match(runs, /\[ "\$message" != "\$POINTER_JSON" \]/, "the activated object's message must equal the validated pointer JSON");
+  });
+
+  test("the rollback step runs on failure, restores the recorded previous pointer, and fails LOUDLY on unverifiable rollback", () => {
+    const rollback = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("ROLLBACK FAILED")));
+    assert.ok(rollback, "the rollback step exists");
+    assert.equal(rollback?.["if"], "failure()", "the rollback runs only on failure");
+    assert.equal(stepEnv(rollback!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the rollback is a privileged mutation (PAT, step-level env)");
+    const runs = (rollback!["run"] as string) ?? "";
+    assert.match(runs, /ref_mode/i, "the rollback branches on the pre-mutation ref state");
+    assert.match(runs, /--method DELETE "\$STABLE_REF"/, "first-publication rollback removes the ref (restores the absent state)");
+    assert.match(runs, /rollback_ok/, "the rollback outcome is tracked explicitly");
+    assert.match(runs, /ROLLBACK FAILED[\s\S]*UNVERIFIED/s, "an unverifiable rollback fails LOUDLY — the state is reported as unverified");
+    assert.match(runs, /rollback VERIFIED/, "a successful rollback is verified by read-back before being claimed");
+    assert.match(runs, /previous_pointer_json|PREV_POINTER_JSON/, "the rollback restores the RECORDED previous pointer verbatim");
+  });
+
+  test("the three-way stable-ref gate aborts on any failure (never treats an API failure as 'ref absent')", () => {
+    const runs = runBlocks(promote).join("\n");
+    assert.match(runs, /git\/ref\/tags\/console-snapshot-prod/, "the gate queries the dedicated ref");
+    assert.match(runs, /404\)/, "404 = genuinely absent (mode=create)");
+    assert.match(runs, /200\)/, "200 = exists (mode=update)");
+    assert.match(runs, /refusing to treat this as 'ref absent'/, "a failing gate aborts the run");
+    const gateStep = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("git/ref/tags/console-snapshot-prod")));
+    assert.equal(stepEnv(gateStep!)["GH_TOKEN"], "${{ github.token }}", "the stable-ref gate uses the READ-ONLY automatic token, never the PAT");
   });
 });

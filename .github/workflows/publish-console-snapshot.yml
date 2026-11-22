@@ -64,7 +64,7 @@ name: publish-console-snapshot
 #                            downloaded bytes, provenance tag parsing +
 #                            strict shape validation, the fail-closed
 #                            tag/release collision gates, and the
-#                            hardened `release-latest` rollback-pointer
+#                            hardened `stable-pointer-current` stable-ref
 #                            discovery (custom bundle — receives the
 #                            READ-ONLY workflow token only, per the
 #                            review requirement that discovery use a
@@ -96,17 +96,29 @@ name: publish-console-snapshot
 #                            (a private repository's release assets 404
 #                            for unauthenticated requests). The stable
 #                            pointer cannot move until this job is green.
-#   promote (contents:read)  THE activation job: exactly ONE privileged
-#                            operation — `gh release edit <tag> --latest`
-#                            — plus token-free precondition checks. Zero
-#                            custom code, no checkout, no node; the
-#                            release-write PAT exists ONLY as the
-#                            step-level env of that single gh command.
-#   verify-stable (read-only) the post-activation stable-reference gate,
-#                            run with the READ-ONLY workflow token from a
-#                            full repository checkout (the code it runs —
-#                            strict schema-v2 parser + same-release
-#                            cross-checks — is the reviewed commit's own).
+#   promote (contents:read)  THE activation job: the pointer-build
+#                            output is re-validated (jq, token-free),
+#                            the current stable ref is re-read through a
+#                            READ-ONLY three-way gate, and exactly ONE
+#                            privileged step performs the mutation —
+#                            create the new ANNOTATED TAG OBJECT
+#                            (`gh api POST /git/tags`, message = the
+#                            pointer JSON) + move the ref
+#                            (`gh api PATCH /git/refs`, force) —
+#                            followed by a READ-ONLY read-back
+#                            verification and, on failure, a rollback
+#                            step. Zero custom code, no checkout, no
+#                            node; the release-write PAT exists ONLY as
+#                            the step-level env of the mutation and
+#                            rollback steps.
+#   verify-stable (read-only) the post-activation stable-reference gate:
+#                            the FULL identity chain (ref → tag object →
+#                            pointer → versioned release record → its
+#                            three assets → checksum + provenance +
+#                            pointer digests), run with the READ-ONLY
+#                            workflow token from a full repository
+#                            checkout (the code it runs is the reviewed
+#                            commit's own).
 #
 # FOURTH-ROUND CORRECTION — CREDENTIAL ISOLATION VIA A DEDICATED PAT:
 # the owner provisioned a fine-grained PAT exclusively for this
@@ -122,11 +134,11 @@ name: publish-console-snapshot
 #     READ-ONLY in all seven jobs by construction;
 #   * the ONLY write-capable credential in the entire workflow is the
 #     owner-provisioned `GY_RELEASE_PAT` secret, exposed as STEP-LEVEL
-#     env on EXACTLY the two trusted release-mutation steps (the
-#     create+upload step of `release` and the single promotion command
-#     of `promote`) — never at workflow or job level, never to any step
-#     that checks out code, installs dependencies, runs node/scripts or
-#     downloads artifacts;
+#     env on EXACTLY the trusted mutation steps (the create+upload step
+#     of `release`, the stable-ref activation step of `promote`, and the
+#     rollback step of `promote`) — never at workflow or job level,
+#     never to any step that checks out code, installs dependencies,
+#     runs node/scripts or downloads artifacts;
 #   * the `release` and `promote` jobs still contain ZERO custom code
 #     (no checkout, no setup-node, no pnpm, no node, no repository or
 #     artifact-executed code) — pinned by test/publishWorkflow.test.ts.
@@ -145,40 +157,38 @@ name: publish-console-snapshot
 # (needs: chain enforces the order); `verify-stable` re-verifies the
 # stable pointer after activation.
 #
-# STABLE REFERENCE — LATEST-RELEASE PROMOTION (ARCHITECTURE DECISION
-# PENDING OWNER APPROVAL — review Task 2; the PAT provisioning is NOT
-# approval of this architecture): every publication is an immutable
-# versioned release (`console-snapshot-prod-<UTC
-# timestamp>-<source commit>`, created with `--latest=false` so it does
-# NOT move the stable pointer on creation). The stable retrieval
-# reference is the repo-wide "latest release" designation, served
-# through the CONSTANT URL
-#   https://github.com/<repo>/releases/latest/download/console-snapshot.json
-# NOTE (repository is now PRIVATE): that URL — and the versioned tag
-# asset URLs — require AUTHENTICATION since the visibility change. The
-# workflow's own verification gates fetch through the authenticated API
-# path with the READ-ONLY workflow token; unauthenticated CONSUMERS
-# (the graveyield-console deployment) can no longer fetch the artifact
-# AT ALL — that production integration blocker is documented in
-# docs/SNAPSHOT_PUBLICATION.md §11 and is an owner decision; Console and
-# Vercel are outside this task's authorization.
-# Activation is a SINGLE metadata operation (`gh release edit <tag>
-# --latest`, API PATCH make_latest=true) that moves the whole pointer at
-# once — no asset is ever deleted or overwritten, so the stable URL
-# always resolves to ONE complete release's assets: the previous
-# artifact until activation, the new artifact after. A failed run at
-# ANY point before activation leaves the previous last-known-good
-# artifact serving; rollback is a second single metadata operation on
-# the previous release's tag (recorded BEFORE any release operation,
-# see the rollback step). The repo-wide-latest mechanism is a MATERIAL
-# architecture change relative to the owner-approved dedicated
-# `console-snapshot-prod` reference: an unrelated release could take
-# over the pointer. It is retained ONLY as the interim implementation
-# with an explicit owner-approval gate and a documented exclusive
-# promotion policy (docs/SNAPSHOT_PUBLICATION.md §9); an unrelated
-# promotion is additionally DETECTED post-activation (verify-stable
-# requires the latest designation to equal the activated tag) and fails
-# the run.
+# STABLE REFERENCE — DEDICATED `console-snapshot-prod` REF (SIXTH-ROUND
+# CORRECTION — OWNER-SELECTED ARCHITECTURE): the production stable
+# reference is the git ref `refs/tags/console-snapshot-prod` — an
+# ANNOTATED tag whose tag-object MESSAGE carries the stable-pointer JSON
+# (graveyield.console-snapshot-stable-pointer.v1) naming ONE immutable
+# versioned release (tag + source commit + per-asset SHA-256 digests and
+# lengths). The production path NEVER depends on the repo-wide "latest"
+# designation — an unrelated release taking it cannot move the stable
+# reference. The pointer BYTES are never copied onto the stable
+# reference: the snapshot/provenance/checksum live exclusively on
+# immutable versioned releases (`--latest=false` on creation), so the
+# pointer cannot become a second mutable copy of the payload.
+# Activation = create a NEW immutable tag object (POST /git/tags) and
+# move the ref with ONE atomic update (PATCH /git/refs, force) — a
+# reader of the ref sees the old pointer or the new pointer, never a
+# missing window or a partial state (the atomicity the previously
+# rejected asset-clobber design could not provide). The PREVIOUS pointer
+# content is recorded BEFORE the mutation (run summary + job output +
+# the new pointer's previous* fields); rollback re-creates the previous
+# pointer object and re-points the ref, verified by read-back. A failed
+# run at ANY point before the atomic ref move leaves the stable
+# reference untouched; a failed POST-activation verification triggers
+# the rollback step, and an unverifiable rollback fails LOUDLY (the run
+# reports the state as unverified — never claims restoration without
+# evidence).
+# PRODUCTION RESOLUTION (consumers; requires the documented Console-side
+# change — see docs/SNAPSHOT_PUBLICATION.md): GET
+#   https://api.github.com/repos/<repo>/git/ref/tags/console-snapshot-prod
+# → GET .../git/tags/<object.sha> → parse the pointer from `message` →
+# fetch the assets from
+#   https://github.com/<repo>/releases/download/<pointer.versionedTag>/<asset>
+# and verify the SHA-256 digests against the pointer before use.
 #
 # WHAT IT DOES (in order, fail-closed):
 #   1. generate — build the indexer (frozen lockfile), run
@@ -195,10 +205,10 @@ name: publish-console-snapshot
 #      the versioned tag from provenance, abort on an existing versioned
 #      tag or release (immutability; never clobber; BOTH gates
 #      distinguish "absent" from "exists" from "gate failed" — an API
-#      failure is NEVER treated as "absent"), record the current latest
-#      release through the hardened `release-latest` gate with the
-#      READ-ONLY token (only a genuine HTTP 404 means "no previous
-#      release"; auth/permission/rate-limit/outage/malformed failures
+#      failure is NEVER treated as "absent"), record the current stable
+#      pointer through the hardened `stable-pointer-current` gate with the
+#      READ-ONLY token (only a genuine HTTP 404 means "no stable
+#      reference yet"; auth/permission/rate-limit/outage/malformed failures
 #      abort) and expose the tag + rollback pointer as job outputs.
 #   4. release (privileged, zero custom code) — re-check the checksum,
 #      re-validate the tag shape, re-run the three-way tag-collision
@@ -429,12 +439,15 @@ jobs:
       # (the release-ops bundle, provenance parsing). `github.token` is
       # therefore READ-ONLY for every step of this job — the write-
       # capable token does not exist here, so the review's finding (a
-      # write-capable token reaching custom `release-latest` execution)
+      # write-capable token reaching custom stable-pointer discovery)
       # is impossible by construction.
       contents: read
     env:
       REPO: ${{ github.repository }}
-      STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
+      # The dedicated stable reference (sixth round) — informational; the
+      # repo-wide latest URL is no longer referenced anywhere in the
+      # workflow's execution path.
+      STABLE_REF: refs/tags/console-snapshot-prod
     steps:
       - name: Guard — the pre-publication gates run ONLY from refs/heads/main
         run: |
@@ -525,13 +538,15 @@ jobs:
             *) echo "release-collision belt check got unexpected HTTP $code; refusing to treat this as 'no release'"; exit 1 ;;
           esac
       - name: Record the current stable pointer (rollback reference; aborts on ANY discovery failure)
-        # Hardened (review Task 4): `release-latest` exits non-zero on
-        # authentication failure, permission failure, rate limit, API
-        # outage, network failure or malformed response — only a genuine
-        # HTTP 404 yields kind=none ("first publication"). The pointer is
-        # recorded BEFORE any release operation and written to the run
-        # summary immediately, so even a failed run shows the exact
-        # rollback target.
+        # Hardened (review Task 4; sixth round): `stable-pointer-current`
+        # reads the DEDICATED stable reference
+        # (refs/tags/console-snapshot-prod) — NOT the repo-wide latest
+        # designation — and exits non-zero on authentication failure,
+        # permission failure, rate limit, API outage, network failure or
+        # malformed response. Only a genuine HTTP 404 yields kind=none
+        # ("first publication"). The pointer is recorded BEFORE any
+        # release operation and written to the run summary immediately,
+        # so even a failed run shows the exact rollback target.
         # CREDENTIAL NOTE (review Task 1, third-round correction): this
         # is repository-built custom code, so it receives the READ-ONLY
         # workflow token ONLY — this job's explicit permissions grant is
@@ -542,21 +557,30 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
         run: |
-          node ops/release-ops.mjs release-latest "$REPO" > /tmp/rollback.out
+          node ops/release-ops.mjs stable-pointer-current "$REPO" > /tmp/rollback.out
           kind=$(sed -n 's/^kind=//p' /tmp/rollback.out)
           tag=$(sed -n 's/^tag=//p' /tmp/rollback.out)
+          sha=$(sed -n 's/^sha=//p' /tmp/rollback.out)
+          pointer_json=$(sed -n 's/^pointer_json=//p' /tmp/rollback.out)
           if [ "$kind" = "found" ]; then PREV="$tag"; else PREV=""; fi
-          echo "previous latest tag: ${PREV:-<none — first publication>}"
-          echo "previous_latest_tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "previous stable pointer: ${PREV:-<none — first publication>}"
+          echo "previous_versioned_tag=$PREV" >> "$GITHUB_OUTPUT"
+          echo "previous_pointer_json=$pointer_json" >> "$GITHUB_OUTPUT"
           {
             echo "## Rollback pointer (recorded BEFORE any release operation)"
-            echo "- previous latest release: \`${PREV:-<none — first publication>}\`"
-            echo "- to restore it after activation: \`gh release edit ${PREV:-<tag>} --repo $REPO --latest\`"
-            echo "- rollback is verified only if the follow-up stable check confirms this release serves the stable URL"
+            echo "- previous stable pointer target: \`${PREV:-<none — first publication>}\`"
+            if [ -n "$pointer_json" ]; then
+              echo "- previous pointer JSON (recorded verbatim for rollback):"
+              echo '```json'
+              echo "$pointer_json"
+              echo '```'
+            fi
+            echo "- to restore it after activation: re-create the previous pointer tag object (\`gh api POST /git/tags\` with the recorded pointer JSON as the message) and move \`refs/tags/console-snapshot-prod\` to it (\`gh api PATCH /git/refs\`) — the workflow's rollback step does exactly this and verifies the result"
           } >> "$GITHUB_STEP_SUMMARY"
     outputs:
       versioned_tag: ${{ steps.facts.outputs.tag }}
-      previous_latest_tag: ${{ steps.rollback.outputs.previous_latest_tag }}
+      previous_versioned_tag: ${{ steps.rollback.outputs.previous_versioned_tag }}
+      previous_pointer_json: ${{ steps.rollback.outputs.previous_pointer_json }}
 
   # ─────────────────────────────────────────────────────────────────────
   # 4. release — PRIVILEGED but ZERO CUSTOM CODE: the only job that
@@ -672,7 +696,7 @@ jobs:
             --target "$CHECKOUT_SHA" \
             --latest=false \
             --title "ConsoleSnapshot v2 — $TAG" \
-            --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the authenticated path and the latest-release promotion succeeds."
+            --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the authenticated path and the dedicated console-snapshot-prod stable reference is atomically moved to its pointer."
           gh release upload "$TAG" \
             --repo "$REPO" \
             bundle/console-snapshot.json \
@@ -745,32 +769,67 @@ jobs:
         run: |
           node ops/release-ops.mjs verify-release-assets \
             "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
+      - name: Build the stable-pointer JSON from the VERIFIED release (read-only preparation for activation)
+        # Sixth round: after the same-release verification passes, the
+        # bundle builds the stable-pointer JSON from the EXACT verified
+        # bytes (per-asset SHA-256 digests + the release's source commit)
+        # and resolves the CURRENT stable pointer as the rollback
+        # reference. This step is strictly READ-ONLY — it only PRODUCES
+        # the pointer JSON; the ref mutation happens exclusively in the
+        # privileged promote job's pinned `gh api` steps.
+        id: pointer
+        env:
+          TAG: ${{ needs.release.outputs.versioned_tag }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
+        run: |
+          node ops/release-ops.mjs stable-pointer-build \
+            "$REPO" --tag "$TAG" --expected-tag "$TAG" > /tmp/pointer.out
+          pointer_json=$(sed -n 's/^pointer_json=//p' /tmp/pointer.out)
+          prev_kind=$(sed -n 's/^previous_kind=//p' /tmp/pointer.out)
+          prev_tag=$(sed -n 's/^previous_versioned_tag=//p' /tmp/pointer.out)
+          prev_sha=$(sed -n 's/^previous_tag_object_sha=//p' /tmp/pointer.out)
+          # Fail closed on an empty pointer (the build must have produced one).
+          if [ -z "$pointer_json" ]; then
+            echo "stable-pointer-build produced no pointer JSON"; exit 1
+          fi
+          echo "pointer_json=$pointer_json" >> "$GITHUB_OUTPUT"
+          echo "previous_kind=$prev_kind" >> "$GITHUB_OUTPUT"
+          echo "previous_versioned_tag=$prev_tag" >> "$GITHUB_OUTPUT"
+          echo "previous_tag_object_sha=$prev_sha" >> "$GITHUB_OUTPUT"
+          echo "stable pointer built for $TAG (previous: ${prev_tag:-<none — first publication>})"
     outputs:
       versioned_tag: ${{ needs.release.outputs.versioned_tag }}
+      pointer_json: ${{ steps.pointer.outputs.pointer_json }}
+      build_previous_versioned_tag: ${{ steps.pointer.outputs.previous_versioned_tag }}
 
   # ─────────────────────────────────────────────────────────────────────
-  # 6. promote — PRIVILEGED activation: exactly ONE trusted gh command
-  #    (the latest-release metadata promotion), authenticated with the
-  #    dedicated `GY_RELEASE_PAT` secret on that step's env alone. Zero
-  #    custom code, no checkout, no node; the automatic GITHUB_TOKEN
-  #    stays READ-ONLY (explicit contents:read). Runs only after the
-  #    roundtrip gate (verify-versioned) proved the released bytes.
+  # 6. promote — PRIVILEGED activation of the DEDICATED stable reference
+  #    (refs/tags/console-snapshot-prod): the new ANNOTATED tag object is
+  #    created and the ref is moved with ONE atomic update, authenticated
+  #    with the dedicated `GY_RELEASE_PAT` secret on the mutation and
+  #    rollback steps' env alone. Zero custom code, no checkout, no node
+  #    (only pinned `gh api`, `curl`, `jq` and shell validation); the
+  #    automatic GITHUB_TOKEN stays READ-ONLY (explicit contents:read)
+  #    and is used ONLY for the read-only gates and the read-back
+  #    verification. Runs only after the roundtrip gate (verify-versioned)
+  #    proved the released bytes and built the pointer JSON.
   # ─────────────────────────────────────────────────────────────────────
   promote:
-    name: activate the stable reference — single metadata promotion (privileged — one trusted gh command, no custom code)
+    name: activate the dedicated stable reference — new annotated pointer tag object + ONE atomic ref update (privileged — pinned gh api mutations only, no custom code)
     needs: verify-versioned
     # Layer 1 of the main-only restriction on the promotion job.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      # FOURTH-ROUND CORRECTION: the automatic GITHUB_TOKEN is READ-ONLY
-      # even here; the promotion mutates the release designation through
-      # the dedicated `GY_RELEASE_PAT` secret (step-level env below), so
-      # no job-level write grant is needed anywhere in this workflow.
+      # SIXTH-ROUND CORRECTION: the automatic GITHUB_TOKEN is READ-ONLY
+      # even here; the ref mutations authenticate through the dedicated
+      # `GY_RELEASE_PAT` secret (step-level env below), so no job-level
+      # write grant is needed anywhere in this workflow.
       contents: read
     env:
       REPO: ${{ github.repository }}
-      STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
+      CHECKOUT_SHA: ${{ github.sha }}
+      STABLE_REF: refs/tags/console-snapshot-prod
     steps:
       - name: Guard — the promotion runs ONLY from refs/heads/main
         run: |
@@ -788,25 +847,217 @@ jobs:
             '') echo "no versioned tag crossed the job boundary"; exit 1 ;;
             *) echo "tag crossing into the promotion job fails the strict versioned-tag shape: $TAG"; exit 1 ;;
           esac
-      - name: Activate the stable reference (single latest-release promotion)
-        # Only reached when: artifact complete + schema-valid + integrity
-        # verified + versioned release published + same-release asset
-        # verification passed (verify-versioned is this job's `needs`).
-        # ONE metadata operation moves the whole stable pointer; no asset
-        # is deleted or overwritten, so the previous last-known-good
-        # artifact remains fully available (its release is untouched) and
-        # a failure here still serves the OLD artifact. `gh release edit`
-        # itself fails closed if the release does not exist.
-        # THE write-capable credential exists ONLY on this step: the
-        # dedicated fine-grained `GY_RELEASE_PAT` repository secret. The
-        # automatic GITHUB_TOKEN is read-only and is NOT used for the
-        # mutation; the PAT reaches only this pinned gh CLI invocation.
+      - name: Validate the pointer JSON crossing the job boundary (token-free)
+        # The pointer JSON was built by the read-only verify-versioned job
+        # from the VERIFIED release bytes. Before any privileged command
+        # consumes it, its shape is re-validated HERE with jq: exact key
+        # set, schema discriminator, stable-ref name, versioned tag equal
+        # to the boundary tag, source commit equal to the asserted
+        # checkout commit, 64-hex digests, positive lengths.
         env:
           TAG: ${{ needs.verify-versioned.outputs.versioned_tag }}
+          POINTER_JSON: ${{ needs.verify-versioned.outputs.pointer_json }}
+        run: |
+          if [ -z "$POINTER_JSON" ]; then echo "no pointer JSON crossed the job boundary"; exit 1; fi
+          jq -e '
+            (keys | sort) == (["checksum","pointerSchema","previousTagObjectSha","previousVersionedTag","provenance","publishedAtUnixMs","snapshot","sourceCommit","stableRef","versionedTag"] | sort)
+            and .pointerSchema == "graveyield.console-snapshot-stable-pointer.v1"
+            and .stableRef == "console-snapshot-prod"
+            and .versionedTag == $tag
+            and .sourceCommit == $commit
+            and (.publishedAtUnixMs | type == "number" and . > 0)
+            and .snapshot.name == "console-snapshot.json"
+            and .provenance.name == "console-snapshot-provenance.json"
+            and .checksum.name == "console-snapshot.sha256"
+            and ([.snapshot.sha256, .provenance.sha256, .checksum.sha256] | all(test("^[0-9a-f]{64}$")))
+            and ([.snapshot.byteLength, .provenance.byteLength, .checksum.byteLength] | all(type == "number" and . > 0))
+            and ((.previousVersionedTag == null) == (.previousTagObjectSha == null))
+          ' --arg tag "$TAG" --arg commit "$CHECKOUT_SHA" >/dev/null <<<"$POINTER_JSON" \
+            || { echo "pointer JSON crossing into the promotion job fails the strict pointer validation"; exit 1; }
+          echo "pointer JSON validated: names $TAG at commit $CHECKOUT_SHA"
+      - name: Read the current stable reference (three-way gate; records the rollback reference)
+        # Immediately before the mutation, the current state of
+        # refs/tags/console-snapshot-prod is re-read with the READ-ONLY
+        # automatic token: 404 = absent (first publication, mode=create),
+        # 200 = exists (mode=update; the pointer JSON in the tag object is
+        # validated and recorded verbatim as the rollback reference),
+        # anything else = the gate itself failed (abort). This fresh read
+        # is the authoritative rollback source; the build-time read from
+        # verify-versioned is recorded for the summary.
+        id: stablegate
+        env:
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
+        run: |
+          code=$(curl -sS -o /tmp/stableref.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod") || { echo "stable-ref gate FAILED (curl transport error); refusing to treat this as 'ref absent'"; exit 1; }
+          case "$code" in
+            404)
+              echo "the stable ref does not exist yet — first publication (mode=create)"
+              echo "ref_mode=create" >> "$GITHUB_OUTPUT"
+              echo "previous_pointer_json=" >> "$GITHUB_OUTPUT"
+              echo "previous_versioned_tag=" >> "$GITHUB_OUTPUT"
+              echo "previous_tag_object_sha=" >> "$GITHUB_OUTPUT"
+              ;;
+            200)
+              sha=$(jq -r '.object.sha' /tmp/stableref.json)
+              case "$sha" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                *) echo "stable-ref gate returned an unusable object.sha: $sha"; exit 1 ;;
+              esac
+              curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/git/tags/$sha" -o /tmp/stableobj.json \
+                || { echo "stable tag-object read FAILED (curl transport error); aborting"; exit 1; }
+              message=$(jq -r '.message // ""' /tmp/stableobj.json)
+              prev_tag=$(jq -r '.versionedTag // ""' <<<"$message")
+              case "$prev_tag" in
+                console-snapshot-prod-*) ;;
+                *) echo "the current stable tag object does not carry a valid pointer JSON — refusing to activate on top of an unparseable state"; exit 1 ;;
+              esac
+              echo "the stable ref exists and names ${prev_tag} (mode=update)"
+              echo "ref_mode=update" >> "$GITHUB_OUTPUT"
+              echo "previous_pointer_json=$message" >> "$GITHUB_OUTPUT"
+              echo "previous_versioned_tag=$prev_tag" >> "$GITHUB_OUTPUT"
+              echo "previous_tag_object_sha=$sha" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "stable-ref gate FAILED (unexpected HTTP $code); refusing to treat this as 'ref absent'"; exit 1 ;;
+          esac
+      - name: Activate the dedicated stable reference (create annotated pointer tag object + ONE atomic ref update)
+        # Only reached when: artifact complete + schema-valid + integrity
+        # verified + versioned release published + same-release asset
+        # verification passed (verify-versioned is this job's `needs`) +
+        # pointer JSON re-validated + current ref state read. The pointer
+        # JSON becomes the message of a NEW immutable annotated tag
+        # object; the ref then moves in ONE atomic update. No asset is
+        # ever deleted or overwritten, so the previous last-known-good
+        # artifact remains fully available (its versioned release is
+        # untouched) and a failure here leaves the OLD pointer serving.
+        # THE write-capable credential exists ONLY on this step (and the
+        # rollback step below): the dedicated fine-grained
+        # `GY_RELEASE_PAT` repository secret. The automatic GITHUB_TOKEN
+        # is read-only and is NOT used for the mutations; the PAT reaches
+        # only these pinned gh api invocations — never node, never a
+        # script, never an action, never a downloaded artifact.
+        id: activate
+        env:
+          TAG: ${{ needs.verify-versioned.outputs.versioned_tag }}
+          POINTER_JSON: ${{ needs.verify-versioned.outputs.pointer_json }}
+          REF_MODE: ${{ steps.stablegate.outputs.ref_mode }}
           GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
         run: |
-          gh release edit "$TAG" --repo "$REPO" --latest
-          echo "stable reference activated: $STABLE_SNAPSHOT_URL"
+          new_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+            -f tag="console-snapshot-prod" \
+            -f object="$CHECKOUT_SHA" \
+            -f type="commit" \
+            -f message="$POINTER_JSON" \
+            --jq '.sha')
+          case "$new_sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "tag-object creation returned no usable sha: $new_sha"; exit 1 ;;
+          esac
+          echo "new_tag_object_sha=$new_sha" >> "$GITHUB_OUTPUT"
+          if [ "$REF_MODE" = "create" ]; then
+            gh api --method POST "repos/$REPO/git/refs" \
+              -f ref="$STABLE_REF" \
+              -f sha="$new_sha"
+          else
+            gh api --method PATCH "$STABLE_REF" \
+              -f sha="$new_sha" \
+              -F force=true
+          fi
+          echo "stable ref activation issued: $STABLE_REF -> $new_sha (pointer for $TAG)"
+      - name: Read-back verification (the ref MUST name the created pointer object)
+        # READ-ONLY (automatic token): the ref must now resolve to exactly
+        # the created tag object sha, and that object's message must equal
+        # the pointer JSON byte-for-byte. Any divergence fails the run and
+        # triggers the rollback step below.
+        id: readback
+        if: success()
+        env:
+          POINTER_JSON: ${{ needs.verify-versioned.outputs.pointer_json }}
+          NEW_SHA: ${{ steps.activate.outputs.new_tag_object_sha }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
+        run: |
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$NEW_SHA" ]; then
+            echo "READ-BACK MISMATCH: the stable ref resolves to '$sha', expected the created object '$NEW_SHA'"
+            exit 1
+          fi
+          message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/tags/$NEW_SHA" | jq -r '.message // ""')
+          if [ "$message" != "$POINTER_JSON" ]; then
+            echo "READ-BACK MISMATCH: the activated tag object's message does not equal the validated pointer JSON"
+            exit 1
+          fi
+          echo "read-back verified: refs/tags/console-snapshot-prod -> $NEW_SHA (pointer for ${{ needs.verify-versioned.outputs.versioned_tag }})"
+      - name: Roll back the stable reference to the recorded previous pointer (on any activation/verification failure)
+        # Runs ONLY when the activation or the read-back failed. Restores
+        # the recorded previous pointer: for a first publication (no
+        # previous pointer) it DELETES the ref (restoring the absent
+        # state); otherwise it re-creates a tag object carrying the
+        # PREVIOUS pointer JSON verbatim and re-points the ref to it.
+        # The result is verified by read-back. ANY rollback failure fails
+        # LOUDLY with the stable state reported as UNVERIFIED — the run
+        # NEVER claims restoration without evidence.
+        if: failure()
+        env:
+          REF_MODE: ${{ steps.stablegate.outputs.ref_mode }}
+          PREV_POINTER_JSON: ${{ steps.stablegate.outputs.previous_pointer_json }}
+          PREV_VERSIONED_TAG: ${{ steps.stablegate.outputs.previous_versioned_tag }}
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
+        run: |
+          set +e
+          rollback_ok=false
+          if [ "$REF_MODE" = "create" ]; then
+            echo "first publication: rolling back to the ABSENT stable-ref state (deleting the ref)"
+            gh api --method DELETE "$STABLE_REF" >/dev/null 2>&1 || true
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+            if [ "$code" = "404" ]; then
+              rollback_ok=true
+              echo "rollback VERIFIED: the stable ref is absent again (first-publication state restored)"
+            else
+              echo "rollback verification FAILED: the stable ref read returned HTTP $code (expected 404)"
+            fi
+          else
+            echo "rolling back to the recorded previous pointer (${PREV_VERSIONED_TAG})"
+            prev_commit=$(jq -r '.sourceCommit // ""' <<<"$PREV_POINTER_JSON")
+            case "$prev_commit" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "the recorded previous pointer carries no usable sourceCommit — refusing a blind rollback"; prev_commit="" ;;
+            esac
+            if [ -n "$prev_commit" ]; then
+              old_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+                -f tag="console-snapshot-prod" \
+                -f object="$prev_commit" \
+                -f type="commit" \
+                -f message="$PREV_POINTER_JSON" \
+                --jq '.sha')
+              gh api --method PATCH "$STABLE_REF" -f sha="$old_sha" -F force=true >/dev/null 2>&1 || true
+              sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+              message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/git/tags/$sha" | jq -r '.message // ""')
+              restored_tag=$(jq -r '.versionedTag // ""' <<<"$message")
+              if [ "$sha" = "$old_sha" ] && [ "$message" = "$PREV_POINTER_JSON" ] && [ "$restored_tag" = "$PREV_VERSIONED_TAG" ]; then
+                rollback_ok=true
+                echo "rollback VERIFIED: the stable ref again resolves to ${PREV_VERSIONED_TAG} (tag object $old_sha)"
+              else
+                echo "rollback verification FAILED: ref=$sha expected=$old_sha; restored tag='${restored_tag}' expected='${PREV_VERSIONED_TAG}'"
+              fi
+            fi
+          fi
+          if [ "$rollback_ok" != "true" ]; then
+            echo "==================================================================="
+            echo "ROLLBACK FAILED — the stable reference state is UNVERIFIED."
+            echo "Manual restoration required: re-create the previous pointer tag"
+            echo "object from the recorded JSON (see the run summary) and move"
+            echo "refs/tags/console-snapshot-prod to it, then re-verify."
+            echo "==================================================================="
+            exit 1
+          fi
     outputs:
       versioned_tag: ${{ needs.verify-versioned.outputs.versioned_tag }}
 
@@ -852,20 +1103,22 @@ jobs:
           version: 9
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build:sdk
-      - name: Verify the stable reference serves the activated artifact (post-activation gate)
-        # Review Task 5 #7/#8: the post-activation check requires (a) the
-        # repo-wide latest designation (queried through the authenticated
-        # API) to equal the activated versioned tag — an unrelated
-        # promotion that moved the pointer FAILS the run; and (b) the
-        # three assets fetched through the authenticated API path (the
-        # repository is PRIVATE — the constant latest URL 404s for
-        # unauthenticated requests) to be ONE release's complete
-        # artifact set naming that tag (checksum + digest +
-        # provenance-tag cross-check), so a pointer race DURING the
-        # downloads cannot bless a mixed artifact set. This is a
-        # READ-ONLY job: it runs the reviewed commit's own verification
-        # code with the workflow's READ-ONLY token — no write permission
-        # and no release-write credential exists in this job at all.
+      - name: Verify the stable reference serves the activated artifact (post-activation identity gate)
+        # Sixth round: the post-activation gate verifies the FULL identity
+        # chain over the DEDICATED stable reference
+        # (refs/tags/console-snapshot-prod): ref → annotated tag object →
+        # pointer JSON → pointer.versionedTag must equal the activated
+        # tag → the release record for THAT tag carries THAT tag → the
+        # three assets fetched FROM THAT EXACT RECORD (authenticated API
+        # path — a private repository's release assets 404 for
+        # unauthenticated requests) → checksum + provenance + integrity →
+        # pointer digests over the fetched bytes. A raced ref, an
+        # unexpected pointer target, a mixed artifact set or a digest
+        # divergence FAILS the run (the promote job's rollback step
+        # restores the previous pointer). This is a READ-ONLY job: it
+        # runs the reviewed commit's own verification code with the
+        # workflow's READ-ONLY token — no write permission and no
+        # release-write credential exists in this job at all.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
           GH_TOKEN: ${{ github.token }} # READ-ONLY token (job declares contents: read)
@@ -875,9 +1128,9 @@ jobs:
             console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-notrack) ;;
             *) echo "activated tag fails the strict versioned-tag shape: $TAG"; exit 1 ;;
           esac
-          node --import tsx/esm src/cli.ts verify-release-assets \
-            "$REPO" --tag "$TAG" --scope latest --expected-tag "$TAG"
-          echo "stable reference verified: the latest designation AND the public stable URL serve exactly the activated versioned release's bytes"
+          node --import tsx/esm src/cli.ts verify-stable \
+            "$REPO" --expected-tag "$TAG"
+          echo "stable reference verified: the dedicated console-snapshot-prod ref resolves to ONE verified artifact set naming exactly the activated versioned release"
       - name: Publication summary (includes rollback pointer)
         # Read-only informational summary. The provenance is read from
         # the run-scoped artifact (no token needed); the rollback pointer
@@ -889,18 +1142,24 @@ jobs:
       - name: Write the publication summary
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
-          PREV: ${{ needs.publish.outputs.previous_latest_tag }}
+          PREV: ${{ needs.publish.outputs.previous_versioned_tag }}
+          PREV_POINTER: ${{ needs.publish.outputs.previous_pointer_json }}
           REPO: ${{ github.repository }}
-          STABLE_SNAPSHOT_URL: https://github.com/${{ github.repository }}/releases/latest/download/console-snapshot.json
         run: |
           {
             echo "## ConsoleSnapshot publication"
             echo "- versioned release: \`$TAG\`"
-            echo "- stable reference: \`latest\` release designation (activated via a single metadata promotion)"
-            echo "- stable URL: $STABLE_SNAPSHOT_URL"
-            echo "- rollback pointer (previous latest): \`${PREV:-<none — first publication>}\`"
-            echo "- rollback procedure: promote the previous immutable release recorded above back to the latest designation (single metadata operation), then re-run the stable gate with --expected-tag set to the previous tag to confirm"
-            echo "- Console configuration: \`GY_SNAPSHOT_URL\` = the stable URL above"
+            echo "- stable reference: the DEDICATED \`refs/tags/console-snapshot-prod\` annotated pointer tag (owner-selected architecture; the repo-wide latest designation is NOT the production pointer)"
+            echo "- production resolution: \`GET /repos/$REPO/git/ref/tags/console-snapshot-prod\` → \`GET /repos/$REPO/git/tags/<object.sha>\` → pointer JSON in the tag-object message → fetch assets from \`releases/download/<pointer.versionedTag>/<asset>\` and verify the pointer's SHA-256 digests"
+            echo "- rollback pointer (previous stable target): \`${PREV:-<none — first publication>}\`"
+            if [ -n "$PREV_POINTER" ]; then
+              echo "- previous pointer JSON (recorded verbatim for rollback):"
+              echo '```json'
+              echo "$PREV_POINTER"
+              echo '```'
+            fi
+            echo "- rollback procedure: re-create the previous pointer tag object (\`gh api POST /git/tags\` with the recorded pointer JSON as the message) and move \`refs/tags/console-snapshot-prod\` to it (\`gh api PATCH /git/refs\`, force), then re-run \`verify-stable --expected-tag <previous tag>\` to confirm"
+            echo "- Console configuration (REQUIRES the documented Console-side change — see docs/SNAPSHOT_PUBLICATION.md §9/§13): the Console must resolve the dedicated stable reference through the two-step chain above; \`GY_SNAPSHOT_URL\` (single-GET of the latest URL) no longer matches the production mechanism"
             echo
             echo '```json'
             cat bundle/console-snapshot-provenance.json

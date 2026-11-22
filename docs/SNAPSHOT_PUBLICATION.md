@@ -36,6 +36,13 @@ release with `gh release upload --clobber`. That design is rejected:
 
 ## 3. Selected design — latest-release promotion
 
+> **SUPERSEDED (sixth round, 2026-11-22):** the owner SELECTED the
+> dedicated `console-snapshot-prod` stable-reference architecture —
+> see §9 (the recorded decision) and §13 (the exact production
+> resolution mechanism). This section is retained as the historical
+> record of the interim repo-wide-latest design, which is no longer the
+> production path.
+
 Every publication is an immutable, versioned release tagged
 `console-snapshot-prod-<YYYYMMDDTHHMMSSZ>-<source-commit-12>` created
 with `--latest=false` (so creating it never moves the stable pointer).
@@ -268,86 +275,77 @@ owner-provided token (evidence recorded in the PR remediation report):
   `console-snapshot-prod-*` namespace so versioned snapshot tags become
   GitHub-enforced immutable.
 
-## 9. Stable-reference architecture decision (PR #5 remediation — review Task 2)
+## 9. Stable-reference architecture decision (PR #5 remediation — review Task 2; DECIDED — sixth round)
 
 The originally approved GY-M1-INT-001 design specified a DEDICATED
 stable reference named `console-snapshot-prod`. PR #5 implemented the
 repo-wide latest-release promotion instead — a MATERIAL architecture
-change that this remediation does NOT treat as owner-approved. Both
-alternatives are documented here; the decision is an explicit OWNER
-APPROVAL GATE.
+change. **On 2026-11-22 the owner explicitly selected the dedicated
+architecture**, and the sixth-round correction implements it. The
+alternatives are retained below for the audit record.
 
-### Option A — dedicated stable reference (`console-snapshot-prod`)
+### Option A — dedicated stable reference (`console-snapshot-prod`) — SELECTED AND IMPLEMENTED
 
-Keep a permanent stable release/tag named `console-snapshot-prod` and
-make it always point at the last-known-good artifact.
+The production stable reference is the git ref
+`refs/tags/console-snapshot-prod` — an ANNOTATED tag whose tag-object
+MESSAGE carries the stable-pointer JSON
+(`graveyield.console-snapshot-stable-pointer.v1`) naming ONE immutable
+versioned release (tag + source commit + per-asset SHA-256 digests and
+byte lengths). The pointer bytes are NEVER copied onto the stable
+reference: the snapshot/provenance/checksum live exclusively on
+immutable versioned releases, so the reference cannot become a second
+mutable copy of the payload.
 
-* **Safety requirement it must satisfy:** the currently served artifact
-  stays available until the replacement is verified and activated; no
-  missing-asset window; no mixed snapshot/provenance set.
-* **The GitHub-native mechanisms available, and why each fails the
-  requirement:**
-  1. *Asset clobbering on the stable release* (`gh release upload
-     --clobber`) — REJECTED (see §2): per-asset delete-then-create is
-     not atomic; a failed upload can permanently destroy the
-     last-known-good bytes.
-  2. *A pointer artifact* (a small stable file naming the versioned
-     release's URL) — the pointer file itself needs a stable, atomically
-     updatable location: the same problem one level down. Consuming it
-     ALSO requires a Console change (the Console fetches one fixed URL
-     and validates schema-v2; a pointer indirection is not in the
-     shipped consumer contract), i.e. an explicit Console-side scope
-     change.
-  3. *GitHub Pages* hosting a pointer file — separate deployment
-     pipeline and a second production system; a new production
-     architecture that requires owner authorization and cannot be
-     invented by this PR.
-* **Status: NOT implementable with the required safety property on
-  GitHub natively today.** If the owner requires Option A, the realistic
-  path is option 2 or 3 above plus an authorized Console change — a
-  decision and a scope extension that belong to the owner, not to this
-  PR.
+**The exact GitHub mechanism** (deliberately NOT treating release tag,
+release name and latest designation as interchangeable):
 
-### Option B — repository-wide latest release (current implementation)
+1. Promotion builds the pointer JSON from the VERIFIED release bytes
+   (read-only bundle step, `stable-pointer-build`).
+2. The privileged step creates a NEW immutable annotated tag object
+   (`POST /repos/{repo}/git/tags`, `message` = pointer JSON,
+   `object` = the release's source commit).
+3. The ref is then moved with ONE atomic update (`PATCH
+   /repos/{repo}/git/refs/tags/console-snapshot-prod`, force; on a
+   first publication the ref is CREATED via `POST /git/refs`). A reader
+   of the ref sees the old pointer or the new pointer — never a missing
+   window or a partial state.
+4. Read-back verification (read-only) confirms the ref resolves to the
+   created object sha and its message equals the validated pointer JSON,
+   byte-for-byte.
 
-Publish immutable versioned releases and promote one to "latest" after
-full verification (§3). The stable URL is the constant
-`releases/latest/download/console-snapshot.json`.
+**Why this satisfies the safety property** (answering §3-era objections):
 
-* **What it buys:** the last-known-good property with GitHub-native
-  semantics only (verified live: one release's bytes via one redirect,
-  pointer = single metadata field, drafts/prereleases excluded).
-* **What it costs:** the pointer is REPO-WIDE. An unrelated
-  non-draft, non-prerelease release would take it over. Required
-  compensating policy (documented, NOT technically enforceable from
-  inside this repository's workflows):
-  1. **Exclusive promotion policy:** every non-draft, non-prerelease
-     release in `grave-indexer` must be a console-snapshot versioned
-     release; other content must be released elsewhere or flagged
-     prerelease/draft.
-  2. **Operational responsibility:** the owner (or a delegated
-     maintainer) owns release hygiene in this repository; any other
-     workflow or actor that can create releases is in scope of this
-     policy.
-  3. **Rollback mechanism:** `gh release edit <previous-tag> --latest`
-     + `verify-release-assets --scope latest --expected-tag
-     <previous-tag>` (the workflow prints both in its run summary).
-  4. **Detection (implemented):** the post-activation gate fails the
-     run if the latest designation does not equal the activated tag —
-     so a racing unrelated promotion is at least never mistaken for a
-     successful publication.
-* **Status: implemented as the interim mechanism. It remains subject to
-  the owner's explicit approval of the repo-wide-latest architecture
-  and the exclusive promotion policy above.** This PR does not claim
-  that approval; the decision is restated as a blocker in the PR report.
+* The previously rejected mechanism — asset clobbering on a stable
+  release (`gh release upload --clobber`) — is NOT atomic per asset and
+  can destroy the last-known-good bytes. This design deletes and
+  overwrites NO assets at all: the only mutable thing is the ref, and a
+  ref update is a single atomic operation.
+* The previously open question "the pointer file needs a stable,
+  atomically updatable location" is answered by the git ref itself:
+  annotated tag objects are immutable git objects re-created per
+  promotion, and the ref update is atomic.
+* The stable reference is DEDICATED: an unrelated release taking the
+  repo-wide latest designation cannot move it (verified by test).
+* Rollback: the previous pointer JSON is recorded BEFORE the mutation
+  (run summary + job output + the new pointer's `previous*` fields);
+  rollback re-creates a tag object carrying the previous pointer
+  verbatim, re-points the ref, and verifies by read-back — it does not
+  depend on the old tag object remaining reachable. An unverifiable
+  rollback fails loudly (the state is reported UNVERIFIED, never
+  claimed restored).
+* Residual limitation (disclosed): a reader racing the ref update may
+  see either pointer; every consumer MUST verify the fetched bytes
+  against the pointer digests (fail-closed), which is part of the
+  documented Console contract (§13).
 
-### The decision the owner is asked to make
+### Option B — repository-wide latest release (SUPERSEDED interim implementation)
 
-> Approve one of: (A) dedicated stable reference, accepting that it
-> requires a pointer-artifact/Pages mechanism AND a Console change, or
-> (B) repo-wide latest-release promotion, accepting the exclusive
-> promotion policy and the residual repo-wide-pointer risk. Until the
-> decision is recorded, no production publication should be dispatched.
+Retired from the production path by the owner's decision. The historical
+mechanism (immutable versioned releases + a single `make_latest` metadata
+promotion + the exclusive-promotion policy) is documented in the git
+history of this file and in §3. The `verify-release-assets --scope
+latest` CLI capability and the `releases/latest/download/...` URL helpers
+survive only as non-production utilities and tests.
 
 ## 10. Remediation hardening (PR #5 — review Tasks 1, 4, 5)
 
@@ -487,8 +485,8 @@ never accessed while preparing this change.
 
 | Credential | Where it exists | What it can do |
 | --- | --- | --- |
-| `github.token` (automatic) | ALL SEVEN jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, latest-designation query, authenticated asset fetches during verification) |
-| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly TWO steps: the `release` job's `gh release create/upload` step and the `promote` job's single `gh release edit --latest` step | GitHub release mutations (create immutable versioned release, upload its three assets, flip the latest designation) |
+| `github.token` (automatic) | ALL SEVEN jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, stable-ref and tag-object reads, authenticated asset fetches during verification, post-activation read-back) |
+| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly THREE steps: the `release` job's `gh release create/upload` step; the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
 | `ACTIONS_RUNTIME_TOKEN` | Managed by GitHub for `actions/upload-artifact` / `actions/download-artifact` inside one workflow run | Run-scoped artifact transport only; not a `github.token` input |
 | `MAINNET_RPC_URL` / `DEVNET_RPC_URL` | `generate` job env (RPC access for snapshot generation) | RPC endpoints; no GitHub capability |
 
@@ -503,7 +501,10 @@ token at all — NEVER the PAT. The release and promote jobs hold the PAT
 but contain ZERO custom code: no checkout, no dependency installation,
 no node, no repository script, no artifact-executed code — the only
 commands that can read the credential are the pinned `gh release`
-mutation invocations themselves.
+mutation invocations and the pinned `gh api` git-data mutations of the
+dedicated stable reference (create the pointer tag object, move the
+ref, and the failure-path rollback, which also reads back what it just
+wrote to verify its own mutation).
 
 ### Trust assumptions (owner-side, not verifiable from this repository)
 
@@ -645,3 +646,78 @@ Consequences, stated precisely:
 Nothing in this addendum changes the credential model of §11, the
 workflow structure, or any release state: no release was created,
 modified or promoted in the course of documenting this.
+
+## 13. Console integration — the dedicated stable reference (sixth round)
+
+The owner-selected architecture changes the production resolution
+mechanism. The shipped `graveyield-console` contract (an UNAUTHENTICATED
+single GET of `GY_SNAPSHOT_URL` = the repo-wide latest URL, expecting the
+snapshot JSON) can no longer consume the production stable reference:
+there is no single-GET URL behind the dedicated ref.
+
+### 13.1 The exact production resolution mechanism
+
+```
+1. GET https://api.github.com/repos/GraveYield/grave-indexer/git/ref/tags/console-snapshot-prod
+   → { object: { sha: <tag object sha>, type: "tag" } }
+2. GET https://api.github.com/repos/GraveYield/grave-indexer/git/tags/<tag object sha>
+   → { message: <stable-pointer JSON>, object: { sha: <source commit> } }
+3. Parse `message` as graveyield.console-snapshot-stable-pointer.v1 (strict).
+4. GET https://github.com/GraveYield/grave-indexer/releases/download/<pointer.versionedTag>/console-snapshot.json
+   (+ the provenance and checksum assets from the SAME versioned tag)
+5. Verify: sha256(bytes) == pointer.snapshot.sha256, byte length matches,
+   provenance names pointer.versionedTag and pointer.sourceCommit.
+   Only then parse and render (fail-closed on any mismatch).
+```
+
+Steps 1–2 are unauthenticated on the public repository (the standard
+GitHub API rate limit applies; a server-side proxy is the recommended
+hardening if higher throughput is ever needed).
+
+### 13.2 REQUIRED future Console configuration change (owner approval gate)
+
+The Console change itself is OUTSIDE this task's authorization and is
+NOT implemented here. What the owner must approve and ship:
+
+1. Replace the single-GET `GY_SNAPSHOT_URL` contract with the two-step
+   resolution above (a small server-side fetch in the Console's data
+   layer — the pointer indirection is browser-safe; no credential is
+   involved).
+2. Keep every existing fail-closed property: schema-v2 validation,
+   freshness, and the NEW pointer-digest verification before rendering.
+3. Until that change ships, the Console cannot consume publications
+   under this architecture: production snapshot ingestion is BLOCKED on
+   the Console change (do not dispatch a production publication before
+   the Console resolves the dedicated reference, or accept the outage).
+
+### 13.3 Rollback procedure (operator)
+
+1. Locate the recorded previous pointer JSON: it is printed in the
+   publication run summary (`previous pointer JSON (recorded
+   verbatim for rollback)`) AND carried in the current pointer's
+   `previousVersionedTag`/`previousTagObjectSha` fields.
+2. Re-create the previous pointer tag object:
+   `gh api --method POST repos/:repo/git/tags -f tag=console-snapshot-prod -f object=<pointer.sourceCommit> -f type=commit -f message=<previous pointer JSON>`
+3. Move the ref:
+   `gh api --method PATCH repos/:repo/git/refs/tags/console-snapshot-prod -f sha=<new sha> -F force=true`
+4. Verify:
+   `release-ops verify-stable <owner/repo> --expected-tag <previous versioned tag>`
+   — exit 0 is the ONLY acceptable evidence of restoration. If any
+   step fails, the stable state is UNVERIFIED: do not claim restoration
+   without this evidence.
+5. The workflow performs exactly this sequence automatically (the
+   promote job's rollback step) when post-activation verification fails,
+   and fails loudly when it cannot verify the result.
+
+### 13.4 How to independently verify the stable target
+
+```
+release-ops verify-stable <owner/repo> --expected-tag <versioned tag>
+```
+
+exit 0 proves the FULL identity chain: ref → annotated tag object →
+pointer → `pointer.versionedTag === <tag>` → release record identity →
+the three assets FROM THAT EXACT RECORD → checksum + provenance +
+integrity → pointer digests over the fetched bytes. The command
+authenticates with a READ-scoped token when one is in the environment
+and falls back to unauthenticated reads on a public repository.

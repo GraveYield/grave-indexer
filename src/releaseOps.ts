@@ -65,12 +65,19 @@ import {
   PROVENANCE_ASSET_NAME,
   SNAPSHOT_ASSET_NAME,
   SnapshotPublicationError,
+  STABLE_TAG,
   verifySnapshotIntegrity,
   stableProvenanceUrl,
+  stableRefApiUrl,
   stableSnapshotUrl,
+  stableTagObjectApiUrl,
   verifyChecksumFile,
   versionedAssetUrl,
+  buildStablePointer,
+  parseStablePointer,
+  verifyStablePointerMatchesArtifacts,
   type PublicationProvenance,
+  type StablePointerV1,
 } from "./snapshotPublication.js";
 
 // ─── Error taxonomy ────────────────────────────────────────────────────────
@@ -478,4 +485,328 @@ export async function verifyReleaseAssetSet(args: {
     }
     throw err;
   }
+}
+
+// ─── 3. Dedicated stable reference — resolve, verify, build (sixth round) ──
+//
+// The owner-selected stable reference is the git ref
+// `refs/tags/console-snapshot-prod`: an ANNOTATED tag whose tag-object
+// message carries the stable-pointer JSON (graveyield.console-snapshot-
+// stable-pointer.v1) naming ONE immutable versioned release. This module
+// is strictly READ-ONLY: the ref mutations live in the workflow's
+// privileged `gh api` steps (the release-ops bundle must never hold the
+// release-write credential).
+//
+// IDENTITY CHAIN (every link fail-closed):
+//   ref → tag object → parse pointer → pointer.versionedTag === expected
+//   → release record by THAT tag (record.tag_name === pointer.versionedTag)
+//   → assets from THAT exact record → checksum + provenance + integrity
+//   → pointer digests must match the fetched bytes.
+
+/** Outcome of resolving the dedicated stable reference. `kind: "none"` is
+ * produced EXCLUSIVELY by a genuine HTTP 404 — "the ref does not exist
+ * yet" (first publication). Every other failure is a thrown error. */
+export type StableRefResolution =
+  | { kind: "none"; detail: string }
+  | { kind: "found"; tagObjectSha: string; objectType: string };
+
+const HEX40 = /^[0-9a-f]{40}$/;
+
+/**
+ * Resolve the dedicated stable reference (`refs/tags/console-snapshot-prod`).
+ * Same fail-closed classification as `resolveLatestRelease`: 404 = none,
+ * 200 = found (tag object sha), everything else typed.
+ */
+export async function resolveStableRef(args: { repository: string; http?: HttpImpl }): Promise<StableRefResolution> {
+  const http = args.http ?? defaultHttp;
+  let res: MinimalHttpResponse;
+  try {
+    res = await http(stableRefApiUrl(args.repository));
+  } catch (err) {
+    throw new ReleaseOpsError("NETWORK", `stable-ref query failed: ${String((err as Error).message ?? err)}`);
+  }
+  if (res.status === 404) {
+    return { kind: "none", detail: `HTTP 404 from git/ref/tags/${STABLE_TAG} — the stable reference does not exist yet (first publication)` };
+  }
+  if (res.status === 200) {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch (err) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", `stable-ref response is not JSON: ${String((err as Error).message ?? err)}`, 200);
+    }
+    if (typeof body !== "object" || body === null) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable-ref response is not a JSON object", 200);
+    }
+    const object = (body as { object?: { sha?: unknown; type?: unknown } }).object;
+    if (typeof object !== "object" || object === null || typeof object.sha !== "string" || !HEX40.test(object.sha)) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable-ref response carries no usable object.sha", 200);
+    }
+    return {
+      kind: "found",
+      tagObjectSha: object.sha,
+      objectType: typeof object.type === "string" ? object.type : "<unknown>",
+    };
+  }
+  if (res.status === 401) {
+    throw new ReleaseOpsError("AUTHENTICATION", "stable-ref query rejected the credentials", 401);
+  }
+  if (res.status === 403 || res.status === 429) {
+    const remaining = res.headers.get("x-ratelimit-remaining");
+    if (res.status === 429 || remaining === "0") {
+      throw new ReleaseOpsError("RATE_LIMIT", "GitHub API rate limit exhausted during stable-ref query", res.status);
+    }
+    throw new ReleaseOpsError("PERMISSION", "stable-ref query was denied (token lacks repository access)", res.status);
+  }
+  if (res.status >= 500) {
+    throw new ReleaseOpsError("API_OUTAGE", `api.github.com unavailable during stable-ref query (HTTP ${res.status})`, res.status);
+  }
+  throw new ReleaseOpsError("UNEXPECTED_STATUS", `stable-ref query returned an unexpected HTTP status`, res.status);
+}
+
+/** The stable pointer plus the annotated tag object's identity. */
+export interface StablePointerResolution {
+  pointer: StablePointerV1;
+  /** The annotated tag object sha this pointer was read from. */
+  tagObjectSha: string;
+  /** The commit the tag object points at (the versioned release's source commit). */
+  commitSha: string;
+}
+
+/**
+ * Fetch the annotated tag object behind the stable ref and parse its
+ * message as the stable-pointer JSON. The message parse is strict
+ * (`parseStablePointer`); any malformed message is a typed failure.
+ */
+export async function fetchStablePointer(args: {
+  repository: string;
+  tagObjectSha: string;
+  http?: HttpImpl;
+}): Promise<StablePointerResolution> {
+  if (!HEX40.test(args.tagObjectSha)) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", `tag object sha ${JSON.stringify(args.tagObjectSha)} is not 40-hex — refusing to query`);
+  }
+  const http = args.http ?? defaultHttp;
+  let res: MinimalHttpResponse;
+  try {
+    res = await http(stableTagObjectApiUrl(args.repository, args.tagObjectSha));
+  } catch (err) {
+    throw new ReleaseOpsError("NETWORK", `stable tag-object query failed: ${String((err as Error).message ?? err)}`);
+  }
+  if (res.status === 404) {
+    throw new ReleaseOpsError("NOT_FOUND", `the stable-ref tag object ${args.tagObjectSha} does not exist — the ref is dangling; refusing to interpret`, 404);
+  }
+  if (res.status === 401) {
+    throw new ReleaseOpsError("AUTHENTICATION", "stable tag-object query rejected the credentials", 401);
+  }
+  if (res.status === 403 || res.status === 429) {
+    const remaining = res.headers.get("x-ratelimit-remaining");
+    if (res.status === 429 || remaining === "0") {
+      throw new ReleaseOpsError("RATE_LIMIT", "GitHub API rate limit exhausted during stable tag-object query", res.status);
+    }
+    throw new ReleaseOpsError("PERMISSION", "stable tag-object query was denied (token lacks repository access)", res.status);
+  }
+  if (res.status >= 500) {
+    throw new ReleaseOpsError("API_OUTAGE", `api.github.com unavailable during stable tag-object query (HTTP ${res.status})`, res.status);
+  }
+  if (res.status !== 200) {
+    throw new ReleaseOpsError("UNEXPECTED_STATUS", `stable tag-object query returned an unexpected HTTP status`, res.status);
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (err) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", `stable tag-object response is not JSON: ${String((err as Error).message ?? err)}`, 200);
+  }
+  if (typeof body !== "object" || body === null) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object response is not a JSON object", 200);
+  }
+  const record = body as { message?: unknown; object?: { sha?: unknown } };
+  if (typeof record.message !== "string" || record.message.length === 0) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object carries no message — not an annotated pointer tag", 200);
+  }
+  let pointer: StablePointerV1;
+  try {
+    pointer = parseStablePointer(record.message);
+  } catch (err) {
+    if (err instanceof SnapshotPublicationError) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", `stable pointer parse failed: ${err.message}`, 200);
+    }
+    throw err;
+  }
+  const commitSha = record.object && typeof record.object.sha === "string" ? record.object.sha : "<none>";
+  return { pointer, tagObjectSha: args.tagObjectSha, commitSha };
+}
+
+/** The verified versioned artifact triple (internal shared loader). */
+interface VerifiedVersionedArtifacts {
+  snapshotBytes: Uint8Array;
+  provenanceBytes: Uint8Array;
+  checksumBytes: Uint8Array;
+  provenance: PublicationProvenance;
+}
+
+/**
+ * Fetch a versioned release's OWN asset triple and verify it completely:
+ * record identity, checksum file, provenance parse, provenance tag and
+ * byte integrity. Shared by `verifyStableReference` and
+ * `buildStablePointerForRelease`.
+ */
+async function loadVerifiedVersionedArtifacts(args: {
+  repository: string;
+  tag: string;
+  expectedTag: string;
+  authToken?: string;
+}): Promise<VerifiedVersionedArtifacts> {
+  const http = args.authToken !== undefined ? authedHttp(args.authToken) : defaultHttp;
+  const record = await fetchReleaseRecord(args.repository, args.tag, http);
+  if (record.tag_name !== args.tag) {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `release lookup returned tag_name ${String(record.tag_name ?? "<none>")}, expected ${args.tag} — refusing to verify a mismatched release record`,
+      200,
+    );
+  }
+  let snapshotBytes: Uint8Array;
+  let provenanceBytes: Uint8Array;
+  let checksumBytes: Uint8Array;
+  if (args.authToken !== undefined) {
+    ({ snapshotBytes, provenanceBytes, checksumBytes } = await fetchAssetsFromRecord(record, args.authToken));
+  } else {
+    const urls = assetUrls(args.repository, args.tag, "versioned");
+    snapshotBytes = await defaultFetchAsset(urls.snapshot);
+    provenanceBytes = await defaultFetchAsset(urls.provenance);
+    checksumBytes = await defaultFetchAsset(urls.checksum);
+  }
+  verifyChecksumFile(snapshotBytes, checksumBytes, SNAPSHOT_ASSET_NAME);
+  let provenance: PublicationProvenance;
+  try {
+    provenance = JSON.parse(Buffer.from(provenanceBytes).toString("utf8")) as PublicationProvenance;
+  } catch (err) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", `provenance sidecar is not JSON: ${String((err as Error).message ?? err)}`);
+  }
+  if (provenance.versionedTag !== args.expectedTag) {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `provenance names release ${provenance.versionedTag ?? "<none>"}, expected ${args.expectedTag} — the fetched files are a MIXED artifact set`,
+    );
+  }
+  try {
+    verifySnapshotIntegrity(snapshotBytes, provenance);
+  } catch (err) {
+    if (err instanceof SnapshotPublicationError) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", `integrity verification failed: ${err.message}`);
+    }
+    throw err;
+  }
+  return { snapshotBytes, provenanceBytes, checksumBytes, provenance };
+}
+
+/**
+ * Verify the DEDICATED stable reference end-to-end (sixth-round Task 4
+ * identity chain). The stable reference must resolve to a concrete
+ * versioned release identity, and the assets must be verified against
+ * THAT exact identity — never against a moving alias:
+ *
+ *   1. the ref exists and its annotated tag object parses as a pointer;
+ *   2. the pointer names EXACTLY `expectedTag` (an unexpected release is
+ *      a typed failure — no assets are downloaded from it);
+ *   3. the release record for the pointer's tag carries THAT tag;
+ *   4. the three assets come from that exact record;
+ *   5. checksum + provenance + integrity verify over the bytes;
+ *   6. the pointer digests/lengths match the fetched bytes, the
+ *      provenance names the pointer's tag, and the pointer's
+ *      sourceCommit matches the provenance commit.
+ */
+export async function verifyStableReference(args: {
+  repository: string;
+  expectedTag: string;
+  authToken?: string;
+}): Promise<StablePointerResolution> {
+  const http = args.authToken !== undefined ? authedHttp(args.authToken) : defaultHttp;
+  const resolution = await resolveStableRef({ repository: args.repository, http });
+  if (resolution.kind === "none") {
+    throw new ReleaseOpsError("NOT_FOUND", `the dedicated stable reference (${STABLE_TAG}) does not exist — the stable pointer is missing`, 404);
+  }
+  const stable = await fetchStablePointer({ repository: args.repository, tagObjectSha: resolution.tagObjectSha, http });
+  if (stable.pointer.versionedTag !== args.expectedTag) {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `the stable reference points to ${stable.pointer.versionedTag}, expected ${args.expectedTag} — the stable reference resolved to an unexpected release; refusing to verify assets it does not name`,
+      200,
+    );
+  }
+  const artifacts = await loadVerifiedVersionedArtifacts({
+    repository: args.repository,
+    tag: stable.pointer.versionedTag,
+    expectedTag: stable.pointer.versionedTag,
+    ...(args.authToken !== undefined ? { authToken: args.authToken } : {}),
+  });
+  try {
+    verifyStablePointerMatchesArtifacts({
+      pointer: stable.pointer,
+      snapshotBytes: artifacts.snapshotBytes,
+      provenanceBytes: artifacts.provenanceBytes,
+      checksumBytes: artifacts.checksumBytes,
+      provenance: artifacts.provenance,
+    });
+  } catch (err) {
+    if (err instanceof SnapshotPublicationError) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", `stable pointer identity verification failed: ${err.message}`);
+    }
+    throw err;
+  }
+  return stable;
+}
+
+/**
+ * Verify a versioned release and BUILD the stable pointer JSON for it
+ * (read-only preparation for the workflow's privileged activation step:
+ * the bundle builds and emits the pointer; ONLY the workflow's `gh api`
+ * steps — holding the release-write credential — create the tag object
+ * and move the ref). Also resolves the CURRENT stable pointer as the
+ * rollback reference (recorded BEFORE the mutation).
+ */
+export async function buildStablePointerForRelease(args: {
+  repository: string;
+  tag: string;
+  expectedTag: string;
+  authToken?: string;
+  http?: HttpImpl;
+}): Promise<{
+  pointer: StablePointerV1;
+  pointerJson: string;
+  previous: { versionedTag: string; tagObjectSha: string } | null;
+}> {
+  const http = args.authToken !== undefined ? authedHttp(args.authToken) : (args.http ?? defaultHttp);
+  const artifacts = await loadVerifiedVersionedArtifacts({
+    repository: args.repository,
+    tag: args.tag,
+    expectedTag: args.expectedTag,
+    ...(args.authToken !== undefined ? { authToken: args.authToken } : {}),
+  });
+  const sourceCommit = artifacts.provenance.indexerSourceCommitSha;
+  if (sourceCommit === null || !HEX40.test(sourceCommit)) {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `the provenance carries no usable source commit (${String(artifacts.provenance.indexerSourceCommitSha ?? "<none>")}) — the stable pointer cannot be built without one`,
+      200,
+    );
+  }
+  const resolution = await resolveStableRef({ repository: args.repository, http });
+  let previous: { versionedTag: string; tagObjectSha: string } | null = null;
+  if (resolution.kind === "found") {
+    const current = await fetchStablePointer({ repository: args.repository, tagObjectSha: resolution.tagObjectSha, http });
+    previous = { versionedTag: current.pointer.versionedTag, tagObjectSha: resolution.tagObjectSha };
+  }
+  const built = buildStablePointer({
+    versionedTag: args.expectedTag,
+    sourceCommit,
+    publishedAtUnixMs: artifacts.provenance.snapshotGeneratedAtUnixMs,
+    snapshotBytes: artifacts.snapshotBytes,
+    provenanceBytes: artifacts.provenanceBytes,
+    checksumBytes: artifacts.checksumBytes,
+    previous,
+  });
+  return { pointer: built.pointer, pointerJson: built.pointerJson, previous };
 }

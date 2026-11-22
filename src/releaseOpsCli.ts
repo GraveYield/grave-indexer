@@ -44,8 +44,12 @@ import { pathToFileURL } from "node:url";
 import {
   ReleaseOpsError,
   authedHttp,
+  buildStablePointerForRelease,
+  fetchStablePointer,
+  resolveStableRef,
   resolveLatestRelease,
   verifyReleaseAssetSet,
+  verifyStableReference,
   type AssetScope,
 } from "./releaseOps.js";
 
@@ -162,6 +166,117 @@ export async function cmdVerifyReleaseAssets(args: {
   }
 }
 
+/**
+ * `stable-pointer-current` — READ-ONLY discovery of the dedicated stable
+ * reference (`refs/tags/console-snapshot-prod`) for rollback bookkeeping.
+ *
+ * Output protocol (machine-consumed by the workflow via GITHUB_OUTPUT):
+ *   * kind=none|found  tag=<versioned tag or empty>  sha=<tag object sha or empty>
+ *     pointer_json=<compact pointer JSON or empty>
+ * `kind: none` is produced ONLY by a genuine HTTP 404 from the stable-ref
+ * endpoint (first publication). Any other failure prints the typed
+ * category to stderr and exits non-zero.
+ */
+export async function cmdStablePointerCurrent(repository: string): Promise<number> {
+  const token = githubApiToken();
+  try {
+    const resolution = await resolveStableRef({ repository, ...(token ? { http: authedHttp(token) } : {}) });
+    if (resolution.kind === "none") {
+      console.error(`stable-pointer-current: ${resolution.detail}`);
+      console.log("kind=none");
+      console.log("tag=");
+      console.log("sha=");
+      console.log("pointer_json=");
+    } else {
+      const stable = await fetchStablePointer({ repository, tagObjectSha: resolution.tagObjectSha, ...(token ? { http: authedHttp(token) } : {}) });
+      console.error(`stable-pointer-current: stable reference resolves to ${stable.pointer.versionedTag} (tag object ${resolution.tagObjectSha})`);
+      console.log("kind=found");
+      console.log(`tag=${stable.pointer.versionedTag}`);
+      console.log(`sha=${resolution.tagObjectSha}`);
+      console.log(`pointer_json=${JSON.stringify(stable.pointer)}`);
+    }
+    return 0;
+  } catch (err) {
+    if (err instanceof ReleaseOpsError) {
+      console.error(`stable-pointer-current: refusing to guess the rollback pointer — ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+/**
+ * `stable-pointer-build` — READ-ONLY preparation for activation: verify
+ * the versioned release's own asset triple (identity + checksum +
+ * provenance + integrity), build the stable-pointer JSON from the
+ * VERIFIED bytes, and resolve the CURRENT stable pointer as the rollback
+ * reference. The pointer JSON crosses the job boundary as an output; the
+ * actual ref mutation happens ONLY in the workflow's privileged `gh api`
+ * steps — this bundle code NEVER holds the release-write credential.
+ *
+ * Output protocol (machine-consumed via GITHUB_OUTPUT):
+ *   * pointer_json=<compact pointer JSON>
+ *     previous_kind=none|found
+ *     previous_versioned_tag=<...>  previous_tag_object_sha=<...>
+ */
+export async function cmdStablePointerBuild(args: { repository: string; tag: string; expectedTag: string }): Promise<number> {
+  const token = githubApiToken();
+  try {
+    const built = await buildStablePointerForRelease({
+      repository: args.repository,
+      tag: args.tag,
+      expectedTag: args.expectedTag,
+      ...(token ? { authToken: token } : {}),
+    });
+    console.error(
+      `stable-pointer-build: verified ${built.pointer.versionedTag} (snapshot ${built.pointer.snapshot.sha256}, ${built.pointer.snapshot.byteLength} bytes); previous stable pointer: ${built.previous?.versionedTag ?? "<none — first publication>"}`,
+    );
+    console.log(`pointer_json=${built.pointerJson}`);
+    console.log(`previous_kind=${built.previous === null ? "none" : "found"}`);
+    console.log(`previous_versioned_tag=${built.previous?.versionedTag ?? ""}`);
+    console.log(`previous_tag_object_sha=${built.previous?.tagObjectSha ?? ""}`);
+    return 0;
+  } catch (err) {
+    if (err instanceof ReleaseOpsError) {
+      console.error(`stable-pointer-build: refusing to build the pointer — ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
+/**
+ * `verify-stable` — post-activation identity gate for the DEDICATED
+ * stable reference (owner-selected architecture). Verifies the FULL
+ * identity chain: ref → annotated tag object → pointer JSON →
+ * `pointer.versionedTag === expected-tag` → release record identity →
+ * the three assets FROM THAT EXACT RECORD → checksum + provenance +
+ * integrity → pointer digests over the fetched bytes. An unexpected
+ * pointer target, a raced ref, a mixed artifact set or a digest
+ * divergence is a typed failure — the workflow rolls back or reports
+ * failure, never success.
+ */
+export async function cmdVerifyStable(args: { repository: string; expectedTag: string }): Promise<number> {
+  const token = githubApiToken();
+  try {
+    const stable = await verifyStableReference({
+      repository: args.repository,
+      expectedTag: args.expectedTag,
+      ...(token ? { authToken: token } : {}),
+    });
+    console.error(
+      `verify-stable: OK — the stable reference (refs/tags/console-snapshot-prod, tag object ${stable.tagObjectSha}) resolves to ONE verified artifact set naming ${args.expectedTag} (source commit ${stable.pointer.sourceCommit}; snapshot digest ${stable.pointer.snapshot.sha256})`,
+    );
+    return 0;
+  } catch (err) {
+    if (err instanceof ReleaseOpsError) {
+      console.error(`verify-stable: FAILED — ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
 const USAGE = `grave-indexer release-ops — the GitHub-facing commands the privileged publication job runs
 
   release-ops release-latest <owner/repo>
@@ -170,8 +285,17 @@ const USAGE = `grave-indexer release-ops — the GitHub-facing commands the priv
       non-zero (never guessed).
   release-ops verify-release-assets <owner/repo> --tag <tag> --scope versioned|latest --expected-tag <tag>
       Same-release verification of snapshot + provenance + checksum;
-      --scope latest additionally requires the repo-wide latest
-      designation to equal the expected tag.
+      --scope latest requires the repo-wide latest designation to equal
+      the expected tag (NON-production utility — the production stable
+      reference is the dedicated console-snapshot-prod ref).
+  release-ops stable-pointer-current <owner/repo>
+      Read the dedicated stable reference (refs/tags/console-snapshot-prod)
+      for rollback bookkeeping: kind=none ONLY on a genuine 404.
+  release-ops stable-pointer-build <owner/repo> --tag <tag> --expected-tag <tag>
+      Verify the versioned release and build the stable-pointer JSON
+      (read-only preparation for the privileged activation step).
+  release-ops verify-stable <owner/repo> --expected-tag <tag>
+      Post-activation identity gate over the dedicated stable reference.
 `;
 
 /** Dispatch for the standalone bundle. argv excludes node and the script path. */
@@ -196,6 +320,35 @@ export async function releaseOpsMain(argv: string[]): Promise<number> {
       return 1;
     }
     return cmdVerifyReleaseAssets({ repository: repo, tag, scope: scope as AssetScope, expectedTag: expected });
+  }
+  if (command === "stable-pointer-current") {
+    const repo = argv.slice(1).find((a) => !a.startsWith("--"));
+    if (!repo) {
+      console.error(USAGE);
+      return 1;
+    }
+    return cmdStablePointerCurrent(repo);
+  }
+  if (command === "stable-pointer-build") {
+    const rest = argv.slice(1);
+    const repo = rest.find((a) => !a.startsWith("--"));
+    const tag = rest.includes("--tag") ? rest[rest.indexOf("--tag") + 1] : undefined;
+    const expected = rest.includes("--expected-tag") ? rest[rest.indexOf("--expected-tag") + 1] : undefined;
+    if (!repo || !tag || !expected) {
+      console.error(USAGE);
+      return 1;
+    }
+    return cmdStablePointerBuild({ repository: repo, tag, expectedTag: expected });
+  }
+  if (command === "verify-stable") {
+    const rest = argv.slice(1);
+    const repo = rest.find((a) => !a.startsWith("--"));
+    const expected = rest.includes("--expected-tag") ? rest[rest.indexOf("--expected-tag") + 1] : undefined;
+    if (!repo || !expected) {
+      console.error(USAGE);
+      return 1;
+    }
+    return cmdVerifyStable({ repository: repo, expectedTag: expected });
   }
   console.error(USAGE);
   return 1;

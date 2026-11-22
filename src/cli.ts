@@ -65,9 +65,15 @@ import {
 // indexer CLI graph (web3, RPC transports, signing) must never be pulled
 // into the write-token execution boundary. cli.ts re-exports the command
 // functions so the behavioral tests keep driving the same entry points.
-import { cmdReleaseLatest, cmdVerifyReleaseAssets } from "./releaseOpsCli.js";
+import {
+  cmdReleaseLatest,
+  cmdStablePointerBuild,
+  cmdStablePointerCurrent,
+  cmdVerifyReleaseAssets,
+  cmdVerifyStable,
+} from "./releaseOpsCli.js";
 
-export { cmdReleaseLatest, cmdVerifyReleaseAssets };
+export { cmdReleaseLatest, cmdStablePointerBuild, cmdStablePointerCurrent, cmdVerifyReleaseAssets, cmdVerifyStable };
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
@@ -932,6 +938,35 @@ async function main(): Promise<number> {
         return 1;
       }
       return cmdVerifyReleaseAssets({ repository: repo, tag, scope: scope as AssetScope, expectedTag: expected });
+    }
+    case "stable-pointer-current": {
+      const repo = process.argv.slice(3).find((a) => !a.startsWith("--"));
+      if (!repo) {
+        console.error("usage: grave-indexer stable-pointer-current <owner/repo>");
+        return 1;
+      }
+      return cmdStablePointerCurrent(repo);
+    }
+    case "stable-pointer-build": {
+      const argv = process.argv.slice(3);
+      const repo = argv.find((a) => !a.startsWith("--"));
+      const tag = argv.includes("--tag") ? argv[argv.indexOf("--tag") + 1] : undefined;
+      const expected = argv.includes("--expected-tag") ? argv[argv.indexOf("--expected-tag") + 1] : undefined;
+      if (!repo || !tag || !expected) {
+        console.error("usage: grave-indexer stable-pointer-build <owner/repo> --tag <versioned-tag> --expected-tag <versioned-tag>");
+        return 1;
+      }
+      return cmdStablePointerBuild({ repository: repo, tag, expectedTag: expected });
+    }
+    case "verify-stable": {
+      const argv = process.argv.slice(3);
+      const repo = argv.find((a) => !a.startsWith("--"));
+      const expected = argv.includes("--expected-tag") ? argv[argv.indexOf("--expected-tag") + 1] : undefined;
+      if (!repo || !expected) {
+        console.error("usage: grave-indexer verify-stable <owner/repo> --expected-tag <versioned-tag>");
+        return 1;
+      }
+      return cmdVerifyStable({ repository: repo, expectedTag: expected });
     }
     case "health":
       return cmdHealth(config);

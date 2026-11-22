@@ -26,21 +26,22 @@
 //      failure at any earlier step leaves the previously served stable
 //      reference untouched (last-known-good preservation).
 //
-// STABLE REFERENCE MECHANISM (GY-M1-INT-001 correction, owner-approved
-// investigation §4.3): the stable reference is GitHub's
-// "latest release" designation, NOT a mutable stable release whose
-// assets are clobbered in place. The stable URL is the CONSTANT
-// `https://github.com/<repo>/releases/latest/download/console-snapshot.json`.
-// The pointer flip is a single metadata operation on one release record
-// (`make_latest=true`); the previous release and its assets are never
-// touched, so the stable URL resolves to a COMPLETE old artifact or a
-// COMPLETE new artifact — never a mixture, never a missing-asset window.
-// The superseded clobber design is rejected precisely because a multi-
-// asset in-place replacement is not atomic: GitHub deletes the old
-// asset before creating the replacement, so a mid-upload failure (or a
-// fetch racing the swap) leaves the stable URL 404 or serving mismatched
-// snapshot/provenance pairs, and a failed upload can destroy the
-// last-known-good bytes permanently.
+// STABLE REFERENCE MECHANISM (sixth-round correction — the OWNER SELECTED
+// the dedicated `console-snapshot-prod` architecture): the stable
+// reference is the git ref `refs/tags/console-snapshot-prod`, whose
+// ANNOTATED TAG OBJECT MESSAGE carries a small pointer JSON naming ONE
+// immutable versioned release (tag, source commit, per-asset digests).
+// Promotion = create a NEW immutable tag object (POST /git/tags), then
+// move the ref with ONE atomic update (PATCH /git/refs, force). A reader
+// of the ref sees either the old pointer or the new pointer — never a
+// missing window, never a partial state. The snapshot/provenance/checksum
+// BYTES are never copied onto the stable reference: they live exclusively
+// on immutable versioned releases, so the pointer cannot become a second
+// mutable copy of the payload. The superseded repo-wide "latest release"
+// promotion is retired from the production path (an unrelated release
+// taking the designation could move the pointer); the
+// `releases/latest/download/...` URL helpers survive only as utilities
+// for the non-production verification path.
 //
 // SECURITY: the provenance is secret-free by construction — it carries
 // only the fields listed in `PUBLICATION_PROVENANCE_KEYS`, which tests
@@ -58,14 +59,16 @@ import { CONSOLE_SNAPSHOT_SCHEMA_VERSION } from "./consoleSnapshotVersion.js";
 import type { ConsoleSnapshotV2 } from "./consoleSnapshot.js";
 
 /**
- * The stable production tag PREFIX (GY-M1-INT-001 §4).
+ * The dedicated stable reference name (GY-M1-INT-001 §4; OWNER-SELECTED
+ * architecture, sixth-round correction): the git ref
+ * `refs/tags/console-snapshot-prod` — an ANNOTATED tag whose tag-object
+ * message carries the stable-pointer JSON (see `StablePointerV1`).
  *
- * NOTE ON SEMANTICS: there is deliberately NO mutable release named
- * `console-snapshot-prod` in the corrected design. The string survives
- * only as the versioned-tag prefix (`console-snapshot-prod-<stamp>-<commit>`)
- * so historical tags stay recognizably production-snapshot tags. The
- * stable RETRIEVAL reference is the repo-wide "latest release" pointer
- * (see `stableSnapshotUrl`), not a fixed tag.
+ * NOTE ON SEMANTICS: versioned release tags are
+ * `console-snapshot-prod-<stamp>-<commit>` (the same prefix with a
+ * suffix); the stable ref name has NO suffix and is never a versioned
+ * release tag. The stable ref NEVER carries the payload bytes — the
+ * pointer names one immutable versioned release which holds them.
  */
 export const STABLE_TAG = "console-snapshot-prod";
 
@@ -75,23 +78,23 @@ export const PROVENANCE_ASSET_NAME = "console-snapshot-provenance.json";
 export const CHECKSUM_ASSET_NAME = "console-snapshot.sha256";
 
 /**
- * The stable, CONSTANT Console retrieval URL for a repository: the
- * "latest release" asset path. Resolves to whatever release currently
- * holds the repo-wide latest designation. NOTE (repository is now
- * PRIVATE): the URL is unchanged, but it now requires authentication —
- * unauthenticated consumers get HTTP 404 (see
- * docs/SNAPSHOT_PUBLICATION.md §12 for the Console-side blocker).
+ * SUPERSEDED (retained as a utility for the non-production verification
+ * path): the repo-wide "latest release" asset URL. The production stable
+ * reference is the dedicated `console-snapshot-prod` git-ref pointer
+ * (see `stableRefApiUrl`); this URL family is no longer used by the
+ * publication workflow and must never be relied on for production
+ * distribution — an unrelated release can take the latest designation.
  */
 export function stableSnapshotUrl(repository: string): string {
   return `https://github.com/${repository}/releases/latest/download/${SNAPSHOT_ASSET_NAME}`;
 }
 
-/** Stable URL for the provenance sidecar (same latest-release mechanism). */
+/** Stable URL for the provenance sidecar (same superseded latest-release mechanism). */
 export function stableProvenanceUrl(repository: string): string {
   return `https://github.com/${repository}/releases/latest/download/${PROVENANCE_ASSET_NAME}`;
 }
 
-/** Stable URL for the SHA-256 checksum file (same latest-release mechanism). */
+/** Stable URL for the SHA-256 checksum file (same superseded latest-release mechanism). */
 export function stableChecksumUrl(repository: string): string {
   return `https://github.com/${repository}/releases/latest/download/${CHECKSUM_ASSET_NAME}`;
 }
@@ -102,6 +105,239 @@ export function stableChecksumUrl(repository: string): string {
  */
 export function versionedAssetUrl(repository: string, tag: string, assetName: string): string {
   return `https://github.com/${repository}/releases/download/${tag}/${assetName}`;
+}
+
+// ─── Dedicated stable reference (owner-selected architecture) ──────────────
+
+/**
+ * The EXACT production resolution entry point: the git-ref API URL for
+ * the dedicated `console-snapshot-prod` ref. `object.sha` of the response
+ * is the ANNOTATED TAG OBJECT sha; fetching that object
+ * (`stableTagObjectApiUrl`) yields the pointer JSON in its `message`
+ * field. Unauthenticated access works on a public repository
+ * (rate-limited); the workflow's verification jobs authenticate with the
+ * READ-ONLY automatic token.
+ */
+export function stableRefApiUrl(repository: string): string {
+  return `https://api.github.com/repos/${repository}/git/ref/tags/${STABLE_TAG}`;
+}
+
+/** The annotated tag-object URL for a concrete stable-ref tag-object sha. */
+export function stableTagObjectApiUrl(repository: string, tagObjectSha: string): string {
+  return `https://api.github.com/repos/${repository}/git/tags/${tagObjectSha}`;
+}
+
+/** Schema discriminator of the stable pointer carried in the tag-object message. */
+export const STABLE_POINTER_SCHEMA = "graveyield.console-snapshot-stable-pointer.v1";
+
+/** Per-asset identification carried by the pointer (digest + length, NEVER the bytes). */
+export interface StablePointerAssetDigest {
+  name: string;
+  sha256: string;
+  byteLength: number;
+}
+
+/**
+ * The stable-pointer JSON (`graveyield.console-snapshot-stable-pointer.v1`)
+ * — the ENTIRE content of the annotated tag object behind
+ * `refs/tags/console-snapshot-prod`. It IDENTIFIES one immutable
+ * versioned release; it never carries the payload bytes (the payload
+ * lives exclusively on the versioned release, so the stable reference
+ * can never become a second mutable copy of the snapshot).
+ */
+export interface StablePointerV1 {
+  pointerSchema: string;
+  stableRef: string;
+  /** The versioned release the stable reference currently identifies. */
+  versionedTag: string;
+  /** The release's source commit (40-hex) — must equal the release's target commit. */
+  sourceCommit: string;
+  publishedAtUnixMs: number;
+  snapshot: StablePointerAssetDigest;
+  provenance: StablePointerAssetDigest;
+  checksum: StablePointerAssetDigest;
+  /** Rollback record: the pointer this one replaced (null on first publication). */
+  previousVersionedTag: string | null;
+  previousTagObjectSha: string | null;
+}
+
+/** The exhaustive pointer key set — tests pin this to keep the pointer secret-free. */
+export const STABLE_POINTER_KEYS = [
+  "pointerSchema",
+  "stableRef",
+  "versionedTag",
+  "sourceCommit",
+  "publishedAtUnixMs",
+  "snapshot",
+  "provenance",
+  "checksum",
+  "previousVersionedTag",
+  "previousTagObjectSha",
+] as const;
+
+const STABLE_POINTER_ASSET_KEYS = ["name", "sha256", "byteLength"] as const;
+
+const HEX40 = /^[0-9a-f]{40}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+
+function parseAssetDigest(value: unknown, expectedName: string, field: string): StablePointerAssetDigest {
+  if (typeof value !== "object" || value === null) {
+    throw new SnapshotPublicationError(`stable pointer field '${field}' must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (JSON.stringify(keys) !== JSON.stringify([...STABLE_POINTER_ASSET_KEYS].sort())) {
+    throw new SnapshotPublicationError(`stable pointer field '${field}' carries an unexpected key set: ${keys.join(",")}`);
+  }
+  if (record["name"] !== expectedName) {
+    throw new SnapshotPublicationError(`stable pointer field '${field}.name' must be ${expectedName}`);
+  }
+  if (typeof record["sha256"] !== "string" || !HEX64.test(record["sha256"])) {
+    throw new SnapshotPublicationError(`stable pointer field '${field}.sha256' must be 64-hex`);
+  }
+  if (typeof record["byteLength"] !== "number" || !Number.isInteger(record["byteLength"]) || record["byteLength"] <= 0) {
+    throw new SnapshotPublicationError(`stable pointer field '${field}.byteLength' must be a positive integer`);
+  }
+  return { name: record["name"] as string, sha256: record["sha256"] as string, byteLength: record["byteLength"] as number };
+}
+
+/**
+ * Build the stable pointer for one verified versioned publication.
+ * Digests are computed over the EXACT verified bytes. `previous` records
+ * the pointer content this publication replaces (rollback reference).
+ * The JSON is the canonical single-line serialization — the exact text
+ * written into the annotated tag object message.
+ */
+export function buildStablePointer(args: {
+  versionedTag: string;
+  sourceCommit: string;
+  publishedAtUnixMs: number;
+  snapshotBytes: Uint8Array;
+  provenanceBytes: Uint8Array;
+  checksumBytes: Uint8Array;
+  previous?: { versionedTag: string; tagObjectSha: string } | null;
+}): { pointer: StablePointerV1; pointerJson: string } {
+  assertVersionedTagFormat(args.versionedTag);
+  if (!HEX40.test(args.sourceCommit)) {
+    throw new SnapshotPublicationError(`stable pointer sourceCommit must be 40-hex, got ${JSON.stringify(args.sourceCommit)}`);
+  }
+  if (!Number.isInteger(args.publishedAtUnixMs) || args.publishedAtUnixMs <= 0) {
+    throw new SnapshotPublicationError(`stable pointer publishedAtUnixMs must be a positive integer`);
+  }
+  if (args.previous !== null && args.previous !== undefined) {
+    assertVersionedTagFormat(args.previous.versionedTag);
+    if (!HEX40.test(args.previous.tagObjectSha)) {
+      throw new SnapshotPublicationError(`stable pointer previousTagObjectSha must be 40-hex`);
+    }
+  }
+  const pointer: StablePointerV1 = {
+    pointerSchema: STABLE_POINTER_SCHEMA,
+    stableRef: STABLE_TAG,
+    versionedTag: args.versionedTag,
+    sourceCommit: args.sourceCommit,
+    publishedAtUnixMs: args.publishedAtUnixMs,
+    snapshot: { name: SNAPSHOT_ASSET_NAME, sha256: snapshotSha256(args.snapshotBytes), byteLength: args.snapshotBytes.byteLength },
+    provenance: { name: PROVENANCE_ASSET_NAME, sha256: snapshotSha256(args.provenanceBytes), byteLength: args.provenanceBytes.byteLength },
+    checksum: { name: CHECKSUM_ASSET_NAME, sha256: snapshotSha256(args.checksumBytes), byteLength: args.checksumBytes.byteLength },
+    previousVersionedTag: args.previous?.versionedTag ?? null,
+    previousTagObjectSha: args.previous?.tagObjectSha ?? null,
+  };
+  return { pointer, pointerJson: JSON.stringify(pointer) };
+}
+
+/**
+ * Strict, fail-closed parse of a stable-pointer JSON (the annotated tag
+ * object message). Every field is validated; an unexpected key set, a
+ * wrong schema discriminator, a malformed tag/commit/digest or a
+ * non-positive length throws. Never returns an unvalidated shape.
+ */
+export function parseStablePointer(text: string): StablePointerV1 {
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch (err) {
+    throw new SnapshotPublicationError(`stable pointer is not JSON: ${String((err as Error).message ?? err)}`);
+  }
+  if (typeof body !== "object" || body === null) {
+    throw new SnapshotPublicationError("stable pointer is not a JSON object");
+  }
+  const record = body as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (JSON.stringify(keys) !== JSON.stringify([...STABLE_POINTER_KEYS].sort())) {
+    throw new SnapshotPublicationError(`stable pointer carries an unexpected key set: ${keys.join(",")}`);
+  }
+  if (record["pointerSchema"] !== STABLE_POINTER_SCHEMA) {
+    throw new SnapshotPublicationError(`stable pointer pointerSchema must be ${STABLE_POINTER_SCHEMA}`);
+  }
+  if (record["stableRef"] !== STABLE_TAG) {
+    throw new SnapshotPublicationError(`stable pointer stableRef must be ${STABLE_TAG}`);
+  }
+  if (typeof record["versionedTag"] !== "string") {
+    throw new SnapshotPublicationError("stable pointer versionedTag must be a string");
+  }
+  assertVersionedTagFormat(record["versionedTag"] as string);
+  if (typeof record["sourceCommit"] !== "string" || !HEX40.test(record["sourceCommit"])) {
+    throw new SnapshotPublicationError("stable pointer sourceCommit must be 40-hex");
+  }
+  if (typeof record["publishedAtUnixMs"] !== "number" || !Number.isInteger(record["publishedAtUnixMs"]) || record["publishedAtUnixMs"] <= 0) {
+    throw new SnapshotPublicationError("stable pointer publishedAtUnixMs must be a positive integer");
+  }
+  const pointer = record as unknown as StablePointerV1;
+  pointer.snapshot = parseAssetDigest(record["snapshot"], SNAPSHOT_ASSET_NAME, "snapshot");
+  pointer.provenance = parseAssetDigest(record["provenance"], PROVENANCE_ASSET_NAME, "provenance");
+  pointer.checksum = parseAssetDigest(record["checksum"], CHECKSUM_ASSET_NAME, "checksum");
+  if (record["previousVersionedTag"] !== null && typeof record["previousVersionedTag"] !== "string") {
+    throw new SnapshotPublicationError("stable pointer previousVersionedTag must be a string or null");
+  }
+  if (typeof record["previousVersionedTag"] === "string") {
+    assertVersionedTagFormat(record["previousVersionedTag"] as string);
+  }
+  if (record["previousTagObjectSha"] !== null && (typeof record["previousTagObjectSha"] !== "string" || !HEX40.test(record["previousTagObjectSha"]))) {
+    throw new SnapshotPublicationError("stable pointer previousTagObjectSha must be 40-hex or null");
+  }
+  if ((record["previousVersionedTag"] === null) !== (record["previousTagObjectSha"] === null)) {
+    throw new SnapshotPublicationError("stable pointer previous fields must be both null or both set");
+  }
+  return pointer;
+}
+
+/**
+ * Cross-check a stable pointer against the EXACT artifact triple fetched
+ * from the versioned release it names, and against that release's own
+ * provenance sidecar. Any digest, length, tag or commit divergence is a
+ * hard failure — the pointer must never bless bytes it does not name.
+ */
+export function verifyStablePointerMatchesArtifacts(args: {
+  pointer: StablePointerV1;
+  snapshotBytes: Uint8Array;
+  provenanceBytes: Uint8Array;
+  checksumBytes: Uint8Array;
+  provenance: PublicationProvenance;
+}): void {
+  const pairs: Array<[StablePointerAssetDigest, Uint8Array, string]> = [
+    [args.pointer.snapshot, args.snapshotBytes, "snapshot"],
+    [args.pointer.provenance, args.provenanceBytes, "provenance"],
+    [args.pointer.checksum, args.checksumBytes, "checksum"],
+  ];
+  for (const [digest, bytes, field] of pairs) {
+    const actual = snapshotSha256(bytes);
+    if (actual !== digest.sha256 || bytes.byteLength !== digest.byteLength) {
+      throw new SnapshotPublicationError(
+        `stable pointer ${field} digest/length mismatch: pointer says ${digest.sha256}/${digest.byteLength}, fetched bytes hash to ${actual}/${bytes.byteLength}`,
+      );
+    }
+  }
+  if (args.provenance.versionedTag !== args.pointer.versionedTag) {
+    throw new SnapshotPublicationError(
+      `stable pointer names ${args.pointer.versionedTag} but the release's provenance names ${args.provenance.versionedTag ?? "<none>"} — refusing a cross-release identification`,
+    );
+  }
+  if (args.provenance.indexerSourceCommitSha !== null && args.provenance.indexerSourceCommitSha !== args.pointer.sourceCommit) {
+    throw new SnapshotPublicationError(
+      `stable pointer sourceCommit ${args.pointer.sourceCommit} does not match the release provenance commit ${args.provenance.indexerSourceCommitSha}`,
+    );
+  }
+  verifySnapshotIntegrity(args.snapshotBytes, args.provenance);
 }
 
 // ─── Integrity ─────────────────────────────────────────────────────────────
@@ -327,12 +563,12 @@ export function assertVersionedTagFormat(tag: string): void {
 
 /**
  * The ordered publication steps (the workflow MUST execute them in this
- * order). The stable reference is a PROMOTION (repo-wide latest-release
- * designation), executed as one metadata operation AFTER the versioned
- * release has been published AND its assets verified (through the
- * authenticated API path on a private repository; the unauthenticated
- * download-URL path was valid only while the repository was public),
- * and followed by a stable-URL re-verification.
+ * order). The stable reference is the DEDICATED `console-snapshot-prod`
+ * git-ref pointer (owner-selected architecture): activation creates a
+ * new annotated tag object carrying the pointer JSON and moves the ref
+ * with ONE atomic update, executed AFTER the versioned release has been
+ * published AND its assets verified, and followed by an identity
+ * re-verification of the ref → pointer → versioned release chain.
  */
 export const PUBLICATION_STEPS = [
   "generate",
@@ -340,7 +576,7 @@ export const PUBLICATION_STEPS = [
   "verify-integrity",
   "publish-versioned-release",
   "verify-versioned-assets",
-  "activate-stable-latest",
+  "activate-stable-reference",
   "verify-stable-reference",
 ] as const;
 
@@ -402,6 +638,7 @@ export function assertStableReferenceServesVerifiedArtifact(args: {
   fetchedSnapshotBytes: Uint8Array;
   fetchedProvenance: PublicationProvenance;
   activatedTag: string;
+  pointer?: StablePointerV1;
 }): void {
   if (args.fetchedProvenance.versionedTag !== args.activatedTag) {
     throw new SnapshotPublicationError(
@@ -410,54 +647,55 @@ export function assertStableReferenceServesVerifiedArtifact(args: {
     );
   }
   verifySnapshotIntegrity(args.fetchedSnapshotBytes, args.fetchedProvenance);
+  if (args.pointer !== undefined && args.pointer.versionedTag !== args.activatedTag) {
+    throw new SnapshotPublicationError(
+      `stable reference is NOT serving the activated artifact: the pointer names ` +
+        `${args.pointer.versionedTag}, expected ${args.activatedTag}`,
+    );
+  }
 }
 
 /**
- * The stable reference update is a LATEST-RELEASE PROMOTION: a single
- * metadata operation (`make_latest=true` on the verified versioned
- * release record) that atomically re-points the repo-wide latest
- * designation. Rationale (documented for audit):
+ * The stable reference update is a DEDICATED-REF ACTIVATION (owner-
+ * selected architecture): a NEW annotated tag object carrying the
+ * pointer JSON is created (immutable git object), then the ref
+ * `refs/tags/console-snapshot-prod` is moved with ONE atomic update
+ * (`PATCH /git/refs`, force). Rationale (documented for audit):
  *
- *   * The superseded design — replacing the three assets on a permanent
- *     `console-snapshot-prod` release via `gh release upload --clobber`
- *     — is NOT atomic: GitHub deletes each old asset before creating
- *     the new one, so the stable URL can 404 mid-swap, and a failed
- *     upload after the first deletion permanently destroys the
- *     last-known-good bytes. A client racing the swap can also receive
- *     a NEW snapshot beside an OLD provenance (mismatched pair).
- *   * With the promotion design, every publication lives on its own
- *     immutable versioned release; the stable URL
- *     (`releases/latest/download/console-snapshot.json`) always
- *     resolves to ONE complete release's assets. The promotion moves
- *     the whole pointer in one metadata update — the previous release
- *     and its assets are never modified or deleted, so the old
- *     artifact remains fully available until (and after) the moment
- *     the new one is activated, and rollback is another single
- *     metadata operation (`gh release edit <previous-tag> --latest`).
- *   * The promotion step runs ONLY after the versioned release's
- *     assets have been downloaded back and re-verified (authenticated
- *     API path on a private repository; enforced by
- *     `assertStableAdvanceAllowed`); post-activation verification
- *     re-confirms the stable reference serves the activated bytes
- *     (`assertStableReferenceServesVerifiedArtifact`).
+ *   * The previously-rejected design — replacing the three assets on a
+ *     permanent `console-snapshot-prod` release via `gh release upload
+ *     --clobber` — is NOT atomic: GitHub deletes each old asset before
+ *     creating the new one, so the stable URL can 404 mid-swap and a
+ *     failed upload permanently destroys the last-known-good bytes.
+ *   * The repo-wide "latest" promotion (the interim mechanism) is
+ *     retired from production: an unrelated release taking the
+ *     designation would move the production pointer.
+ *   * With the dedicated-ref design, the payload bytes live ONLY on
+ *     immutable versioned releases; the pointer is a small immutable
+ *     git object re-created for every promotion, and the ref moves in a
+ *     single atomic operation. Readers see the old pointer or the new
+ *     pointer — never a missing or partial state. The previous pointer
+ *     content is recorded (run summary + pointer's `previous*` fields),
+ *     so rollback re-creates the old pointer object and re-points the
+ *     ref, verified by read-back — without depending on the old object
+ *     remaining reachable.
  *
- * Residual non-atomicity / disclosed risks (see docs/SNAPSHOT_PUBLICATION.md):
- *   * "latest" is a REPO-WIDE designation — any other non-draft,
- *     non-prerelease release created in this repository would move the
- *     pointer. Mitigations: repository release policy, the workflow's
- *     post-activation verification, and operator auditability.
- *   * GitHub CDN caching on the latest-release path is short-lived;
- *     consumers must re-fetch and rely on the sidecar digest for
- *     integrity.
+ * Residual limitations (see docs/SNAPSHOT_PUBLICATION.md):
+ *   * the ref update is atomic per GitHub's ref API, but a reader
+ *     racing it may see either pointer — every consumer MUST verify the
+ *     fetched bytes against the pointer digests (fail-closed).
+ *   * consumption requires the documented two-step resolution (ref →
+ *     tag object → versioned release) — a Console-side change that is
+ *     documented for owner approval, not yet shipped.
  */
 export function describeStableReferenceUpdate(): string {
   return (
-    "latest-release promotion: the verified versioned release is activated with a single " +
-    "make_latest=true metadata operation (gh release edit <tag> --latest). The stable URL " +
-    "(releases/latest/download/console-snapshot.json) is constant and always resolves to one " +
-    "complete release's assets; the previous release is never modified or deleted, so the " +
-    "last-known-good artifact remains fully available until activation and can be restored by " +
-    "re-promoting its release. The previous assets are never removed before the verified " +
-    "replacement exists on its own immutable versioned release."
+    "dedicated stable reference activation: a new annotated tag object carrying the " +
+    "stable-pointer JSON is created, and the ref refs/tags/console-snapshot-prod is moved " +
+    "with one atomic ref update. The pointer names one immutable versioned release; the " +
+    "payload bytes are never copied onto the stable reference. The previous pointer content " +
+    "is recorded for rollback; restoring it re-creates the old pointer object and re-points " +
+    "the ref, verified by read-back. The previous assets are never removed before the " +
+    "verified replacement exists on its own immutable versioned release."
   );
 }

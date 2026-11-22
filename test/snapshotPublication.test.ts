@@ -44,17 +44,25 @@ import {
   stableSnapshotUrl,
   stableProvenanceUrl,
   stableChecksumUrl,
+  stableRefApiUrl,
+  stableTagObjectApiUrl,
+  buildStablePointer,
+  parseStablePointer,
+  verifyStablePointerMatchesArtifacts,
+  STABLE_POINTER_SCHEMA,
   versionedAssetUrl,
   VERSIONED_TAG_PATTERN,
   SnapshotPublicationError,
   PUBLICATION_PROVENANCE_KEYS,
   PUBLICATION_STEPS,
   STABLE_TAG,
+  STABLE_POINTER_KEYS,
   SNAPSHOT_ASSET_NAME,
   PROVENANCE_ASSET_NAME,
   CHECKSUM_ASSET_NAME,
   type PublicationProvenance,
   type PublicationContext,
+  type StablePointerV1,
 } from "../src/snapshotPublication.js";
 import { parseConsoleSnapshot } from "../src/consoleSnapshotParse.js";
 import { buildAmmInfo, synth } from "./fixtures.js";
@@ -318,15 +326,26 @@ describe("stable reference update ordering", () => {
     versionedAssetsVerified: true,
   };
 
-  test("the stable tag string survives only as the versioned-tag PREFIX (no mutable stable release)", () => {
+  test("the stable ref name is distinct from every versioned tag (no suffix vs suffix)", () => {
     assert.equal(STABLE_TAG, "console-snapshot-prod");
+    assert.ok(!VERSIONED_TAG_PATTERN.test(STABLE_TAG), "the stable ref name is not a versioned tag");
+    assert.ok(versionedTagName(NOW_MS, SOURCE).startsWith(`${STABLE_TAG}-`), "versioned tags derive from the stable name");
   });
 
-  test("the stable URLs are the CONSTANT latest-release paths (plain fetch, no auth)", () => {
+  test("the superseded latest-release URLs are retained as utilities only", () => {
     const repo = "GraveYield/grave-indexer";
     assert.equal(stableSnapshotUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot.json`);
     assert.equal(stableProvenanceUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot-provenance.json`);
     assert.equal(stableChecksumUrl(repo), `https://github.com/${repo}/releases/latest/download/console-snapshot.sha256`);
+  });
+
+  test("the PRODUCTION stable-reference resolution entry points are the dedicated git-ref APIs", () => {
+    const repo = "GraveYield/grave-indexer";
+    assert.equal(stableRefApiUrl(repo), `https://api.github.com/repos/${repo}/git/ref/tags/console-snapshot-prod`);
+    const sha = "a".repeat(40);
+    assert.equal(stableTagObjectApiUrl(repo, sha), `https://api.github.com/repos/${repo}/git/tags/${sha}`);
+    // And they never overlap the superseded latest URL family.
+    assert.ok(!stableRefApiUrl(repo).includes("releases/latest"));
   });
 
   test("versioned asset URLs are immutable tag-scoped paths", () => {
@@ -335,19 +354,19 @@ describe("stable reference update ordering", () => {
     assert.equal(versionedAssetUrl(repo, tag, SNAPSHOT_ASSET_NAME), `https://github.com/${repo}/releases/download/${tag}/console-snapshot.json`);
   });
 
-  test("the step order is fail-closed: activation is followed by a stable-URL re-verification", () => {
+  test("the step order is fail-closed: activation is followed by a stable-reference identity re-verification", () => {
     assert.deepEqual(PUBLICATION_STEPS, [
       "generate",
       "validate-schema",
       "verify-integrity",
       "publish-versioned-release",
       "verify-versioned-assets",
-      "activate-stable-latest",
+      "activate-stable-reference",
       "verify-stable-reference",
     ]);
-    assert.ok(PUBLICATION_STEPS.indexOf("activate-stable-latest") > PUBLICATION_STEPS.indexOf("verify-versioned-assets"));
+    assert.ok(PUBLICATION_STEPS.indexOf("activate-stable-reference") > PUBLICATION_STEPS.indexOf("verify-versioned-assets"));
     assert.ok(PUBLICATION_STEPS.indexOf("verify-versioned-assets") > PUBLICATION_STEPS.indexOf("publish-versioned-release"));
-    assert.ok(PUBLICATION_STEPS.indexOf("verify-stable-reference") > PUBLICATION_STEPS.indexOf("activate-stable-latest"));
+    assert.ok(PUBLICATION_STEPS.indexOf("verify-stable-reference") > PUBLICATION_STEPS.indexOf("activate-stable-reference"));
   });
 
   test("a fully verified sequence may advance the stable reference", () => {
@@ -397,14 +416,40 @@ describe("stable reference update ordering", () => {
     }
   });
 
-  test("the stable update is documented as a latest-release promotion (never asset clobbering)", () => {
+  test("the stable update is documented as a dedicated-ref activation (never asset clobbering, never repo-wide latest)", () => {
     const doc = describeStableReferenceUpdate();
-    assert.ok(doc.includes("latest-release promotion"), "the mechanism is named");
-    assert.ok(doc.includes("make_latest=true"), "the single metadata operation is identified");
-    assert.ok(doc.includes("releases/latest/download/console-snapshot.json"), "the stable URL is named");
-    assert.ok(doc.includes("never modified or deleted"), "last-known-good preservation is stated");
-    assert.ok(doc.includes("re-promoting"), "rollback is stated");
-    assert.ok(!doc.toLowerCase().includes("clobber") || doc.toLowerCase().includes("rejected"), "clobbering is not the mechanism");
+    assert.ok(doc.includes("annotated tag object"), "the mechanism is named");
+    assert.ok(doc.includes("refs/tags/console-snapshot-prod"), "the dedicated ref is named");
+    assert.ok(doc.includes("atomic ref update"), "the single atomic operation is identified");
+    assert.ok(doc.includes("never copied onto the stable reference"), "the payload never becomes a second mutable copy");
+    assert.ok(doc.includes("recorded for rollback"), "rollback is stated");
+    assert.ok(doc.includes("immutable versioned release"), "the pointer names an immutable versioned release");
+  });
+
+  test("the pointer digest gate rejects tampered sidecar bytes", () => {
+    const prov = buildPublicationProvenance(realSnapshot().snapshot, realSnapshot().bytes, { ...BASE_CTX, versionedTag: versionedTagName(NOW_MS, SOURCE) });
+    const built = buildStablePointer({
+      versionedTag: prov.versionedTag as string,
+      sourceCommit: SOURCE,
+      publishedAtUnixMs: NOW_MS,
+      snapshotBytes: realSnapshot().bytes,
+      provenanceBytes: new TextEncoder().encode(JSON.stringify(prov)),
+      checksumBytes: new TextEncoder().encode(`${snapshotSha256(realSnapshot().bytes)}  ${SNAPSHOT_ASSET_NAME}\n`),
+      previous: null,
+    });
+    const tampered = realSnapshot().bytes.slice();
+    tampered[tampered.length - 2] = (tampered[tampered.length - 2] ?? 0) ^ 0x01;
+    assert.throws(
+      () =>
+        verifyStablePointerMatchesArtifacts({
+          pointer: built.pointer,
+          snapshotBytes: tampered,
+          provenanceBytes: new TextEncoder().encode(JSON.stringify(prov)),
+          checksumBytes: new TextEncoder().encode(`${snapshotSha256(tampered)}  ${SNAPSHOT_ASSET_NAME}\n`),
+          provenance: prov,
+        }),
+      /digest\/length mismatch/,
+    );
   });
 
   test("the stable reference must serve the ACTIVATED versioned artifact (post-activation gate)", () => {
@@ -437,5 +482,150 @@ describe("stable reference update ordering", () => {
     for (const hostile of ["", "; rm -rf /", "console-snapshot-prod", "console-snapshot-prod-20260101T000000Z", "console-snapshot-prod-20260101T000000Z-DEADBEEFDEAD", "console-snapshot-prod-20260101T000000Z-0123456789abc"]) {
       assert.throws(() => assertVersionedTagFormat(hostile), SnapshotPublicationError, `hostile tag ${JSON.stringify(hostile)} refused`);
     }
+  });
+});
+
+// ─── Stable-pointer JSON — build/parse round trip + strict rejection matrix ──
+
+describe("stable pointer JSON (graveyield.console-snapshot-stable-pointer.v1)", () => {
+  function builtPointer(at = NOW_MS) {
+    const { snapshot, bytes } = realSnapshotAt(at);
+    const tag = versionedTagName(at, SOURCE);
+    const prov = buildPublicationProvenance(snapshot, bytes, { ...BASE_CTX, versionedTag: tag });
+    const provenanceBytes = new TextEncoder().encode(JSON.stringify(prov));
+    const checksumBytes = new TextEncoder().encode(`${snapshotSha256(bytes)}  ${SNAPSHOT_ASSET_NAME}\n`);
+    return {
+      tag,
+      snapshotBytes: bytes,
+      provenance: prov,
+      provenanceBytes,
+      checksumBytes,
+      ...buildStablePointer({
+        versionedTag: tag,
+        sourceCommit: SOURCE,
+        publishedAtUnixMs: at,
+        snapshotBytes: bytes,
+        provenanceBytes,
+        checksumBytes,
+        previous: null,
+      }),
+    };
+  }
+
+  test("build → parse round trip preserves every field; the JSON is a single canonical line", async () => {
+    const built = builtPointer();
+    assert.ok(!built.pointerJson.includes("\n"), "the pointer JSON is single-line (annotated tag message)");
+    const parsed = parseStablePointer(built.pointerJson);
+    assert.equal(parsed.pointerSchema, STABLE_POINTER_SCHEMA);
+    assert.equal(parsed.stableRef, "console-snapshot-prod");
+    assert.equal(parsed.versionedTag, built.tag);
+    assert.equal(parsed.sourceCommit, SOURCE);
+    assert.equal(parsed.snapshot.sha256, snapshotSha256(built.snapshotBytes));
+    assert.equal(parsed.snapshot.byteLength, built.snapshotBytes.byteLength);
+    assert.equal(parsed.previousVersionedTag, null);
+    assert.equal(parsed.previousTagObjectSha, null);
+    assert.deepEqual(Object.keys(parsed).sort(), [...STABLE_POINTER_KEYS].sort(), "the key set is pinned");
+    void built.pointer;
+  });
+
+  test("the pointer digests verify against the exact artifact triple and its provenance", async () => {
+    const built = builtPointer();
+    assert.doesNotThrow(() =>
+      verifyStablePointerMatchesArtifacts({
+        pointer: built.pointer,
+        snapshotBytes: built.snapshotBytes,
+        provenanceBytes: built.provenanceBytes,
+        checksumBytes: built.checksumBytes,
+        provenance: built.provenance,
+      }),
+    );
+    // A provenance naming a DIFFERENT release is refused (cross-release identification).
+    const otherTag = versionedTagName(NOW_MS - 1_000, "9".repeat(40));
+    assert.throws(
+      () =>
+        verifyStablePointerMatchesArtifacts({
+          pointer: built.pointer,
+          snapshotBytes: built.snapshotBytes,
+          provenanceBytes: built.provenanceBytes,
+          checksumBytes: built.checksumBytes,
+          provenance: { ...built.provenance, versionedTag: otherTag },
+        }),
+      /refusing a cross-release identification/,
+    );
+  });
+
+  test("the previous-pointer record is carried and validated (rollback chain)", () => {
+    const built = builtPointer();
+    const withPrevious = buildStablePointer({
+      versionedTag: built.tag,
+      sourceCommit: SOURCE,
+      publishedAtUnixMs: NOW_MS,
+      snapshotBytes: built.snapshotBytes,
+      provenanceBytes: built.provenanceBytes,
+      checksumBytes: built.checksumBytes,
+      previous: { versionedTag: versionedTagName(NOW_MS - 3_600_000, "9".repeat(40)), tagObjectSha: "a".repeat(40) },
+    });
+    assert.ok(withPrevious.pointerJson.includes('"previousVersionedTag":"console-snapshot-prod-'));
+    assert.ok(withPrevious.pointerJson.includes('"previousTagObjectSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'));
+    const parsed = parseStablePointer(withPrevious.pointerJson);
+    assert.equal(parsed.previousVersionedTag, versionedTagName(NOW_MS - 3_600_000, "9".repeat(40)));
+    // Previous fields must be jointly null or jointly set.
+    assert.throws(
+      () =>
+        parseStablePointer(
+          JSON.stringify({ ...parsed, previousVersionedTag: null }),
+        ),
+      SnapshotPublicationError,
+    );
+  });
+
+  test("the strict parser rejects malformed pointers (every field fail-closed)", () => {
+    const built = builtPointer();
+    const valid = JSON.parse(built.pointerJson) as Record<string, unknown>;
+    // Not JSON / not an object.
+    assert.throws(() => parseStablePointer("not-json"), /not JSON/);
+    assert.throws(() => parseStablePointer("42"), /not a JSON object/);
+    // Wrong schema discriminator / stableRef.
+    assert.throws(() => parseStablePointer(JSON.stringify({ ...valid, pointerSchema: "graveyield.other.v1" })), /pointerSchema/);
+    assert.throws(() => parseStablePointer(JSON.stringify({ ...valid, stableRef: "console-snapshot-staging" })), /stableRef/);
+    // Unexpected key set (extra or missing keys).
+    const extra = { ...valid, sneaky: 1 };
+    assert.throws(() => parseStablePointer(JSON.stringify(extra)), /unexpected key set/);
+    const missing = { ...valid } as Record<string, unknown>;
+    delete missing.snapshot;
+    assert.throws(() => parseStablePointer(JSON.stringify(missing)), /unexpected key set/);
+    // Malformed tag / commit / timestamp.
+    assert.throws(() => parseStablePointer(JSON.stringify({ ...valid, versionedTag: "console-snapshot-prod" })), /does not match the expected shape|versioned tag/);
+    assert.throws(() => parseStablePointer(JSON.stringify({ ...valid, sourceCommit: "zz" })), /sourceCommit/);
+    assert.throws(() => parseStablePointer(JSON.stringify({ ...valid, publishedAtUnixMs: -1 })), /publishedAtUnixMs/);
+    const validRecord = valid as unknown as Record<string, Record<string, unknown>>;
+    // Malformed digests (not hex, wrong length) and bad lengths.
+    const badSnapshot = { ...valid } as Record<string, unknown>;
+    badSnapshot.snapshot = { ...validRecord.snapshot, sha256: "0".repeat(63) };
+    assert.throws(() => parseStablePointer(JSON.stringify(badSnapshot)), /sha256/);
+    const badLength = { ...valid } as Record<string, unknown>;
+    badLength.snapshot = { ...validRecord.snapshot, byteLength: 0 };
+    assert.throws(() => parseStablePointer(JSON.stringify(badLength)), /byteLength/);
+    const badName = { ...valid } as Record<string, unknown>;
+    badName.snapshot = { ...validRecord.snapshot, name: "snapshot.json" };
+    assert.throws(() => parseStablePointer(JSON.stringify(badName)), /name/);
+    // A versioned-tag-shaped-but-hostile previous record is refused.
+    assert.throws(
+      () => parseStablePointer(JSON.stringify({ ...valid, previousVersionedTag: "console-snapshot-prod", previousTagObjectSha: null })),
+      SnapshotPublicationError,
+    );
+    // Building with a hostile sourceCommit is refused.
+    assert.throws(
+      () =>
+        buildStablePointer({
+          versionedTag: versionedTagName(NOW_MS, SOURCE),
+          sourceCommit: "; rm -rf /",
+          publishedAtUnixMs: NOW_MS,
+          snapshotBytes: new Uint8Array(1),
+          provenanceBytes: new Uint8Array(1),
+          checksumBytes: new Uint8Array(1),
+        }),
+      SnapshotPublicationError,
+    );
   });
 });
