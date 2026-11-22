@@ -88,6 +88,7 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
   const verifyVersioned = wf.jobs["verify-versioned"];
   const promote = wf.jobs["promote"];
   const verifyStable = wf.jobs["verify-stable"];
+  const rollback = wf.jobs["rollback"];
   const allJobs: Array<[string, Workflow["jobs"][string] | undefined]> = [
     ["generate", generate],
     ["verify", verify],
@@ -96,8 +97,9 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
     ["verify-versioned", verifyVersioned],
     ["promote", promote],
     ["verify-stable", verifyStable],
+    ["rollback", rollback],
   ];
-  assert.ok(allJobs.every(([, j]) => j), "all seven jobs exist");
+  assert.ok(allJobs.every(([, j]) => j), "all eight jobs exist");
   if (!allJobs.every(([, j]) => j)) throw new Error("workflow jobs missing");
   const jobs = allJobs.map(([, j]) => j!) as NonNullable<Workflow["jobs"][string]>[];
 
@@ -118,7 +120,7 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
 
   test("top-level permissions are read-only; EVERY job declares contents:read explicitly (no write-permission job exists)", () => {
     assert.deepEqual(wf.permissions, { contents: "read" });
-    // Fourth-round correction: ALL SEVEN jobs declare contents:read
+    // Fourth-round correction: ALL EIGHT jobs declare contents:read
     // EXPLICITLY — the automatic GITHUB_TOKEN is read-only everywhere by
     // declaration, never by inheritance from org defaults alone.
     for (const [name, job] of allJobs) {
@@ -131,6 +133,10 @@ describe("publish-console-snapshot workflow — security-critical structure", ()
     assert.ok(verifyStable!.needs?.includes("promote") && verifyStable!.needs?.includes("publish"), "the post-activation gate runs after promotion");
     assert.ok(publish!.needs?.includes("generate") && publish!.needs?.includes("verify"), "publish depends on BOTH read-only preparation jobs");
     assert.ok(verify!.needs?.includes("generate"), "verify depends on generate");
+    // EIGHTH-ROUND CORRECTION (Finding 1): the dedicated downstream rollback
+    // job is wired into the graph — it needs the promotion outputs AND the
+    // downstream verification result.
+    assert.ok(rollback!.needs?.includes("promote") && rollback!.needs?.includes("verify-stable") && rollback!.needs?.includes("publish"), "the rollback job needs the promotion outputs and the downstream verification result");
   });
 
   test("concurrency: one publication at a time, never cancelled mid-run", () => {
@@ -281,13 +287,15 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
   const verifyVersioned = wf.jobs["verify-versioned"]!;
   const promote = wf.jobs["promote"]!;
   const verifyStable = wf.jobs["verify-stable"]!;
-  const allJobs = [generate, verify, publish, release, verifyVersioned, promote, verifyStable];
+  const rollback = wf.jobs["rollback"]!;
+  const allJobs = [generate, verify, publish, release, verifyVersioned, promote, verifyStable, rollback];
   // Fourth-round correction: EVERY job's automatic token is read-only.
-  // "privileged" now refers to the two jobs that carry the dedicated
+  // "privileged" now refers to the three jobs that carry the dedicated
   // GY_RELEASE_PAT release credential (on mutation steps only).
   const privilegedJobs: Array<[string, typeof generate]> = [
     ["release", release],
     ["promote", promote],
+    ["rollback", rollback],
   ];
   const namedJobs: Array<[string, typeof generate]> = [
     ["generate", generate],
@@ -297,6 +305,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     ["verify-versioned", verifyVersioned],
     ["promote", promote],
     ["verify-stable", verifyStable],
+    ["rollback", rollback],
   ];
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
@@ -304,17 +313,29 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     return job.permissions ?? { contents: "read" };
   }
 
-  test("ALL SEVEN jobs carry the job-level main-only guard (`if: github.ref == 'refs/heads/main'`)", () => {
+  test("job-level gating: the seven unconditional jobs require refs/heads/main; the downstream rollback job requires main AND promotion success AND a failed downstream verification", () => {
     for (const job of allJobs) {
+      if (job === rollback) continue; // the rollback job carries a compound failure-path gate, pinned below
       assert.equal(
         job["if"],
         "github.ref == 'refs/heads/main'",
         "a dispatch against any other ref must skip the job entirely (release-writing steps unreachable)",
       );
     }
+    // EIGHTH-ROUND CORRECTION (Finding 1): the rollback job's dependency-
+    // graph gate. It runs ONLY when promotion COMPLETED (activation was
+    // attempted and the ref was moved) and the DOWNSTREAM verify-stable
+    // job FAILED after it — never for a promotion failure (promote's own
+    // in-job rollback handles that) and never when promotion never
+    // started (that would violate the activation_started safety concept).
+    assert.match(
+      rollback["if"] ?? "",
+      /failure\(\) &&\s*needs\.promote\.result == 'success' &&\s*needs\.verify-stable\.result == 'failure' &&\s*github\.ref == 'refs\/heads\/main'/,
+      "the rollback job runs ONLY after a successful promotion followed by a failed downstream verification",
+    );
   });
 
-  test("ALL SEVEN jobs carry an explicit in-step ref guard that rejects anything but refs/heads/main", () => {
+  test("ALL EIGHT jobs carry an explicit in-step ref guard that rejects anything but refs/heads/main", () => {
     for (const job of allJobs) {
       const guards = job.steps.filter(
         (s) => typeof s["run"] === "string" && (s["run"] as string).includes("refs/heads/main") && (s["run"] as string).includes("GITHUB_REF"),
@@ -468,6 +489,10 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       // the same repo-qualified endpoint for its own PATCH).
       ["promote", /git\/tags[\s\S]*stable ref activation issued/s],
       ["promote", /git\/tags[\s\S]*ROLLBACK FAILED/s],
+      // EIGHTH ROUND (Finding 1): the dedicated downstream rollback job's
+      // single mutation step — restore the previous pointer (POST /git/tags
+      // + PATCH refs) or delete the first-publication ref (DELETE refs).
+      ["rollback", /git\/tags[\s\S]*rollback mutation issued/s],
     ];
     // The ONLY authenticated non-mutation steps allowed in the privileged
     // jobs are the three-way READ gates (automatic token): the versioned
@@ -511,7 +536,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       assert.ok(!("GH_TOKEN" in (job.env ?? {})) && !("GITHUB_TOKEN" in (job.env ?? {})), `${name} must not declare GH_TOKEN/GITHUB_TOKEN at JOB level (it would leak to every step)`);
       assert.ok(!("GY_RELEASE_PAT" in (job.env ?? {})), `${name} must not declare GY_RELEASE_PAT at JOB level (it would leak to every step)`);
     }
-    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release"], "exactly four privileged mutation COMMANDS use the PAT: release create, release upload, stable-ref activation, rollback (create+upload share one step)");
+    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release", "rollback"], "exactly five privileged mutation COMMANDS use the PAT: release create, release upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation");
   });
 
   test("no workflow-level or job-level env exposes the release credential anywhere", () => {
@@ -541,7 +566,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         assert.fail(`GH_TOKEN env references an unsanctioned credential source: ${String(value)}`);
       }
     }
-    assert.equal(patStepCount, 3, "exactly THREE steps carry the release-write PAT (release create+upload, stable-ref activation, rollback)");
+    assert.equal(patStepCount, 4, "exactly FOUR steps carry the release-write PAT (release create+upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     assert.ok(automaticTokenStepCount >= 4, "every authenticated query step uses the READ-ONLY automatic token");
   });
 
@@ -585,7 +610,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     assert.ok(!/^\s*(gh api --method (POST|PATCH|DELETE)|gh api -X (POST|PATCH|DELETE))/m.test(runBlocks(verifyStable).join("\n")), "the stable gate performs NO git-data-mutating operations (mentions in documentation text are not commands)");
   });
 
-  test("permissions stay least-privilege: seven read-only jobs, no write-permission job anywhere", () => {
+  test("permissions stay least-privilege: eight read-only jobs, no write-permission job anywhere", () => {
     assert.deepEqual(wf.permissions, { contents: "read" });
     for (const [name, job] of namedJobs) {
       assert.deepEqual(job.permissions, { contents: "read" }, `${name} must declare contents:read explicitly`);
@@ -601,9 +626,9 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
   const allJobs = Object.entries(wf.jobs);
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
-  test("the PAT appears ONLY inside the step-level env of the three mutation steps", () => {
+  test("the PAT appears ONLY inside the step-level env of the four mutation steps", () => {
     // Every literal occurrence of the secret reference in the file must be
-    // either a comment mention or one of the three sanctioned step env values.
+    // either a comment mention or one of the four sanctioned step env values.
     let envOccurrences = 0;
     for (const [, job] of allJobs) {
       for (const step of job.steps) {
@@ -611,10 +636,10 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         if (env["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}") envOccurrences += 1;
       }
     }
-    assert.equal(envOccurrences, 3, "exactly THREE step env blocks reference the PAT (release create+upload, stable-ref activation, rollback)");
+    assert.equal(envOccurrences, 4, "exactly FOUR step env blocks reference the PAT (release create+upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     // The remaining occurrences must be comments only.
     const stripped = raw.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
-    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 3, "outside comments, the PAT reference appears ONLY in the three sanctioned step env values");
+    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 4, "outside comments, the PAT reference appears ONLY in the four sanctioned step env values");
   });
 
   test("no build, test, generation, verification, artifact, checkout or dependency step receives the PAT in any form", () => {
@@ -817,7 +842,101 @@ describe("rehearsal-publication workflow — hard non-production guard", () => {
 
   test("the rehearsal NEVER references the production release PAT (GY_RELEASE_PAT)", () => {
     const rawRehearsal = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
-    assert.ok(!rawRehearsal.includes("GY_RELEASE_PAT"), "the production release credential must never be wired into the rehearsal workflow");
+    // Comments may DOCUMENT the prohibition; the CONFIGURATION must never
+    // reference the production credential.
+    const strippedRehearsal = rawRehearsal.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+    assert.ok(!strippedRehearsal.includes("GY_RELEASE_PAT"), "the production release credential must never be wired into the rehearsal workflow");
+    assert.ok(!rawRehearsal.includes("secrets."), "no repository secret is referenced anywhere in the rehearsal");
+  });
+});
+
+// ─── Eighth round (review Finding 2) — the rehearsal tests the POINTER ───────
+// ─── architecture, not the retired repo-wide "latest" mechanism ──────────────
+
+describe("rehearsal-publication workflow — dedicated stable-reference architecture (eighth round, Finding 2)", () => {
+  function loadRehearsal(): Workflow {
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    const json = execFileSync(
+      "python3",
+      ["-c", "import sys,yaml,json;d=yaml.safe_load(sys.stdin.read());\nif True in d: d['on']=d.pop(True)\nprint(json.dumps(d))"],
+      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, input: raw },
+    );
+    return JSON.parse(json) as Workflow;
+  }
+
+  const rehearsal = loadRehearsal();
+  const job = rehearsal.jobs["rehearse"]!;
+  const runs = job.steps
+    .filter((s) => typeof s["run"] === "string")
+    .map((s) => s["run"] as string)
+    .join("\n");
+  const stripped = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8")
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+
+  test("the guard precedes EVERY write operation (checkout and all release/ref steps come after it)", () => {
+    const names = job.steps.map((s) => String(s["name"] ?? s["uses"] ?? ""));
+    const guardIdx = names.findIndex((n) => n.startsWith("HARD GUARD"));
+    assert.equal(guardIdx, 0, "the hard guard is the FIRST step");
+    const firstCheckout = job.steps.findIndex((s) => typeof s["uses"] === "string" && (s["uses"] as string).startsWith("actions/checkout"));
+    const firstWrite = runs.search(/gh release (create|upload|delete)|gh api --method (POST|PATCH|DELETE)/);
+    assert.ok(firstCheckout > guardIdx, "checkout happens after the guard");
+    assert.ok(firstWrite >= 0 && firstCheckout > 0, "write steps exist and are pinned relative to checkout");
+  });
+
+  test("the rehearsal creates versioned releases with --latest=false and NEVER promotes through the repo-wide latest mechanism", () => {
+    assert.match(stripped, /--latest=false/, "versioned releases are created explicitly NOT latest");
+    assert.ok(!stripped.includes("gh release edit"), "the retired `gh release edit --latest` promotion is GONE");
+    assert.ok(!stripped.includes("--scope latest"), "no `--scope latest` verification remains");
+    assert.ok(!stripped.includes("release-latest"), "the retired release-latest discovery CLI is not part of the rehearsal");
+    assert.ok(!stripped.includes("releases/latest/download"), "no repo-wide latest download URL is exercised");
+  });
+
+  test("the rehearsal exercises the FULL dedicated stable-reference architecture", () => {
+    assert.match(runs, /stable-pointer-current/, "the hardened stable-pointer discovery is used for rollback bookkeeping");
+    assert.match(runs, /stable-pointer-build/, "the pointer JSON is built from the VERIFIED release bytes");
+    assert.match(runs, /pointerSchema[\s\S]*graveyield\.console-snapshot-stable-pointer\.v1/, "the pointer is strictly validated against the approved schema before use");
+    // The annotated tag object + dedicated ref mutations, repository-qualified.
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/tags"/, "an ANNOTATED pointer tag object is created via POST /git/tags");
+    assert.match(runs, /-f message="\$POINTER_JSON"/, "the pointer JSON is the tag-object message");
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/refs"/, "first publication CREATES the dedicated ref");
+    assert.match(runs, /--method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"[\s\S]*-F force=true/s, "subsequent publications MOVE the dedicated ref with ONE atomic PATCH");
+    assert.match(runs, /-f ref="\$STABLE_REF"/, "ref creation uses the dedicated ref constant");
+    assert.equal(job.env?.["STABLE_REF"], "refs/tags/console-snapshot-prod", "the rehearsal pins the exact dedicated ref name");
+    // Read-back + full identity chain.
+    assert.match(runs, /READ-BACK MISMATCH/, "the ref read-back is verified (sha + message equality)");
+    assert.match(runs, /verify-stable[\s\\]+/, "the FULL production identity chain (verify-stable) validates the activated pointer");
+    assert.match(runs, /--scope versioned/, "assets are verified through the VERSIONED scope (same-release cross-check), never through a repo-wide alias");
+  });
+
+  test("the rehearsal exercises BOTH rollback cases and failure injection around activation", () => {
+    assert.match(runs, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "first-publication rollback deletes the dedicated ref");
+    assert.match(runs, /\[ "\$code" != "404" \]/, "the first-publication rollback proves absence by a genuine HTTP 404 read-back");
+    assert.match(runs, /verify-stable[\s\S]*PRIOR_TAG/, "the previous-pointer rollback is verified through the FULL identity chain for the restored release");
+    // Failure injection BEFORE activation (partial upload) and AFTER
+    // activation (rollback drill + failed-activation probe).
+    assert.match(runs, /verification PASSED on a partial release/, "a pre-activation failure injection exists (partial upload must fail verification)");
+    assert.match(runs, /the dedicated stable reference is unchanged after the partial-upload failure|SAFETY FAILURE: the stable reference moved after a FAILED publication/, "the pre-activation failure must leave the prior pointer intact");
+    assert.match(runs, /pointer build for missing release .* fails/, "an activation for a missing release must fail closed");
+    assert.match(runs, /rollback drill/, "a post-activation rollback drill exists");
+  });
+
+  test("an UNRELATED release (even taking the repo-wide latest designation) is proven unable to move the dedicated ref", () => {
+    const probe = job.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("unrelated"));
+    assert.ok(probe, "the unrelated-release probe step exists");
+    const runsProbe = (probe!["run"] as string) ?? "";
+    assert.match(runsProbe, /--latest/, "the probe deliberately takes the repo-wide latest designation");
+    assert.match(runsProbe, /stable-pointer-current/, "and the dedicated reference is re-read afterward");
+    assert.match(runsProbe, /SAFETY FAILURE: the dedicated stable reference moved/, "a moved dedicated reference fails the rehearsal loudly");
+    assert.match(runsProbe, /verify-stable/, "the probe also re-verifies the full identity chain for the expected tag");
+    assert.match(runsProbe, /gh release delete/, "the probe release is cleaned up afterward");
+  });
+
+  test("the rehearsal's credential stays scoped to the rehearsal repository", () => {
+    assert.equal(job.env?.["GH_TOKEN"], "${{ github.token }}", "the rehearsal uses the run's own repository-scoped token");
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    assert.ok(!raw.includes("secrets."), "no repository secret (including the production PAT) is referenced anywhere in the rehearsal");
   });
 });
 
@@ -1060,5 +1179,163 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
       "the exact condition: on a fully successful promotion failure() is false, so the rollback never runs even though the marker is set",
     );
     assert.equal(steps[readbackIdx]!["if"], "success()", "the read-back gate lets a verified activation complete the job without the rollback");
+  });
+});
+
+// ─── Eighth round (review Finding 1) — the dedicated downstream rollback job ─
+//
+// The promote job's in-job rollback step can only run while promote itself
+// is failing. Once promotion COMPLETES, the separate verify-stable job runs
+// — and if THAT job fails, the stable reference could stay pointed at a
+// publication that never passed the full downstream verification chain.
+// These tests pin the dedicated `rollback` job: its dependency-graph gate,
+// its compare-before-rollback single-writer guard, both rollback cases
+// (previous pointer restore / first-publication ref deletion), its
+// read-back verification, its loud failure with preserved evidence, and
+// its PAT isolation.
+
+describe("publish-console-snapshot workflow — downstream rollback job (eighth round, Finding 1)", () => {
+  const wf = loadWorkflow();
+  const rollback = wf.jobs["rollback"]!;
+  const promote = wf.jobs["promote"]!;
+  const verifyStable = wf.jobs["verify-stable"]!;
+
+  test("the rollback job exists and is wired AFTER the downstream verification", () => {
+    assert.ok(rollback, "the rollback job exists");
+    assert.ok(rollback.needs?.includes("publish"), "the rollback job consumes the publish job's outputs (versioned tag, previous pointer)");
+    assert.ok(rollback.needs?.includes("promote"), "the rollback job consumes the promotion outputs");
+    assert.ok(rollback.needs?.includes("verify-stable"), "the rollback job's trigger is the downstream verification result");
+  });
+
+  test("promotion succeeds AND downstream verification succeeds → NO rollback", () => {
+    // The exact dependency-graph condition: it requires
+    // needs.verify-stable.result == 'failure', so a green verification
+    // (run success) can never trigger the rollback job.
+    const cond = rollback["if"] ?? "";
+    assert.match(cond, /failure\(\)/, "the condition requires the run to be in failure state");
+    assert.match(cond, /needs\.verify-stable\.result == 'failure'/, "the condition requires the DOWNSTREAM verification to have failed — success never triggers a rollback");
+    assert.match(cond, /github\.ref == 'refs\/heads\/main'/, "the rollback is still main-gated");
+  });
+
+  test("promotion succeeds AND downstream verification fails → rollback is attempted", () => {
+    const cond = rollback["if"] ?? "";
+    assert.match(cond, /needs\.promote\.result == 'success'/, "the condition requires promotion to have COMPLETED (the case the in-job rollback cannot cover)");
+    assert.match(cond, /needs\.verify-stable\.result == 'failure'/, "and the downstream verification to have failed");
+    // The mutation exists in the job: a committed compare + mutate + read-back chain.
+    const runs = runBlocks(rollback).join("\n");
+    assert.match(runs, /rollback mutation issued/, "the mutation step issues and records the rollback mutation");
+    assert.match(runs, /rollback VERIFIED|rollback verification FAILED/, "the job verifies the rollback outcome by read-back");
+  });
+
+  test("a previous pointer existed → the previous pointer is restored and verified", () => {
+    const runs = runBlocks(rollback).join("\n");
+    // The update branch: re-create the previous pointer tag object and move the ref to it.
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/tags"/, "the previous pointer tag object is re-created (POST /git/tags)");
+    assert.match(runs, /-f message="\$PREV_POINTER_JSON"/, "the re-created object carries the recorded previous pointer JSON verbatim");
+    assert.match(runs, /--method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" -f sha="\$old_sha" -F force=true/, "the ref is moved back with ONE repository-qualified PATCH");
+    // Read-back: sha + message + previous versioned tag identity.
+    assert.match(runs, /\[ "\$sha" = "\$OLD_SHA" \]/, "read-back checks the ref resolves to the restored object");
+    assert.match(runs, /\[ "\$message" = "\$PREV_POINTER_JSON" \]/, "read-back checks the restored message byte-for-byte");
+    assert.match(runs, /\[ "\$restored_tag" = "\$PREV_VERSIONED_TAG" \]/, "read-back checks the restored pointer names the previous versioned release");
+    // The rollback inputs cross the job boundary through explicit outputs.
+    assert.equal(promote.outputs?.["ref_mode"], "${{ steps.stablegate.outputs.ref_mode }}", "promote exposes the pre-activation ref mode");
+    assert.equal(promote.outputs?.["previous_pointer_json"], "${{ steps.stablegate.outputs.previous_pointer_json }}", "promote exposes the verbatim previous pointer JSON");
+    assert.equal(promote.outputs?.["previous_versioned_tag"], "${{ steps.stablegate.outputs.previous_versioned_tag }}", "promote exposes the previous versioned tag");
+    assert.equal(promote.outputs?.["new_tag_object_sha"], "${{ steps.activate.outputs.new_tag_object_sha }}", "promote exposes the tag object this run created (the compare anchor)");
+    // The rollback job consumes the previous pointer across the job
+    // boundary through the mutate step's explicit env indirection.
+    const mutate = rollback.steps.find((s) => s["id"] === "mutate")!;
+    assert.equal(stepEnv(mutate!)["PREV_POINTER_JSON"], "${{ needs.promote.outputs.previous_pointer_json }}", "the rollback job consumes the previous pointer across the job boundary");
+    assert.equal(stepEnv(mutate!)["PREV_VERSIONED_TAG"], "${{ needs.promote.outputs.previous_versioned_tag }}", "the rollback job consumes the previous versioned tag across the job boundary");
+    assert.equal(stepEnv(mutate!)["REF_MODE"], "${{ needs.promote.outputs.ref_mode }}", "the rollback job consumes the pre-activation ref mode across the job boundary");
+  });
+
+  test("no previous pointer existed (first publication) → the newly created stable reference is deleted and absence is verified by 404", () => {
+    const runs = runBlocks(rollback).join("\n");
+    assert.match(runs, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "first-publication rollback deletes the ref via the repository-qualified endpoint");
+    assert.match(runs, /\[ "\$code" = "404" \]/, "absence is proven ONLY by a genuine 404 read-back");
+    assert.match(runs, /rollback VERIFIED: the stable ref is absent again/, "the restored absent state is explicitly verified");
+  });
+
+  test("the stable reference no longer points at this run's tag object → the rollback REFUSES to overwrite it", () => {
+    const compare = rollback.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("COMPARE-BEFORE-ROLLBACK"));
+    assert.ok(compare, "the compare-before-rollback step exists");
+    assert.equal(stepEnv(compare!)["GH_TOKEN"], "${{ github.token }}", "the comparison runs with the READ-ONLY token");
+    assert.equal(stepEnv(compare!)["NEW_SHA"], "${{ needs.promote.outputs.new_tag_object_sha }}", "the comparison anchors on THIS run's created tag object");
+    const runs = (compare!["run"] as string) ?? "";
+    assert.match(runs, /\[ "\$sha" != "\$NEW_SHA" \]/, "a moved pointer (different object sha) is detected");
+    assert.match(runs, /refusing to overwrite a moved pointer/, "the refusal is explicit");
+    assert.match(runs, /OPERATOR INTERVENTION REQUIRED/, "the refusal is an explicit operator-intervention failure");
+    assert.match(runs, /exit 1/, "the job fails instead of proceeding to any mutation");
+    assert.match(runs, /GITHUB_STEP_SUMMARY/, "the observed state is preserved as evidence");
+    // The mutation step is unreachable unless the comparison passed.
+    const mutate = rollback.steps.find((s) => s["id"] === "mutate");
+    assert.ok(mutate, "the mutation step exists");
+    assert.equal(mutate!["if"], "steps.compare.outputs.compare_ok == 'true'", "the mutation runs ONLY after a successful comparison");
+    const readbackStep = rollback.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("rollback VERIFIED") || typeof s["run"] === "string" && (s["run"] as string).includes("rollback verification FAILED"));
+    assert.equal(readbackStep!["if"], "steps.compare.outputs.compare_ok == 'true'", "the read-back verification is likewise unreachable without a comparison");
+  });
+
+  test("promotion never started (or failed) → the rollback job does NOT run", () => {
+    // The gate demands promote.result == 'success': a skipped or failed
+    // promotion means the ref was never (successfully) moved by this run —
+    // the activation_started safety concept is preserved at the GRAPH level.
+    const cond = rollback["if"] ?? "";
+    assert.match(cond, /needs\.promote\.result == 'success'/, "a failed or skipped promotion can never trigger this job");
+    // The in-job promote rollback still owns the pre-activation / failed-
+    // activation cases (unchanged seventh-round behavior).
+    const promoteRollback = promote.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"));
+    assert.ok(promoteRollback, "the promote job's own rollback step still exists for failures before/at activation");
+    assert.equal(promoteRollback!["if"], "failure() && steps.activation_gate.outputs.activation_started == 'true'", "the in-job rollback still requires the activation-start marker");
+  });
+
+  test("an ambiguous activation result is decided from REMOTE state, never from reported step success", () => {
+    // The downstream rollback job re-reads the live ref BEFORE mutating:
+    // the decision input is the remote state, so an activation whose
+    // reported result is ambiguous (timeout, interruption, partial
+    // completion) is handled by observing what actually happened.
+    const runs = runBlocks(rollback).join("\n");
+    assert.match(runs, /git\/ref\/tags\/console-snapshot-prod/, "the comparison reads the live stable ref");
+    assert.match(runs, /compare_ok=true/, "the comparison's verdict gates the mutation");
+    // The design is documented on the compare step (raw file, comments included).
+    const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
+    assert.match(raw, /The decision to roll back is made from the REMOTE state/, "the design is documented in the step itself");
+    // The promote job's in-job rollback keeps the same property (marker
+    // precedes mutation; the read-back, not the step status, decides).
+    const promoteRollback = promote.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"))!;
+    assert.match((promoteRollback["run"] as string), /rollback_ok/, "the in-job rollback also verifies by read-back rather than trusting the activation status");
+  });
+
+  test("a rollback mutation or read-back failure reports failure and preserves diagnostic evidence", () => {
+    const readback = rollback.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK UNVERIFIED"));
+    assert.ok(readback, "the read-back verification step exists");
+    assert.equal(stepEnv(readback!)["GH_TOKEN"], "${{ github.token }}", "read-back authenticates with the READ-ONLY automatic token");
+    const runs = (readback!["run"] as string) ?? "";
+    assert.match(runs, /ROLLBACK UNVERIFIED[\s\S]*exit 1/s, "an unverifiable rollback fails LOUDLY");
+    assert.match(runs, /GITHUB_STEP_SUMMARY/, "diagnostic evidence (previous pointer JSON, restoration procedure) is preserved in the run summary");
+    assert.match(runs, /PREV_POINTER_JSON/, "the recorded previous pointer JSON is part of the preserved evidence");
+    assert.match(runs, /Manual restoration required|MANUAL RESTORATION REQUIRED/, "the operator is given the restoration path");
+  });
+
+  test("PAT isolation holds across the rollback job: discovery and verification are read-only, only the mutation carries the PAT", () => {
+    assert.deepEqual(rollback.permissions, { contents: "read" }, "the rollback job's automatic token is READ-ONLY");
+    const mutate = rollback.steps.find((s) => s["id"] === "mutate")!;
+    assert.equal(stepEnv(mutate!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the mutation step carries the dedicated PAT");
+    // Every other token-bearing step in the job uses the READ-ONLY token.
+    for (const step of rollback.steps) {
+      const env = stepEnv(step);
+      if ("GH_TOKEN" in env && step !== mutate) {
+        assert.equal(env["GH_TOKEN"], "${{ github.token }}", "discovery/verification steps never receive the PAT");
+      }
+    }
+    // The job contains no checkout / setup-node / custom code at all.
+    for (const step of rollback.steps) {
+      const uses = (step["uses"] as string | undefined) ?? "";
+      assert.ok(!uses.startsWith("actions/checkout") && !uses.startsWith("actions/setup-node"), "the rollback job never checks out code or runs setup-node");
+      const run = (step["run"] as string) ?? "";
+      assert.ok(!/\bnode\b|pnpm|npm|npx|\.mjs|tsx/.test(run), "the rollback job executes no custom or repository-built code");
+    }
+    // The downstream verification job that TRIGGERS the rollback stays read-only.
+    assert.deepEqual(verifyStable.permissions, { contents: "read" }, "verify-stable remains read-only — a failing verification job must not need write access to recover");
   });
 });

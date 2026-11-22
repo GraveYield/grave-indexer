@@ -10,7 +10,7 @@ name: publish-console-snapshot
 # EXECUTION RESTRICTION (review Task 1): the workflow is restricted to
 # the `main` branch at TWO independent layers:
 #   1. a job-level `if: github.ref == 'refs/heads/main'` condition on
-#      ALL SEVEN jobs — a dispatch against any other ref skips every job
+#      ALL EIGHT jobs — a dispatch against any other ref skips every job
 #      outright, so release-writing steps are unreachable;
 #   2. an explicit guard step at the top of each job that re-checks
 #      GITHUB_REF == refs/heads/main (defense in depth; also covers a
@@ -119,6 +119,22 @@ name: publish-console-snapshot
 #                            workflow token from a full repository
 #                            checkout (the code it runs is the reviewed
 #                            commit's own).
+#   rollback (read+PAT)      EIGHTH-ROUND CORRECTION (Finding 1): the
+#                            DEDICATED downstream rollback job. Runs ONLY
+#                            when `promote` succeeded and `verify-stable`
+#                            FAILED after it — the case the promote job's
+#                            own rollback step can no longer cover once
+#                            promotion has completed. Compares the current
+#                            stable ref against THIS run's pointer tag
+#                            object with the READ-ONLY token BEFORE any
+#                            mutation (refuses to overwrite a pointer that
+#                            moved independently), restores the recorded
+#                            previous pointer or deletes the
+#                            first-publication ref in ONE privileged
+#                            step, and verifies the result by read-back —
+#                            failing LOUDLY with preserved evidence if the
+#                            restoration cannot be proven. Zero custom
+#                            code; PAT on the mutation step's env only.
 #
 # FOURTH-ROUND CORRECTION — CREDENTIAL ISOLATION VIA A DEDICATED PAT:
 # the owner provisioned a fine-grained PAT exclusively for this
@@ -131,15 +147,17 @@ name: publish-console-snapshot
 #
 #   * EVERY job declares `contents: read` (explicitly at job level, not
 #     only via the workflow default) — the automatic GITHUB_TOKEN is
-#     READ-ONLY in all seven jobs by construction;
+#     READ-ONLY in all eight jobs by construction;
 #   * the ONLY write-capable credential in the entire workflow is the
 #     owner-provisioned `GY_RELEASE_PAT` secret, exposed as STEP-LEVEL
 #     env on EXACTLY the trusted mutation steps (the create+upload step
-#     of `release`, the stable-ref activation step of `promote`, and the
-#     rollback step of `promote`) — never at workflow or job level,
+#     of `release`, the stable-ref activation step of `promote`, the
+#     rollback step of `promote`, and the single mutation step of the
+#     dedicated `rollback` job) — never at workflow or job level,
 #     never to any step that checks out code, installs dependencies,
 #     runs node/scripts or downloads artifacts;
-#   * the `release` and `promote` jobs still contain ZERO custom code
+#   * the `release`, `promote` and `rollback` jobs still contain ZERO
+#     custom code
 #     (no checkout, no setup-node, no pnpm, no node, no repository or
 #     artifact-executed code) — pinned by test/publishWorkflow.test.ts.
 #   Trust assumption (owner-side, not verifiable from the workflow): the
@@ -229,23 +247,30 @@ name: publish-console-snapshot
 #      reached when every prior job is green AND the three-way
 #      stable-ref gate has read the current ref state. An
 #      activation-start marker is written immediately BEFORE the first
-#      mutation; the rollback step runs only when that marker exists AND
-#      the run has failed — never for a failure that happened before
-#      activation was attempted.
+#      mutation; the in-job rollback step runs only when that marker
+#      exists AND the promote job itself has failed — never for a failure
+#      that happened before activation was attempted.
 #   7. verify-stable (read-only) — the DEDICATED stable reference must
 #      resolve to a pointer naming exactly the activated versioned tag
 #      AND that release must serve one complete verified artifact set
 #      (full identity chain via `verify-stable --expected-tag`); then
 #      the publication summary (incl. the rollback pointer) is written.
+#   8. rollback (privileged on ONE step, zero custom code) — EIGHTH-ROUND
+#      CORRECTION (Finding 1): runs ONLY when promote succeeded and
+#      verify-stable FAILED after it. Compares the live stable ref
+#      against this run's created pointer tag object (read-only), refuses
+#      to overwrite a moved pointer, restores the previous pointer or
+#      deletes the first-publication ref, and verifies the restoration by
+#      read-back — failing loudly with preserved evidence otherwise.
 #
 # PERMISSIONS: least privilege — the workflow default is `contents:
-# read`, and EVERY ONE of the seven jobs declares `contents: read`
+# read`, and EVERY ONE of the eight jobs declares `contents: read`
 # EXPLICITLY at job level: the automatic GITHUB_TOKEN is READ-ONLY in
 # every job of this workflow, and no job-level grant can elevate it.
 # The ONLY write-capable credential is the `GY_RELEASE_PAT` secret on
 # the two trusted release-mutation steps (step-level env only). An
 # untrusted pull_request context cannot reach any step:
-# workflow_dispatch is the only trigger, all seven jobs are gated to
+# workflow_dispatch is the only trigger, all eight jobs are gated to
 # refs/heads/main, and the workflow-level default is read-only.
 #
 # RELEASE PROTECTION MODEL (review Task 3): VERIFIED repository
@@ -1105,6 +1130,21 @@ jobs:
           fi
     outputs:
       versioned_tag: ${{ needs.verify-versioned.outputs.versioned_tag }}
+      # EIGHTH-ROUND CORRECTION (review Finding 1): the downstream rollback
+      # job must be able to restore the pre-activation state when the
+      # POST-activation verification fails. These outputs carry the exact
+      # rollback inputs across the job boundary: the ref mode (create =
+      # first publication, update = a previous pointer existed), the
+      # verbatim previous pointer JSON, the previous versioned tag, and the
+      # annotated tag object SHA this run created (the compare-before-
+      # rollback anchor). Job outputs are published only when the job
+      # SUCCEEDS — which is exactly the only situation in which the
+      # rollback job runs (promote must have succeeded for verify-stable to
+      # have failed after it).
+      ref_mode: ${{ steps.stablegate.outputs.ref_mode }}
+      previous_pointer_json: ${{ steps.stablegate.outputs.previous_pointer_json }}
+      previous_versioned_tag: ${{ steps.stablegate.outputs.previous_versioned_tag }}
+      new_tag_object_sha: ${{ steps.activate.outputs.new_tag_object_sha }}
 
   # ─────────────────────────────────────────────────────────────────────
   # 7. verify-stable — READ-ONLY post-activation stable-reference gate
@@ -1158,9 +1198,14 @@ jobs:
         # path — a private repository's release assets 404 for
         # unauthenticated requests) → checksum + provenance + integrity →
         # pointer digests over the fetched bytes. A raced ref, an
-        # unexpected pointer target, a mixed artifact set or a digest
-        # divergence FAILS the run (the promote job's rollback step
-        # restores the previous pointer). This is a READ-ONLY job: it
+        # unexpected pointer target, a mixed artifact set, a digest
+        # divergence or a completeness-contract failure (eighth round —
+        # the verifier enforces the producer's completeness conditions)
+        # FAILS the run — and that failure now ALSO triggers the dedicated
+        # downstream ROLLBACK job below (Finding 1): the promote job's own
+        # rollback step can no longer run once promote has completed, so
+        # the stable-reference recovery for a POST-promotion verification
+        # failure lives in its own job. This is a READ-ONLY job: it
         # runs the reviewed commit's own verification code with the
         # workflow's READ-ONLY token — no write permission and no
         # release-write credential exists in this job at all.
@@ -1209,4 +1254,284 @@ jobs:
             echo '```json'
             cat bundle/console-snapshot-provenance.json
             echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # 8. rollback — PRIVILEGED recovery of the dedicated stable reference
+  #    when the POST-ACTIVATION verification (verify-stable) fails AFTER
+  #    the promotion succeeded. EIGHTH-ROUND CORRECTION (review Finding 1).
+  #
+  #    WHY THIS JOB EXISTS: the promote job's in-job rollback step can only
+  #    run while promote is still failing. Once promote COMPLETES, the
+  #    separate verify-stable job runs — and if THAT job fails, promote is
+  #    already done and its rollback step can never fire. Without this job,
+  #    the stable reference could remain pointed at a publication that did
+  #    not pass the complete downstream verification chain (a violation of
+  #    the last-known-good requirement). This job restores the recorded
+  #    previous pointer (or deletes the first-publication ref) and verifies
+  #    the result by read-back — the same last-known-good semantics the
+  #    promote job enforces for its own failures.
+  #
+  #    RUN CONDITION (the dependency-graph gate): ONLY when
+  #      (a) the run is in failure state,
+  #      (b) `promote` COMPLETED SUCCESSFULLY — activation was attempted
+  #          and the ref was actually moved (the promote job's own
+  #          activation-start marker semantics guarantee the ref was never
+  #          touched when promote failed; its in-job rollback step handles
+  #          that case, and this job deliberately does NOT run then),
+  #      (c) `verify-stable` FAILED after that successful promotion,
+  #      (d) the dispatch was on refs/heads/main.
+  #    A failure in ANY earlier job (generate/verify/publish/release/
+  #    verify-versioned) or a promotion that never started (promote
+  #    skipped or failed) can NEVER trigger this job: the stable reference
+  #    was not moved by this run, and "activation_started" is implicitly
+  #    false because promote did not succeed.
+  #
+  #    COMPARE-BEFORE-ROLLBACK (single-writer guard): BEFORE any mutation,
+  #    the CURRENT stable reference is read with the READ-ONLY token and
+  #    must STILL point at the exact annotated tag object this run created
+  #    (promote's `new_tag_object_sha`). If it points anywhere else — a
+  #    newer pointer, an externally changed pointer, or a deleted ref — the
+  #    rollback REFUSES to overwrite it and fails with an explicit
+  #    operator-intervention error. Workflow concurrency provides ordering
+  #    for THIS workflow's runs only; it does NOT provide compare-and-swap
+  #    protection against external writers — this comparison does.
+  #
+  #    CREDENTIAL ISOLATION: discovery (the comparison read) and the
+  #    read-back verification authenticate with the READ-ONLY automatic
+  #    token. The ONLY step carrying the write-capable credential is the
+  #    single mutation step (GY_RELEASE_PAT, step-level env) — the PAT
+  #    never reaches checkout, artifact handling, parsing, verification,
+  #    build or test steps (this job has none of those).
+  #
+  #    ZERO CUSTOM CODE: pinned `gh api`, `curl`, `jq` and shell
+  #    validation only — no checkout, no node, no repository script.
+  # ─────────────────────────────────────────────────────────────────────
+  rollback:
+    name: restore the previous stable pointer after a failed post-activation verification (privileged — pinned gh api mutations only, no custom code)
+    needs: [publish, promote, verify-stable]
+    # The dependency-graph gate: promote succeeded (activation completed)
+    # AND verify-stable failed after it AND the run is on main.
+    if: >-
+      failure() &&
+      needs.promote.result == 'success' &&
+      needs.verify-stable.result == 'failure' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # EXPLICIT read-only grant: the automatic GITHUB_TOKEN is READ-ONLY in
+    # every step of this job; the ref mutations authenticate through the
+    # dedicated `GY_RELEASE_PAT` secret on the mutation step's env alone.
+    permissions:
+      contents: read
+    env:
+      REPO: ${{ github.repository }}
+      STABLE_REF: refs/tags/console-snapshot-prod
+    steps:
+      - name: Guard — the post-verification rollback runs ONLY from refs/heads/main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "refusing to run: production publication is restricted to refs/heads/main (got: $GITHUB_REF)"
+            exit 1
+          fi
+      - name: Re-validate the versioned tag crossing the job boundary
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+        run: |
+          case "$TAG" in
+            console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            console-snapshot-prod-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-notrack) ;;
+            '') echo "no versioned tag crossed into the rollback job"; exit 1 ;;
+            *) echo "tag crossing into the rollback job fails the strict versioned-tag shape: $TAG"; exit 1 ;;
+          esac
+      - name: Compare-before-rollback — the stable ref must STILL point at THIS run's pointer tag object (read-only)
+        # The decision to roll back is made from the REMOTE state, never
+        # from step-success flags: if activation's result were ambiguous
+        # (a timed-out request that GitHub nevertheless applied, or a
+        # request that was killed mid-flight), the promote job's marker
+        # semantics already attempted its in-job rollback; this job's
+        # comparison re-establishes ground truth BEFORE it mutates
+        # anything. Three-way classification: 200 + matching sha = safe to
+        # roll back; 200 + different sha / 404 = the pointer moved or was
+        # deleted independently — REFUSE (operator intervention); any
+        # other status = the gate itself failed — REFUSE (fail closed).
+        id: compare
+        env:
+          NEW_SHA: ${{ needs.promote.outputs.new_tag_object_sha }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
+        run: |
+          code=$(curl -sS -o /tmp/rollback-ref.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod") || { echo "rollback compare gate FAILED (curl transport error); refusing to touch the ref"; exit 1; }
+          {
+            echo "## Rollback — state observed BEFORE any mutation"
+            echo "- expected tag object (created by this run): \`$NEW_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$code" in
+            200)
+              sha=$(jq -r '.object.sha // ""' /tmp/rollback-ref.json)
+              {
+                echo "- observed stable ref object.sha: \`${sha:-<none>}\` (HTTP 200)"
+              } >> "$GITHUB_STEP_SUMMARY"
+              if [ "$sha" != "$NEW_SHA" ]; then
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED"
+                  echo "The stable reference no longer points at the tag object this run created"
+                  echo "(it now points at \`${sha:-<none>}\`). The rollback will NOT overwrite a"
+                  echo "pointer that moved independently (documented single-writer assumption)."
+                  echo "Inspect the current pointer and this run's versioned release, then restore"
+                  echo "manually if required — see docs/SNAPSHOT_PUBLICATION.md §13.3."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED: the stable ref points at '$sha', expected THIS run's object '$NEW_SHA' — refusing to overwrite a moved pointer"
+                exit 1
+              fi
+              echo "compare OK: the stable ref still points at this run's pointer tag object — rollback may proceed"
+              echo "compare_ok=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              {
+                echo "- observed: HTTP 404 — the stable ref is ABSENT"
+              } >> "$GITHUB_STEP_SUMMARY"
+              {
+                echo
+                echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED"
+                echo "The stable reference is absent, but this run's promotion completed successfully"
+                echo "(the ref was created/moved to \`$NEW_SHA\`). The pointer moved or was deleted"
+                echo "independently after promotion — the rollback will NOT blindly recreate it."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "COMPARE-BEFORE-ROLLBACK FAILED: the stable ref is absent after a completed promotion — refusing a blind rollback"
+              exit 1
+              ;;
+            *)
+              {
+                echo "- observed: unexpected HTTP $code"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "rollback compare gate FAILED (unexpected HTTP $code); refusing to treat this as a comparable state"
+              exit 1
+              ;;
+          esac
+      - name: Roll the stable reference back (restore the previous pointer, or delete the first-publication ref)
+        # Handles BOTH rollback cases with repository-qualified endpoints:
+        #   * update mode (a previous pointer existed): re-create the
+        #     previous pointer tag object (POST repos/<repo>/git/tags with
+        #     the recorded pointer JSON as the message) and move the ref
+        #     with ONE update (PATCH repos/<repo>/git/refs/tags/console-
+        #     snapshot-prod, force).
+        #   * create mode (first publication): DELETE
+        #     repos/<repo>/git/refs/tags/console-snapshot-prod — restoring
+        #     the ABSENT pre-publication state.
+        # THE write-capable credential exists ONLY on this step: the
+        # dedicated fine-grained `GY_RELEASE_PAT` repository secret,
+        # scoped to this step's env. The automatic GITHUB_TOKEN is
+        # read-only and is NOT used for the mutation; the PAT reaches only
+        # these pinned gh api invocations — never node, never a script,
+        # never an action, never a downloaded artifact.
+        id: mutate
+        if: steps.compare.outputs.compare_ok == 'true'
+        env:
+          REF_MODE: ${{ needs.promote.outputs.ref_mode }}
+          PREV_POINTER_JSON: ${{ needs.promote.outputs.previous_pointer_json }}
+          PREV_VERSIONED_TAG: ${{ needs.promote.outputs.previous_versioned_tag }}
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
+        run: |
+          set +e # mutation errors surface in the log but never abort before the read-back below can establish the actual ref state
+          if [ "$REF_MODE" = "create" ]; then
+            echo "first publication: rolling back to the ABSENT stable-ref state (deleting the ref)"
+            gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod" || true
+            echo "rollback mutation issued: DELETE repos/$REPO/git/refs/tags/console-snapshot-prod (first-publication restore)"
+          else
+            echo "rolling back to the recorded previous pointer (${PREV_VERSIONED_TAG})"
+            prev_commit=$(jq -r '.sourceCommit // ""' <<<"$PREV_POINTER_JSON")
+            case "$prev_commit" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+              *) echo "the recorded previous pointer carries no usable sourceCommit — refusing a blind rollback"; prev_commit="" ;;
+            esac
+            if [ -z "$prev_commit" ]; then
+              {
+                echo "## OPERATOR INTERVENTION REQUIRED — rollback REFUSED"
+                echo "The recorded previous pointer JSON is missing its sourceCommit; a blind rollback is impossible."
+                echo "The recorded pointer JSON was written to the promote job's run summary — restore manually per docs/SNAPSHOT_PUBLICATION.md §13.3."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "rollback REFUSED: unusable previous pointer evidence"
+              exit 1
+            fi
+            old_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+              -f tag="console-snapshot-prod" \
+              -f object="$prev_commit" \
+              -f type="commit" \
+              -f message="$PREV_POINTER_JSON" \
+              --jq '.sha')
+            gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true || true
+            echo "old_tag_object_sha=$old_sha" >> "$GITHUB_OUTPUT"
+            echo "rollback mutation issued: repos/$REPO/git/refs/tags/console-snapshot-prod -> $old_sha (${PREV_VERSIONED_TAG})"
+          fi
+      - name: Read-back verification (the rollback MUST be provable — fail LOUDLY otherwise)
+        # READ-ONLY (automatic token). update mode: the ref must resolve to
+        # exactly the re-created previous tag object, its message must
+        # equal the recorded previous pointer JSON byte-for-byte, and the
+        # pointer must name the previous versioned tag. create mode: the
+        # ref must be GENUINELY absent (HTTP 404 — never an interpreted
+        # auth/rate-limit/outage failure). ANY unverifiable outcome fails
+        # LOUDLY with the full diagnostic evidence preserved in the run
+        # summary — the run NEVER claims restoration without evidence.
+        if: steps.compare.outputs.compare_ok == 'true'
+        env:
+          REF_MODE: ${{ needs.promote.outputs.ref_mode }}
+          PREV_POINTER_JSON: ${{ needs.promote.outputs.previous_pointer_json }}
+          PREV_VERSIONED_TAG: ${{ needs.promote.outputs.previous_versioned_tag }}
+          OLD_SHA: ${{ steps.mutate.outputs.old_tag_object_sha }}
+          GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
+        run: |
+          rollback_ok=false
+          if [ "$REF_MODE" = "create" ]; then
+            code=$(curl -sS -o /tmp/readback-ref.json -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod") || code="transport-error"
+            if [ "$code" = "404" ]; then
+              rollback_ok=true
+              echo "rollback VERIFIED: the stable ref is absent again (first-publication state restored)"
+            else
+              echo "rollback verification FAILED: the stable ref read returned '$code' (expected a genuine 404)"
+            fi
+          else
+            sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+            message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/tags/$OLD_SHA" | jq -r '.message // ""')
+            restored_tag=$(jq -r '.versionedTag // ""' <<<"$message")
+            if [ "$sha" = "$OLD_SHA" ] && [ "$message" = "$PREV_POINTER_JSON" ] && [ "$restored_tag" = "$PREV_VERSIONED_TAG" ]; then
+              rollback_ok=true
+              echo "rollback VERIFIED: the stable ref again resolves to ${PREV_VERSIONED_TAG} (tag object $OLD_SHA)"
+            else
+              echo "rollback verification FAILED: ref='$sha' expected='$OLD_SHA'; restored tag='${restored_tag}' expected='${PREV_VERSIONED_TAG}'"
+            fi
+          fi
+          if [ "$rollback_ok" != "true" ]; then
+            {
+              echo
+              echo "## ROLLBACK UNVERIFIED — MANUAL RESTORATION REQUIRED"
+              echo "- ref mode: \`$REF_MODE\`"
+              echo "- previous versioned tag: \`${PREV_VERSIONED_TAG:-<none — first publication>}\`"
+              if [ -n "$PREV_POINTER_JSON" ]; then
+                echo "- previous pointer JSON (recorded verbatim):"
+                echo '```json'
+                echo "$PREV_POINTER_JSON"
+                echo '```'
+              fi
+              echo "- restoration procedure: re-create the previous pointer tag object (\`gh api POST /git/tags\` with the recorded pointer JSON as the message) and move \`refs/tags/console-snapshot-prod\` to it (\`gh api PATCH /git/refs\`, force), then re-verify — see docs/SNAPSHOT_PUBLICATION.md §13.3"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "==================================================================="
+            echo "ROLLBACK UNVERIFIED — the stable reference state is UNVERIFIED."
+            echo "Manual restoration required (evidence and procedure preserved in"
+            echo "the run summary). The run does NOT claim the pointer was restored."
+            echo "==================================================================="
+            exit 1
+          fi
+          {
+            echo
+            echo "## Rollback VERIFIED"
+            echo "- the stable reference was restored to the last-known-good state and the restoration was proven by read-back"
+            echo "- restored target: \`${PREV_VERSIONED_TAG:-<none — first-publication ref deleted>}\`"
           } >> "$GITHUB_STEP_SUMMARY"
