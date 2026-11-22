@@ -612,6 +612,16 @@ export interface StablePointerResolution {
  * Fetch the annotated tag object behind the stable ref and parse its
  * message as the stable-pointer JSON. The message parse is strict
  * (`parseStablePointer`); any malformed message is a typed failure.
+ *
+ * NINTH ROUND (review Finding 4): the annotated tag object's identity is
+ * verified DIRECTLY against the pointer it carries — the target type must
+ * be exactly "commit", the target SHA must be present 40-hex, and the
+ * target SHA must EQUAL `pointer.sourceCommit`. This closes the identity
+ * gap where a tag object pointing at commit B could carry a pointer
+ * (and release provenance) both claiming commit A: the release-side
+ * provenance checks cannot detect that inconsistency, because they never
+ * observe the tag object's actual target. The tag target is checked from
+ * the tag object response itself — never inferred from release provenance.
  */
 export async function fetchStablePointer(args: {
   repository: string;
@@ -656,9 +666,27 @@ export async function fetchStablePointer(args: {
   if (typeof body !== "object" || body === null) {
     throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object response is not a JSON object", 200);
   }
-  const record = body as { message?: unknown; object?: { sha?: unknown } };
+  const record = body as { message?: unknown; object?: { sha?: unknown; type?: unknown } };
   if (typeof record.message !== "string" || record.message.length === 0) {
     throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object carries no message — not an annotated pointer tag", 200);
+  }
+  // NINTH ROUND (Finding 4): the tag object's TARGET is verified before
+  // the pointer is trusted. A missing, malformed, or unexpected target
+  // type (anything but exactly "commit") is a typed failure — the
+  // stable pointer must always be an annotated tag object pointing at
+  // the versioned release's source commit.
+  if (typeof record.object !== "object" || record.object === null) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object response carries no target object — the annotated tag identity cannot be established", 200);
+  }
+  if (record.object.type !== "commit") {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `stable tag-object target type is ${JSON.stringify(record.object.type ?? "<missing>")}, expected exactly "commit" — the stable pointer must be an annotated tag object pointing at a commit`,
+      200,
+    );
+  }
+  if (typeof record.object.sha !== "string" || !HEX40.test(record.object.sha)) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", "stable tag-object target sha is missing or not 40-hex — the annotated tag identity cannot be established", 200);
   }
   let pointer: StablePointerV1;
   try {
@@ -669,7 +697,21 @@ export async function fetchStablePointer(args: {
     }
     throw err;
   }
-  const commitSha = record.object && typeof record.object.sha === "string" ? record.object.sha : "<none>";
+  // NINTH ROUND (Finding 4): the tag object's ACTUAL target commit must
+  // equal the pointer's claimed sourceCommit. The release-side provenance
+  // checks (verifyStablePointerMatchesArtifacts) compare the pointer
+  // against the RELEASE record — they cannot see the tag object's real
+  // target, so a tag object pointing at commit B while its pointer and
+  // provenance both claim commit A would otherwise pass. The target is
+  // checked here, directly from the tag object response.
+  if (record.object.sha !== pointer.sourceCommit) {
+    throw new ReleaseOpsError(
+      "MALFORMED_RESPONSE",
+      `stable tag-object target commit ${record.object.sha} does not match the pointer's sourceCommit ${pointer.sourceCommit} — the annotated tag identity chain is inconsistent; refusing to verify`,
+      200,
+    );
+  }
+  const commitSha = record.object.sha;
   return { pointer, tagObjectSha: args.tagObjectSha, commitSha };
 }
 

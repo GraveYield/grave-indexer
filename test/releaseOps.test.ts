@@ -760,6 +760,11 @@ interface FakeState {
   refStatus?: number | undefined;
   refObjectSha?: string | undefined;
   tagObjectMessage?: string | undefined;
+  // NINTH ROUND (Finding 4): the annotated tag object's target type and
+  // target sha are configurable so the new identity checks can be
+  // regression-tested (defaults: a well-formed commit target).
+  tagObjectType?: string | undefined;
+  tagObjectTargetSha?: string | undefined;
   recordTag?: string | undefined;
   recordAssets?: Array<{ name: string; url: string }> | undefined;
   assetBytes?: Map<string, Uint8Array> | undefined;
@@ -776,7 +781,9 @@ interface FakeState {
       }
       if (url.startsWith(`https://api.github.com/repos/${REPO}/git/tags/`)) {
         if (state.tagObjectMessage === undefined) return textResponse("not found", 404);
-        return new Response(JSON.stringify({ message: state.tagObjectMessage, object: { sha: SOURCE_COMMIT, type: "commit" } }), { status: 200 });
+        const targetSha = state.tagObjectTargetSha ?? SOURCE_COMMIT;
+        const targetType = state.tagObjectType ?? "commit";
+        return new Response(JSON.stringify({ message: state.tagObjectMessage, object: { sha: targetSha, type: targetType } }), { status: 200 });
       }
       if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
         return new Response(JSON.stringify({ tag_name: state.recordTag ?? TAG_B, assets: state.recordAssets ?? [] }), { status: 200 });
@@ -990,6 +997,131 @@ interface FakeState {
       "a lightweight or unrelated tag object can never be interpreted as the stable pointer",
     );
     globalThis.fetch = realFetch;
+  });
+
+
+  test("NINTH ROUND (Finding 4) — correct target type 'commit' AND matching target sha: the identity chain passes", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, tagObjectType: "commit", tagObjectTargetSha: SOURCE_COMMIT });
+    const stable = await verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN });
+    assert.equal(stable.commitSha, SOURCE_COMMIT, "the verified resolution reports the tag object's actual target commit");
+    assert.equal(stable.pointer.sourceCommit, SOURCE_COMMIT);
+    globalThis.fetch = realFetch;
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — target type 'commit' but the target sha MISMATCHES pointer.sourceCommit: rejected", async () => {
+    // The identity-chain gap: the tag object points at commit B while the
+    // pointer (and the release provenance) both claim commit A.
+    const pointer = pointerFor();
+    const otherCommit = "b".repeat(40);
+    assert.notEqual(otherCommit, SOURCE_COMMIT);
+    installFake({
+      ...assetState(),
+      tagObjectMessage: pointer.json,
+      tagObjectTargetSha: otherCommit,
+      recordTag: TAG_B,
+      assetBytes: new Map([
+        [`${ASSET_BASE}/1`, B.snapshot],
+        [`${ASSET_BASE}/2`, B.provenanceBytes],
+        [`${ASSET_BASE}/3`, B.checksum],
+      ]),
+    });
+    let thrown: unknown = null;
+    try {
+      await verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN });
+    } catch (err) {
+      thrown = err;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.ok(thrown instanceof ReleaseOpsError, "a typed ReleaseOpsError is thrown");
+    assert.equal((thrown as ReleaseOpsError).category, "MALFORMED_RESPONSE");
+    assert.match((thrown as ReleaseOpsError).message, /target commit .* does not match the pointer's sourceCommit/, "the diagnostic names the inconsistent identity chain");
+    // The rejection happens BEFORE any release/asset work is trusted.
+    assert.ok(!requested.some((u) => u.startsWith(`${ASSET_BASE}/`)), "no asset is downloaded when the tag target contradicts the pointer");
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — an unexpected target type ('tree') is rejected", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, tagObjectType: "tree" });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE" && /expected exactly "commit"/.test(err.message),
+      "a tag object targeting a tree can never be the stable pointer",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — an unexpected target type ('blob') is rejected", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, tagObjectType: "blob" });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — a MISSING target object / target sha is rejected", async () => {
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, tagObjectTargetSha: "" });
+    await assert.rejects(
+      () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE" && /target sha is missing or not 40-hex|target object/.test(err.message),
+      "a tag object without a usable target sha is a typed failure",
+    );
+    globalThis.fetch = realFetch;
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — a MALFORMED tag-object response (no object field) is rejected", async () => {
+    const pointer = pointerFor();
+    requested.length = 0;
+    const realFetchLocal = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requested.push(url);
+      if (url === REF_URL) return new Response(JSON.stringify({ object: { sha: TAG_OBJECT_SHA, type: "tag" } }), { status: 200 });
+      if (url.startsWith(`https://api.github.com/repos/${REPO}/git/tags/`)) {
+        return new Response(JSON.stringify({ message: pointer.json }), { status: 200 });
+      }
+      if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+        return new Response(JSON.stringify({ tag_name: TAG_B, assets: assetState().recordAssets ?? [] }), { status: 200 });
+      }
+      const bytes = assetState().assetBytes?.get(url);
+      if (bytes) return binaryResponse(bytes);
+      return textResponse("not found", 404);
+    }) as typeof fetch;
+    try {
+      await assert.rejects(
+        () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+        (err: unknown) => err instanceof ReleaseOpsError && err.category === "MALFORMED_RESPONSE" && /carries no target object/.test(err.message),
+        "a malformed tag-object response without a target object cannot establish the annotated identity",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("NINTH ROUND (Finding 4) REGRESSION — the check exercises the ACTUAL verification path (verifyStableReference), not an unused helper", async () => {
+    // fetchStablePointer is the function verifyStableReference calls; the
+    // mismatch must surface through it, driven by a non-commit target.
+    const pointer = pointerFor();
+    installFake({ ...assetState(), tagObjectMessage: pointer.json, tagObjectType: "tree", tagObjectTargetSha: SOURCE_COMMIT });
+    let calls = 0;
+    const realFetchLocal = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      if (String(input).startsWith(`https://api.github.com/repos/${REPO}/git/tags/`)) calls += 1;
+      return realFetchLocal(input);
+    }) as typeof fetch;
+    try {
+      await assert.rejects(
+        () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+        /expected exactly "commit"/,
+      );
+      assert.equal(calls, 1, "verifyStableReference fetched the annotated tag object and the check ran inside the production path");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   test("buildStablePointerForRelease: verifies the release and builds the pointer JSON with the rollback record", async () => {

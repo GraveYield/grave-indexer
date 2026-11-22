@@ -665,9 +665,22 @@ unauthenticated (no credential used):
 
 Consequences, stated precisely:
 
-1. **The 12.2 production integration blocker is lifted.** The Console's
-   unauthenticated fetch contract is structurally compatible with the
-   repository again. No Console or Vercel change is required.
+1. **Restoring public visibility removes ONLY the unauthenticated
+   repository-access blocker of 12.2 — nothing else.** The repository's
+   public GitHub resources (the repo page, the releases page, API reads)
+   are reachable by an unauthenticated fetch again, which was the
+   structural incompatibility recorded in 12.2. **This does NOT make the
+   Console compatible with the production publication mechanism**: the
+   shipped Console still consumes a single-GET `GY_SNAPSHOT_URL` contract,
+   and the production stable pointer is the dedicated two-step reference
+   of §13.1 — there is no single-GET URL behind it. **The Console-side
+   two-step resolver described in §13.2 is still REQUIRED before
+   production ingestion can consume publications under this
+   architecture**; no Console or Vercel change is included in the PR that
+   carries this documentation, and none is authorized by that task.
+   Separately, the retired repo-wide `releases/latest/download/...` URL
+   (§3) is NOT the production mechanism either and remains retired (§9,
+   §13).
 2. **The production stable reference is not yet live — because no
    publication has happened yet.** Verified: the releases page lists
    zero releases and no `refs/tags/console-snapshot-prod` reference
@@ -774,7 +787,15 @@ release-ops verify-stable <owner/repo> --expected-tag <versioned tag>
 exit 0 proves the FULL identity chain: ref → annotated tag object →
 pointer → `pointer.versionedTag === <tag>` → release record identity →
 the three assets FROM THAT EXACT RECORD → checksum + provenance +
-integrity → pointer digests over the fetched bytes. The command
+integrity → pointer digests over the fetched bytes. NINTH-ROUND
+ADDITION (review Finding 4): the identity chain also verifies the
+ANNOTATED TAG OBJECT'S ACTUAL TARGET directly from the tag-object
+response — the target type must be exactly `commit` and the target SHA
+must EQUAL `pointer.sourceCommit` — so a tag object pointing at one
+commit while its pointer (and the release provenance) claim another is a
+typed failure instead of an accepted inconsistency. The target is read
+from the tag object itself, never inferred from release provenance. The
+command
 authenticates with a READ-scoped token when one is in the environment
 and falls back to unauthenticated reads on a public repository.
 
@@ -989,7 +1010,25 @@ step, before checkout and any write operation):
    and first-publication rollback (DELETE + 404 read-back);
 8. failure injections before activation (partial upload leaves the
    prior pointer intact) and after activation (rollback drill), plus a
-   failed activation for a missing release.
+   failed activation for a missing release;
+9. NINTH-ROUND Finding 2 — state-aware re-activation: after the
+   first-publication drill DELETED the reference, reactivation reads the
+   live reference and uses `POST repos/<repo>/git/refs` when it is
+   absent (the retired unconditional PATCH required an existing ref and
+   could never complete the first-publication cycle) and the
+   repository-qualified PATCH when it exists; both paths read the
+   reference back, verify the annotated tag object and re-run
+   `verify-stable`;
+10. NINTH-ROUND Finding 3 — a genuine post-activation failure-injection
+   scenario (`post-activation-failure`): after a VERIFIED activation, a
+   deliberate, controlled failure (explicit `exit 1`) triggers the SAME
+   `if: failure()` rollback gating production uses, including
+   compare-before-rollback; the restored state is proven by
+   `verify-stable` (previous pointer) or a genuine HTTP 404 (first
+   publication), and the four phases (publication → injected failure →
+   rollback → restored-state verification) are reported distinctly. The
+   job conclusion for this scenario is EXPECTED failure and is never
+   reported as a successful publication.
 
 Credential boundary: the rehearsal uses the run's own `github.token`
 (which, by the hard guard, exists only inside the rehearsal repository)
