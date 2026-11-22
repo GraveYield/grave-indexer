@@ -35,6 +35,8 @@ import { parseConsoleSnapshot } from "./consoleSnapshotParse.js";
 import {
   buildPublicationProvenance,
   verifySnapshotIntegrity,
+  verifyPublicationCompleteness,
+  findCompletenessFailures,
   versionedTagName,
   snapshotSha256,
   SNAPSHOT_ASSET_NAME,
@@ -730,8 +732,10 @@ export async function cmdConsoleSnapshot(
   return enrichedCount > 0 && !discoveryIncomplete && !enrichmentCapped && !enrichmentFailed ? 0 : 1;
 }
 
-/** Failure stages that mark an artifact as INCOMPLETE (never publication-ready). */
-const COMPLETENESS_STAGES = ["discovery-completeness", "enrichment-completeness"] as const;
+/** Failure stages that mark an artifact as INCOMPLETE are defined once
+ *  in src/snapshotPublication.ts (`COMPLETENESS_STAGES`) — the producer
+ *  (publish-snapshot) and the independent verifier (verify-snapshot,
+ *  verify-release-assets, verify-stable) share the exact same list. */
 
 /**
  * `publish-snapshot` — the manual publication entry point (GY-M1-INT-001
@@ -779,7 +783,10 @@ export async function cmdPublishSnapshot(
   const raw = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
   const snapshot = parseConsoleSnapshot(raw); // strict schema-v2 gate
 
-  const completenessFailures = snapshot.failures.filter((f) => (COMPLETENESS_STAGES as readonly string[]).includes(f.stage));
+  // The SAME completeness contract the independent verifier enforces
+  // (eighth round): one shared stage list + shared gate semantics — the
+  // producer refuses to stage what the verifier would refuse to endorse.
+  const completenessFailures = findCompletenessFailures(snapshot);
   if (completenessFailures.length > 0 || snapshot.pools.length === 0) {
     for (const f of completenessFailures) console.error(`publish-snapshot: ${f.stage} — ${f.reason}`);
     console.error("publish-snapshot: artifact is INCOMPLETE — refusing to stage it for publication");
@@ -805,7 +812,7 @@ export async function cmdPublishSnapshot(
 
   console.log(`publish-snapshot: artifact verified — schema v${snapshot.schemaVersion}, ${snapshot.pools.length} pool(s), complete`);
   console.log(`publish-snapshot: sha256=${provenance.snapshotSha256} bytes=${provenance.snapshotByteLength}`);
-  console.log(`publish-snapshot: versioned tag → ${versionedTag} (stable reference: latest-release promotion, activated only after roundtrip verification)`);
+  console.log(`publish-snapshot: versioned tag → ${versionedTag} (stable reference: the dedicated refs/tags/console-snapshot-prod pointer tag, activated only after roundtrip verification)`);
   console.log(`publish-snapshot: staged → ${out}, ${provPath}, ${checksumPath}`);
   return 0;
 }
@@ -815,7 +822,11 @@ export async function cmdPublishSnapshot(
  * re-verification gate the workflow runs AFTER downloading the staged
  * artifact (before release publication) and again against the asset
  * downloaded BACK from the versioned release. Strict schema-v2 parse +
- * SHA-256/byte-length integrity + completeness gate, in that order.
+ * SHA-256/byte-length integrity + the INDEPENDENT completeness contract
+ * (eighth round — Finding 3: the verifier enforces the SAME completeness
+ * conditions as the producer — no completeness failure marker, a
+ * well-formed provenance enriched count, exact artifact/sidecar count
+ * agreement, and a non-empty artifact), in that order.
  */
 export function cmdVerifySnapshot(artifactPath: string, provenancePath: string): number {
   let bytes: Uint8Array;
@@ -834,8 +845,9 @@ export function cmdVerifySnapshot(artifactPath: string, provenancePath: string):
   const provenance = rawProvenance as PublicationProvenance;
 
   // Gate 1: the strict schema-v2 parser (same contract the console runs).
+  let snapshot: ReturnType<typeof parseConsoleSnapshot>;
   try {
-    parseConsoleSnapshot(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
+    snapshot = parseConsoleSnapshot(JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown);
   } catch (err) {
     console.error(`verify-snapshot: artifact FAILED the strict schema-v2 parse — refusing (${String((err as Error).message ?? err)})`);
     return 1;
@@ -847,14 +859,21 @@ export function cmdVerifySnapshot(artifactPath: string, provenancePath: string):
     console.error(String((err as Error).message ?? err));
     return 1;
   }
-  // Gate 3: the artifact must carry actual enriched content — an empty
-  // publication can never be a production snapshot.
-  const enrichedInProvenance = typeof provenance.counts?.enriched === "number" ? provenance.counts.enriched : 0;
-  if (!(enrichedInProvenance > 0)) {
-    console.error("verify-snapshot: provenance reports zero enriched pools — refusing to endorse an empty snapshot");
+  // Gate 3: the INDEPENDENT completeness contract (eighth round). The
+  // verifier no longer merely requires provenance.counts.enriched > 0 —
+  // it rejects the producer's completeness failure stages
+  // ("discovery-completeness" / "enrichment-completeness") in the
+  // artifact itself, fails closed on missing or malformed completeness
+  // evidence in the sidecar, and requires the sidecar's enriched count
+  // to EXACTLY match the artifact's own enriched count.
+  try {
+    verifyPublicationCompleteness(snapshot, provenance);
+  } catch (err) {
+    console.error(`verify-snapshot: ${String((err as Error).message ?? err)}`);
     return 1;
   }
   console.log(`verify-snapshot: OK — schema v2 parse passed, sha256 ${provenance.snapshotSha256} verified over ${provenance.snapshotByteLength} bytes`);
+  console.log(`verify-snapshot: completeness verified — ${snapshot.counts.enriched} enriched pool(s), no completeness failure marker, sidecar count agrees`);
   return 0;
 }
 
@@ -986,15 +1005,30 @@ Usage:
                                pipeline; [--max-pools] [--enrich] [--max-age-hours])
   grave-indexer verify-snapshot <artifact.json> <provenance.json>
                                Re-verify an artifact: strict schema-v2 parse + SHA-256/
-                               byte-length integrity against the provenance sidecar
+                               byte-length integrity + the independent completeness
+                               contract (no completeness failure marker; the sidecar's
+                               enriched count must exist, be well-formed and match the
+                               artifact; the artifact must be non-empty)
   grave-indexer release-latest <owner/repo>
-                               Hardened rollback-pointer discovery: kind=none ONLY on a
-                               genuine HTTP 404; auth/permission/rate-limit/outage/
-                               malformed failures exit non-zero (never guessed)
+                               LEGACY (non-production) rollback-pointer discovery against
+                               the retired repo-wide latest designation: kind=none ONLY
+                               on a genuine HTTP 404; auth/permission/rate-limit/outage/
+                               malformed failures exit non-zero (never guessed). The
+                               production mechanism is stable-pointer-current over the
+                               dedicated refs/tags/console-snapshot-prod reference
   grave-indexer verify-release-assets <owner/repo> --tag <tag> --scope versioned|latest --expected-tag <tag>
                                Same-release verification of snapshot + provenance +
-                               checksum; --scope latest additionally requires the
-                               repo-wide latest designation to equal the expected tag
+                               checksum. --scope versioned is the PRODUCTION mechanism;
+                               --scope latest is LEGACY (non-production): it additionally
+                               requires the retired repo-wide latest designation to equal
+                               the expected tag
+  grave-indexer stable-pointer-current <owner/repo>
+                               Read the DEDICATED refs/tags/console-snapshot-prod stable
+                               reference (the production rollback-pointer discovery)
+  grave-indexer verify-stable <owner/repo> --expected-tag <tag>
+                               Verify the FULL production identity chain over the
+                               dedicated stable reference: ref → annotated pointer tag
+                               object → pointer JSON → versioned release → assets
   grave-indexer health         Print the latest health snapshot
 
 Key env (see docs/ORACLE_PIPELINE.md):

@@ -34,14 +34,18 @@ release with `gh release upload --clobber`. That design is rejected:
 * A three-asset swap cannot be made atomic on GitHub: there is no
   transaction covering multiple assets of one release.
 
-## 3. Selected design — latest-release promotion
+## 3. SUPERSEDED interim design — repo-wide latest-release promotion (HISTORICAL RECORD ONLY)
 
 > **SUPERSEDED (sixth round, 2026-11-22):** the owner SELECTED the
 > dedicated `console-snapshot-prod` stable-reference architecture —
 > see §9 (the recorded decision) and §13 (the exact production
-> resolution mechanism). This section is retained as the historical
-> record of the interim repo-wide-latest design, which is no longer the
-> production path.
+> resolution mechanism). **This section is retained purely as the
+> historical record of the interim repo-wide-latest design. It is NOT
+> the production path and MUST NOT be read as one:** nothing in the
+> current production workflow depends on the repo-wide latest
+> designation, and the `releases/latest/download/...` URL family and
+> the `verify-release-assets --scope latest` capability survive only as
+> clearly labeled LEGACY, non-production utilities.
 
 Every publication is an immutable, versioned release tagged
 `console-snapshot-prod-<YYYYMMDDTHHMMSSZ>-<source-commit-12>` created
@@ -116,69 +120,85 @@ paths require authentication):
 | Auditable history | Every publication remains a distinct immutable release |
 | Constant Console-compatible URL | `releases/latest/download/console-snapshot.json` — while the repository was public: plain `fetch`, redirects followed, no auth. **Since the visibility change this URL requires authentication — the Console can no longer fetch it (§12 blocker)** |
 
-## 4. Stable-reference semantics (the ten questions)
+## 4. Stable-reference semantics (the ten questions) — CURRENT production mechanism
 
-1. **Does the stable tag move?** No. There is no mutable
-   `console-snapshot-prod` tag/release. The string survives only as the
-   versioned tag PREFIX. Versioned tags are unique per publication and
-   never move.
-2. **Does the stable release change?** The stable *reference* (the
-   repo-wide latest designation) moves once per successful publication.
-   The release it previously pointed to is unchanged and remains fully
-   retrievable.
-3. **Are stable assets overwritten?** Never. Each release's assets are
-   written once and never touched again. There is no asset clobbering
-   anywhere in the design.
+> Answers reflect the SELECTED dedicated stable-reference architecture
+> (§9, §13). Where an answer differs from the superseded interim design
+> of §3, the difference is stated explicitly.
+
+1. **Does the stable tag move?** The dedicated stable REFERENCE
+   `refs/tags/console-snapshot-prod` moves exactly once per successful
+   publication (one atomic ref update). The ANNOTATED TAG OBJECT it
+   pointed at is an immutable git object and never changes; each
+   promotion creates a NEW tag object. Versioned release tags
+   (`console-snapshot-prod-<stamp>-<commit>`) are unique per publication
+   and never move.
+2. **Does the stable release change?** The stable reference is the
+   dedicated git ref — NOT the repo-wide latest designation. It moves
+   once per successful publication, atomically. The versioned release it
+   previously pointed to is unchanged and remains fully retrievable.
+3. **Are stable assets overwritten?** Never. Each versioned release's
+   assets are written once and never touched again. There is no asset
+   clobbering anywhere in the design; the stable reference carries NO
+   payload bytes at all (only the pointer in a tag-object message).
 4. **Can the previous artifact remain available during activation?**
-   Yes — throughout generation, upload, and verification the previous
-   release remains the latest designation and is served unchanged. The
-   promotion itself does not touch the previous release's assets, which
-   stay downloadable forever.
-5. **Is the stable URL constant?** Yes —
-   `https://github.com/GraveYield/grave-indexer/releases/latest/download/console-snapshot.json`
-   (plus the `console-snapshot-provenance.json` and
-   `console-snapshot.sha256` variants). Only the content behind it
-   changes.
-6. **Can the Console retrieve it without authentication?** NO — the
-   repository is now PRIVATE. The visibility change makes unauthenticated
-   retrieval IMPOSSIBLE and breaks the shipped Console consumer contract.
-   See §12 for the production integration blocker and the owner-decision
-   alternatives. (Historical, public-repository behavior: the
-   latest-release asset path served unauthenticated HTTP with redirects
-   (`fetch(url, { redirect: "follow" })` was compatible).)
-7. **Can a failed update leave the URL unavailable?** No. Failures
-   before activation leave the previous release designated (available).
-   The only failure mode AFTER activation is the activation itself
-   succeeding while the post-activation spot check fails (e.g. CDN
-   lag) — the URL then serves the NEW complete artifact; the run
-   reports failure for investigation but availability is preserved.
-   There is no window in which the URL 404s due to publication
-   activity.
+   Yes — throughout generation, upload, and verification the dedicated
+   reference still names the previous pointer, and its release's assets
+   stay downloadable forever. The promotion does not touch the previous
+   release or its assets.
+5. **Is the stable "URL" constant?** The stable RESOLUTION CHAIN is
+   constant: `GET /repos/<repo>/git/ref/tags/console-snapshot-prod` →
+   `GET /repos/<repo>/git/tags/<object.sha>` → pointer JSON in the
+   tag-object message → assets from
+   `releases/download/<pointer.versionedTag>/<asset>`. There is
+   deliberately NO single repo-wide latest URL in the production path —
+   that URL family is a LEGACY, non-production utility only (§3, §9.B).
+6. **Can the Console retrieve it without authentication?** The ref and
+   tag-object reads are unauthenticated on a public repository (the
+   restored state — §12.4) with the standard API rate limit. NOTE: the
+   shipped Console contract (a single-GET of `GY_SNAPSHOT_URL`) does NOT
+   match this two-step resolution — the required Console change is an
+   owner-approval gate (§13.2). Production ingestion is operational only
+   after that change ships.
+7. **Can a failed update leave the resolution chain unavailable?** No.
+   Failures BEFORE the atomic ref move leave the previous pointer
+   serving. A failure AFTER the move triggers the rollback paths: the
+   promote job's in-job rollback (failure at or after the activation
+   step) and — since the eighth-round correction — the dedicated
+   downstream rollback job (failure of the post-activation
+   `verify-stable` gate after a completed promotion). Both restore the
+   recorded previous pointer (or delete the first-publication ref) and
+   verify the restoration by read-back; an unverifiable restoration is
+   reported as UNVERIFIED, loudly.
 8. **Can a client receive mismatched snapshot and provenance files?**
-   Not from publication activity. Both files live on the SAME release
-   and the whole pointer moves atomically (single metadata operation).
-   The residual exposure is a client fetching the two files across a
-   promotion boundary — the provenance sidecar's `versionedTag` and the
-   SHA-256 over the snapshot bytes make any such pair detectably
-   inconsistent; consumers verifying the digest (or comparing
-   `versionedTag`) cannot mistake a crossed-boundary pair for a valid
-   publication.
-9. **How is cache behavior controlled?** The GitHub latest-release path
-   redirects to `release-assets.githubusercontent.com` signed URLs;
-   intermediate redirects are short-lived and asset URLs are
-   re-generated per fetch. Consumers must rely on the sidecar digest
-   (`console-snapshot.sha256` / provenance `snapshotSha256`) for
-   end-to-end integrity and on the artifact's own `freshness.maxAgeMs`
-   for staleness. No cache headers are manipulable in this design —
-   that limitation is disclosed, not hidden.
-10. **How can an operator roll back to the previous version?** Re-promote
-    the previous immutable release — one metadata operation:
+   Not from publication activity. Both files live on the SAME versioned
+   release and the pointer moves atomically (single ref update). A client
+   fetching across a promotion boundary gets detectably inconsistent
+   bytes — the pointer's per-asset SHA-256 digests and the provenance
+   sidecar's `versionedTag` make any such pair fail the consumer's
+   fail-closed verification (§13).
+9. **How is cache behavior controlled?** Versioned asset URLs redirect
+   to `release-assets.githubusercontent.com` signed URLs; intermediate
+   redirects are short-lived and asset URLs are re-generated per fetch.
+   Consumers must rely on the pointer's digests (and the sidecar's
+   `snapshotSha256`) for end-to-end integrity and on the artifact's own
+   `freshness.maxAgeMs` for staleness. No cache headers are manipulable
+   in this design — that limitation is disclosed, not hidden.
+10. **How can an operator roll back to the previous version?** Re-create
+    the previous pointer tag object and move the dedicated ref (§13.3):
     ```
-    gh release edit <previous-tag> --repo GraveYield/grave-indexer --latest
+    gh api --method POST repos/:repo/git/tags -f tag=console-snapshot-prod \
+      -f object=<pointer.sourceCommit> -f type=commit -f message=<previous pointer JSON>
+    gh api --method PATCH repos/:repo/git/refs/tags/console-snapshot-prod \
+      -f sha=<new tag object sha> -F force=true
     ```
-    The previous tag and its verified assets are untouched history. The
-    workflow prints the rollback pointer (the previous latest tag) in
-    its run summary.
+    then re-verify with `verify-stable --expected-tag <previous versioned
+    tag>`. The workflow performs exactly this sequence automatically —
+    the promote job's in-job rollback for failures at/after activation,
+    and the dedicated downstream rollback job when the post-activation
+    verification fails after a completed promotion — and fails loudly
+    when it cannot verify the result. The rollback NEVER overwrites a
+    pointer that has moved independently (compare-before-rollback).
 
 ## 5. Failure matrix (verified by test/snapshotPublicationSequence.test.ts)
 
@@ -193,29 +213,32 @@ interrupted runs, and concurrent/duplicate publication attempts).
 
 ## 6. Residual risks and operator policy
 
-* **Repo-wide designation.** `latest` is per-repository. Any OTHER
-  non-draft, non-prerelease release created in `grave-indexer` would
-  move the stable pointer. Policy: every release in this repository
-  must be a console-snapshot versioned release; any other publishing
-  purpose must use prerelease or draft flags (both excluded from the
-  designation) or a different repository. The workflow's
-  post-activation verification catches a promotion that did not stick.
+* **Dedicated-ref writers.** The stable pointer is the git ref
+  `refs/tags/console-snapshot-prod`; anyone with git-data write access
+  could move it (documented single-writer assumption — §14.4). Any
+  OTHER release created in this repository CANNOT move it (verified by
+  test and by the rehearsal's unrelated-release probe). The workflow's
+  rollback paths refuse to overwrite a pointer that has moved
+  independently (compare-before-rollback), and the post-activation
+  verification catches a promotion that did not stick.
 * **Provenance cross-check.** Consumers SHOULD fetch
   `console-snapshot-provenance.json` alongside the snapshot and verify
   the digest; the Console's current fetch consumes the snapshot URL
   only — its schema-v2 validator still enforces schema and freshness.
-* **First publication.** Before the first release exists the stable URL
-  404s — the Console reports `missing` honestly. This is bootstrap, not
-  data loss.
+* **First publication.** Before the first publication the dedicated
+  reference does not exist — the resolution chain returns HTTP 404 and
+  the Console reports `missing` honestly. This is bootstrap, not data
+  loss.
 
 ## 7. What this design does NOT claim
 
-The word "atomic" is reserved for the single release-record metadata
-operation (`make_latest`) — GitHub executes it as one update and it
-moves the pointer to a release whose asset set was already fully
-verified. The overall publication (generate → upload → verify →
-activate → verify) is a multi-step process, not atomic; its safety
-comes from ordering plus immutability, not from a single transaction.
+The word "atomic" is reserved for the single git ref update (PATCH
+`repos/<repo>/git/refs/tags/console-snapshot-prod`, force) — GitHub
+executes it as one update and it moves the pointer to a release whose
+asset set was already fully verified. The overall publication
+(generate → upload → verify → activate → verify) is a multi-step
+process, not atomic; its safety comes from ordering plus immutability,
+not from a single transaction.
 
 ## 8. VERIFIED repository protection model (PR #5 remediation — review Task 3)
 
@@ -373,17 +396,20 @@ survive only as non-production utilities and tests.
   steps' env alone. **No job in the workflow declares `contents:
   write` — the automatic GITHUB_TOKEN is READ-ONLY in all seven jobs by
   explicit declaration** (each job carries `permissions: contents:
-  read`; the workflow default is `contents: read`). Seven jobs:
+  read`; the workflow default is `contents: read`). Eight jobs (the
+  eighth — the dedicated downstream rollback job — was added by the
+  eighth-round correction, review Finding 1; see §15):
 
   | Job | Effective permissions | Executes custom code? | Token access |
   | --- | --- | --- | --- |
   | `generate` | `contents: read` (EXPLICIT) | YES (build + `publish-snapshot`/`verify-snapshot`) | `github.token` READ-ONLY (consumed implicitly by checkout/setup-node; no `GH_TOKEN` env anywhere); RPC secrets to the snapshot CLI only |
   | `verify` | `contents: read` (EXPLICIT) | YES (independent re-verification + builds the zero-dep release-ops bundle) | `github.token` READ-ONLY (implicit via checkout/setup-node only) |
-  | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `release-latest` discovery) | `github.token` READ-ONLY, step-level env on the tag-collision gate, the belt-check GET and the discovery step ONLY — never the PAT |
+  | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `stable-pointer-current` discovery over the DEDICATED ref) | `github.token` READ-ONLY, step-level env on the tag-collision gate, the belt-check GET and the discovery step ONLY — never the PAT |
   | `release` | `contents: read` (EXPLICIT) | **NO** | `github.token` READ-ONLY, step-level env on the authenticated tag-collision gate ONLY; `GY_RELEASE_PAT` step-level env on the `gh release create/upload` mutation step ONLY |
   | `verify-versioned` | `contents: read` (EXPLICIT) | YES (prebuilt zero-dep bundle, `--scope versioned` roundtrip) | `github.token` READ-ONLY, step-level env on the roundtrip gate ONLY (the repository is private: release assets 404 unauthenticated) — never the PAT |
-  | `promote` | `contents: read` (EXPLICIT) | **NO** | `GY_RELEASE_PAT` step-level env on the single `gh release edit --latest` mutation step ONLY; the tag-shape precondition step is token-free |
-  | `verify-stable` | `contents: read` (EXPLICIT) | YES (reviewed commit's own verification CLI, `--scope latest`) | `github.token` READ-ONLY, step-level env on the gate step only |
+  | `promote` | `contents: read` (EXPLICIT) | **NO** | `GY_RELEASE_PAT` step-level env on the stable-ref activation step (create annotated pointer tag object + atomic ref update) and the in-job rollback step ONLY; the pointer jq gate and read-back are token-free or READ-ONLY |
+  | `verify-stable` | `contents: read` (EXPLICIT) | YES (reviewed commit's own verification CLI, `verify-stable --expected-tag` over the DEDICATED ref) | `github.token` READ-ONLY, step-level env on the gate step only |
+  | `rollback` (eighth round) | `contents: read` (EXPLICIT) | **NO** (pinned `gh api`/`curl`/`jq` only) | `github.token` READ-ONLY on the compare-before-rollback and read-back steps; `GY_RELEASE_PAT` step-level env on the single ref-mutation step ONLY |
 
   See §11 for the complete credential-access matrix and the trust
   assumptions, and §12 for the private-visibility consequences.
@@ -400,8 +426,9 @@ survive only as non-production utilities and tests.
   * `publish` (READ-ONLY) — every gate and every piece of custom code:
     checksum belt over the downloaded bytes, provenance tag parsing +
     strict shape validation, the fail-closed three-way tag/release
-    collision gates, and the hardened `release-latest` rollback-pointer
-    discovery (custom bundle, READ-ONLY token). It declares
+    collision gates, and the hardened `stable-pointer-current`
+    rollback-pointer discovery over the DEDICATED reference (custom
+    bundle, READ-ONLY token). It declares
     `permissions: contents: read` EXPLICITLY, so a write-capable token
     cannot exist in it under any circumstance;
   * `release` (`contents: read` + PAT on the mutation step, ZERO custom
@@ -424,12 +451,25 @@ survive only as non-production utilities and tests.
     token (the repository is private — release assets 404 for
     unauthenticated requests); the stable pointer cannot move until
     this job is green (`promote` has `needs: verify-versioned`);
-  * `promote` (`contents: read` + PAT on the mutation step, ZERO custom
-    code) — exactly ONE privileged operation, `gh release edit <tag>
-    --latest`, with the `GY_RELEASE_PAT` credential as that step's env
-    only (the automatic token is read-only);
+  * `promote` (`contents: read` + PAT on the mutation steps, ZERO
+    custom code) — activation of the DEDICATED stable reference: create
+    the annotated pointer tag object (`gh api POST /git/tags`) and move
+    `refs/tags/console-snapshot-prod` with ONE atomic update
+    (`gh api PATCH repos/<repo>/git/refs/tags/console-snapshot-prod`,
+    force), with the `GY_RELEASE_PAT` credential as those steps' env
+    only (the automatic token is read-only); an in-job rollback step
+    restores the previous pointer when the promote job itself fails at
+    or after activation;
   * `verify-stable` (read-only) — the post-activation stable gate, run
-    with the READ-ONLY workflow token from a full repository checkout.
+    with the READ-ONLY workflow token from a full repository checkout;
+  * `rollback` (eighth round — Finding 1) — the dedicated downstream
+    rollback job: runs ONLY when promotion succeeded and the
+    post-activation `verify-stable` gate FAILED after it; compares the
+    live ref against this run's created pointer tag object before any
+    mutation (refuses to overwrite a moved pointer), restores the
+    previous pointer or deletes the first-publication ref in ONE
+    PAT-bearing step, and verifies the restoration by read-back
+    (§15).
   The privileged jobs' trust chain: the bytes they upload were
   schema- and integrity-verified by BOTH read-only jobs; the release
   job re-checks the checksum over its own downloaded bytes
@@ -452,25 +492,30 @@ survive only as non-production utilities and tests.
   Residual trust assumptions are listed in §11. This structural
   boundary is pinned by test/publishWorkflow.test.ts (global
   invariants: no job declares a write grant; the PAT appears only on
-  the two mutation steps; no code-executing, artifact or checkout step
-  references it).
-* **Rollback-pointer discovery (Task 4):** the previous
-  `gh api ... 2>/dev/null || echo ""` pattern is replaced by
-  `release-latest` (src/releaseOps.ts): only a genuine HTTP 404 yields
-  "first publication"; AUTHENTICATION, PERMISSION, RATE_LIMIT,
-  API_OUTAGE, NETWORK, MALFORMED_RESPONSE and UNEXPECTED_STATUS are
-  typed aborts. The pointer is recorded and written to the run summary
-  BEFORE any release operation.
+  the pinned mutation steps; no code-executing, artifact or checkout
+  step references it).
+* **Rollback-pointer discovery (Task 4, sixth-round supersession):**
+  the previous `gh api ... 2>/dev/null || echo ""` pattern was first
+  replaced by the typed `release-latest` gate (only a genuine HTTP 404
+  yields "first publication"; every auth/permission/rate-limit/outage/
+  network/malformed failure is a typed abort). Under the OWNER-SELECTED
+  architecture the workflow's discovery now reads the DEDICATED
+  reference through `stable-pointer-current` (the same fail-closed
+  classification over `refs/tags/console-snapshot-prod`);
+  `release-latest` survives only as a LEGACY, non-production utility.
+  The pointer is recorded and written to the run summary BEFORE any
+  release operation.
 * **Same-release verification (Task 5):** `verify-release-assets
   --scope versioned` verifies all three assets of ONE exact versioned
   release (checksum over the exact bytes, provenance digest, and the
   provenance must NAME that release's tag — a cross-release mixture is
   detectable because only the release's own sidecar carries its tag).
-  The post-activation gate `--scope latest` additionally requires the
-  repo-wide latest designation (authenticated API query) to equal the
-  activated tag before the three stable-URL files are cross-checked, so
+  The post-activation gate (`verify-stable --expected-tag`) verifies
+  the FULL identity chain over the DEDICATED stable reference (ref →
+  tag object → pointer → release record → assets → pointer digests), so
   neither pointer drift nor an in-flight promotion race can bless a
-  mixed artifact set.
+  mixed artifact set. (`--scope latest` survives only as a LEGACY,
+  non-production utility — never used by the production workflow.)
 
 ## 11. Credential-access matrix and PAT trust assumptions (final credential isolation)
 
@@ -485,8 +530,8 @@ never accessed while preparing this change.
 
 | Credential | Where it exists | What it can do |
 | --- | --- | --- |
-| `github.token` (automatic) | ALL SEVEN jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, stable-ref and tag-object reads, authenticated asset fetches during verification, post-activation read-back) |
-| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly THREE steps: the `release` job's `gh release create/upload` step; the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
+| `github.token` (automatic) | ALL EIGHT jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, stable-ref and tag-object reads, authenticated asset fetches during verification, post-activation read-back, the rollback job's compare-before-rollback and read-back) |
+| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly FOUR steps: the `release` job's `gh release create/upload` step; the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication); the dedicated `rollback` job's single ref-mutation step (same two rollback cases, after a failed post-activation verification) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
 | `ACTIONS_RUNTIME_TOKEN` | Managed by GitHub for `actions/upload-artifact` / `actions/download-artifact` inside one workflow run | Run-scoped artifact transport only; not a `github.token` input |
 | `MAINNET_RPC_URL` / `DEVNET_RPC_URL` | `generate` job env (RPC access for snapshot generation) | RPC endpoints; no GitHub capability |
 
@@ -497,14 +542,14 @@ tests, generates snapshots, executes repository-built JavaScript,
 downloads or verifies artifacts, validates schema/provenance/checksums,
 or discovers the rollback pointer runs under an explicit
 `contents: read` grant and references `github.token` (read-only) or no
-token at all — NEVER the PAT. The release and promote jobs hold the PAT
-but contain ZERO custom code: no checkout, no dependency installation,
-no node, no repository script, no artifact-executed code — the only
-commands that can read the credential are the pinned `gh release`
-mutation invocations and the pinned `gh api` git-data mutations of the
-dedicated stable reference (create the pointer tag object, move the
-ref, and the failure-path rollback, which also reads back what it just
-wrote to verify its own mutation).
+token at all — NEVER the PAT. The release, promote and rollback jobs
+hold the PAT but contain ZERO custom code: no checkout, no dependency
+installation, no node, no repository script, no artifact-executed code
+— the only commands that can read the credential are the pinned `gh
+release` mutation invocations and the pinned `gh api` git-data
+mutations of the dedicated stable reference (create the pointer tag
+object, move the ref, and the rollback mutations, whose read-back
+verification uses the READ-ONLY token).
 
 ### Trust assumptions (owner-side, not verifiable from this repository)
 
@@ -623,17 +668,22 @@ Consequences, stated precisely:
 1. **The 12.2 production integration blocker is lifted.** The Console's
    unauthenticated fetch contract is structurally compatible with the
    repository again. No Console or Vercel change is required.
-2. **The stable URL is not yet live — because no release exists yet.**
-   Verified: the releases page lists zero releases, `/releases/latest`
-   redirects to the releases index, and
-   `releases/latest/download/console-snapshot.json` → HTTP 404. That
-   404 is "no latest release", not "unreachable repository". The stable
-   URL begins resolving unauthenticated only once the first versioned
-   release is created (`--latest=false`) and subsequently promoted
-   (`gh release edit --latest`) by the workflow's release/promote
-   steps. Until then, production ingestion has nothing to fetch — the
-   same state as before the visibility change, and consistent with the
-   no-release-yet invariant.
+2. **The production stable reference is not yet live — because no
+   publication has happened yet.** Verified: the releases page lists
+   zero releases and no `refs/tags/console-snapshot-prod` reference
+   exists, so the production resolution chain (§13.1) returns HTTP 404.
+   That 404 is "no publication yet", not "unreachable repository". The
+   chain begins resolving unauthenticated only once the first versioned
+   release is created (`--latest=false`) and the workflow's promote step
+   creates the annotated pointer tag object and the dedicated reference
+   (`refs/tags/console-snapshot-prod`). NOTE: the
+   `releases/latest/download/...` URL mentioned in earlier revisions of
+   this addendum is NOT the production mechanism — under the
+   owner-selected architecture (§9, §13) production consumption uses the
+   two-step dedicated-reference resolution only. Until the first
+   publication (and the Console change of §13.2), production ingestion
+   has nothing to fetch — the same state as before the visibility
+   change, and consistent with the no-publication-yet invariant.
 3. **The authenticated transports of 12.1 remain correct on a public
    repository.** They are not public-visibility-specific: the
    authenticated tag gates keep their three-way fail-closed semantics,
@@ -705,9 +755,15 @@ NOT implemented here. What the owner must approve and ship:
    — exit 0 is the ONLY acceptable evidence of restoration. If any
    step fails, the stable state is UNVERIFIED: do not claim restoration
    without this evidence.
-5. The workflow performs exactly this sequence automatically (the
-   promote job's rollback step) when post-activation verification fails,
-   and fails loudly when it cannot verify the result.
+5. The workflow performs exactly this sequence automatically and fails
+   loudly when it cannot verify the result — in TWO places: the promote
+   job's in-job rollback step (failures at or after activation inside
+   promote) and, since the eighth-round correction, the dedicated
+   downstream `rollback` job (a failure of the post-activation
+   `verify-stable` gate AFTER promotion completed — the case the in-job
+   step can no longer cover). Both compare the live ref against the
+   run's created pointer tag object first and refuse to overwrite a
+   pointer that has moved independently (§15).
 
 ### 13.4 How to independently verify the stable target
 
@@ -843,3 +899,163 @@ every pointer carries `previousVersionedTag`/`previousTagObjectSha`,
 and the run summary records the replaced pointer verbatim, so an
 unexpected promotion is reconstructable and auditable. No protection
 beyond the single-writer assumption is claimed.
+
+## 15. Eighth-round correction — downstream rollback, pointer-architecture rehearsal, independent completeness verification, and documentation reconciliation
+
+The latest independent end-to-end review identified four findings. All
+four are corrected in this round; the owner-selected dedicated
+stable-reference architecture and every existing security control are
+preserved (no redesign).
+
+### 15.1 Finding 1 — a failure of the downstream `verify-stable` job now supports rollback
+
+The rollback logic lived inside `promote`, so a failure of the SEPARATE
+post-activation `verify-stable` job — after promotion had completed —
+could leave the stable reference pointed at a publication that never
+passed the full downstream verification chain. The workflow now has a
+dedicated `rollback` job (the eighth job) with an explicit
+dependency-graph gate:
+
+```
+if: failure() &&
+    needs.promote.result == 'success' &&
+    needs.verify-stable.result == 'failure' &&
+    github.ref == 'refs/heads/main'
+```
+
+Design properties (all pinned by test/publishWorkflow.test.ts):
+
+* **Runs ONLY after a completed promotion followed by a failed
+  downstream verification.** A failed or skipped promotion can never
+  trigger it (the promote job's in-job rollback step and the
+  `activation_started` marker still own the pre-activation and
+  failed-activation cases). A green verification never triggers it.
+* **Rollback inputs cross the job boundary as explicit outputs** of the
+  promotion process: `ref_mode`, `previous_pointer_json`,
+  `previous_versioned_tag` and `new_tag_object_sha` (the annotated tag
+  object this run created).
+* **Compare-before-rollback (single-writer guard):** BEFORE any
+  mutation the job reads the CURRENT `refs/tags/console-snapshot-prod`
+  with the READ-ONLY token and requires it to still point at THIS run's
+  created tag object. A different object, an absent ref, or any gate
+  failure → the rollback REFUSES, reports `OPERATOR INTERVENTION
+  REQUIRED`, and preserves the observed state as evidence. This is the
+  enforcement of the documented single-writer assumption — workflow
+  concurrency alone provides NO compare-and-swap protection against
+  external writers.
+* **Both rollback cases:** a previous pointer is restored (re-create the
+  previous pointer tag object + ONE repository-qualified PATCH); a
+  first publication restores the ABSENT state (repository-qualified
+  DELETE of `refs/tags/console-snapshot-prod`).
+* **Read-back verification with the READ-ONLY token:** update mode
+  requires ref sha + message + previous-versioned-tag identity; create
+  mode requires a genuine HTTP 404. An unverifiable outcome fails
+  LOUDLY with the previous pointer JSON and the restoration procedure
+  preserved in the run summary.
+* **PAT isolation:** discovery (comparison) and read-back verification
+  authenticate with the READ-ONLY automatic token; the narrowly scoped
+  PAT exists ONLY in the exact step that performs the ref mutation. The
+  job contains zero custom code (no checkout, no node).
+* **Ambiguous activation:** the decision input is REMOTE state — the
+  live ref is read before anything is decided or mutated; no rollback
+  decision relies on a step's reported success.
+
+The `activation_started` safety concept is preserved: a rollback occurs
+only after activation was actually attempted and completed (promote
+succeeded) or at/after the activation step inside promote (marker
+semantics unchanged).
+
+### 15.2 Finding 2 — the rehearsal now rehearses the pointer architecture
+
+`.github/workflows/rehearsal-publication.yml` previously exercised the
+retired repo-wide latest mechanism (`gh release edit --latest`,
+`release-latest`, `--scope latest`,
+`/releases/latest/download/...`). It now rehearses, against
+`GraveYield/grave-indexer-pub-rehearsal` ONLY (hard guard as the first
+step, before checkout and any write operation):
+
+1. `--latest=false` versioned release creation + asset upload;
+2. same-release asset verification (`--scope versioned`);
+3. pointer build from the VERIFIED bytes + strict pointer-schema
+   validation (the same jq gate production uses);
+4. annotated tag object creation (`POST /git/tags`) and dedicated-ref
+   create-or-update (`POST /git/refs` / `PATCH
+   repos/<repo>/git/refs/tags/console-snapshot-prod`, force);
+5. read-back (ref sha + message equality) and the FULL production
+   identity chain (`verify-stable --expected-tag`);
+6. an unrelated-release probe that deliberately takes the repo-wide
+   latest designation and proves it CANNOT move the dedicated reference;
+7. rollback to the previous pointer (verified through the full chain)
+   and first-publication rollback (DELETE + 404 read-back);
+8. failure injections before activation (partial upload leaves the
+   prior pointer intact) and after activation (rollback drill), plus a
+   failed activation for a missing release.
+
+Credential boundary: the rehearsal uses the run's own `github.token`
+(which, by the hard guard, exists only inside the rehearsal repository)
+— never the production-scoped `GY_RELEASE_PAT`, never any repository
+secret. No permissions were broadened; the existing guards are intact
+and pinned by tests.
+
+**Execution status: NOT RUN.** The rehearsal workflow has not been
+dispatched as part of this correction (dispatch authorization is
+explicitly out of scope; workflow_dispatch is also only registrable
+from a default branch). No rehearsal pass/fail may be claimed until an
+authorized run has completed and its results have been independently
+verified — see docs/PUBLICATION_REHEARSAL.md.
+
+### 15.3 Finding 3 — the independent verifier enforces the producer's completeness contract
+
+`cmdVerifySnapshot` (the `verify-snapshot` gate the verification job
+runs against the staged AND re-downloaded artifact) previously required
+only `provenance.counts.enriched > 0`. It now independently:
+
+1. rejects an artifact carrying a `discovery-completeness` or
+   `enrichment-completeness` failure marker;
+2. fails closed on MISSING completeness evidence (no `failures` array,
+   no counts object in the sidecar) and on MALFORMED evidence (a
+   non-integer enriched count anywhere);
+3. rejects a CONTRADICTION: the sidecar's `counts.enriched` must
+   EXACTLY equal the artifact's own enriched count (which the strict
+   schema-v2 parser pins to `pools.length`);
+4. requires a positive enriched count (no empty publication).
+
+The same contract is enforced over the FETCHED bytes by the release-ops
+verification gates (`verify-release-assets` and the `verify-stable`
+identity chain via the zero-dependency `verifyRawArtifactCompleteness`
+core in src/snapshotPublication.ts — the release-ops bundle graph stays
+free of npm dependencies). The producer (`cmdPublishSnapshot`) shares
+the same stage list, so the producer refuses to stage exactly what the
+independent verifiers refuse to endorse. No schema-v2 field was added,
+removed or reinterpreted.
+
+Regression fixtures cover: valid complete artifacts still pass;
+nonempty artifacts carrying either completeness marker fail; enriched
+count mismatch fails; missing/malformed evidence fails; the empty
+artifact fails; and the same rejections hold through the release-ops
+gates over fetched bytes.
+
+### 15.4 Finding 4 — documentation and CLI reconciliation
+
+The dedicated stable-reference architecture
+(`refs/tags/console-snapshot-prod` → annotated pointer tag object →
+versioned release assets) is now the sole documented production
+mechanism:
+
+* §3 is retitled "SUPERSEDED interim design … HISTORICAL RECORD ONLY";
+* §4 (the ten questions) answers are rewritten for the dedicated-ref
+  semantics; the rollback answer documents both automated rollback
+  paths and the compare-before-rollback refusal;
+* §6/§7 no longer describe the repo-wide designation or `make_latest`
+  as production mechanisms;
+* §10/§11 credential and job matrices now describe the eight-job graph
+  and the four PAT-bearing steps;
+* §12.4 no longer presents the `releases/latest/...` URL as the stable
+  URL or `gh release edit --latest` as promotion;
+* §13.3 documents both automated rollback paths;
+* the CLI's `publish-snapshot` success line describes the dedicated
+  stable-reference activation; `release-latest` and
+  `verify-release-assets --scope latest` are labeled LEGACY,
+  non-production utilities in the CLI help (they remain for tests and
+  manual diagnostics only — the production workflow does not use
+  them).

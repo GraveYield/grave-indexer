@@ -15,8 +15,10 @@
 //   * the stable reference may advance ONLY after versioned publication
 //     AND post-publication verification — every unmet condition aborts
 //     with the last-known-good stable artifact untouched;
-//   * the stable update is a latest-release promotion (single metadata
-//     operation; the previous release and its assets are never touched).
+//   * the stable update is a DEDICATED stable-reference activation
+//     (create a NEW annotated pointer tag object + ONE atomic ref update;
+//     the previous release and its assets are never touched; the retired
+//     repo-wide latest promotion survives only as a legacy utility).
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
