@@ -488,7 +488,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       // echo so it cannot also match the rollback step (which now contains
       // the same repo-qualified endpoint for its own PATCH).
       ["promote", /git\/tags[\s\S]*stable ref activation issued/s],
-      ["promote", /git\/tags[\s\S]*ROLLBACK FAILED/s],
+      ["promote", /git\/tags[\s\S]*rollback mutation issued/s],
       // EIGHTH ROUND (Finding 1): the dedicated downstream rollback job's
       // single mutation step — restore the previous pointer (POST /git/tags
       // + PATCH refs) or delete the first-publication ref (DELETE refs).
@@ -507,14 +507,14 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
           const matched = expectedMutations.filter(([jn, re]) => jn === name && re.test(run));
           assert.ok(matched.length > 0, `a GY_RELEASE_PAT-bearing step in ${name} is not a recognized mutation: ${run.slice(0, 120)}`);
           assert.ok(!run.includes("node ") && !run.includes(".mjs"), "PAT-bearing steps execute only the pinned gh CLI, never custom code");
-          // The rollback step re-reads the ref it just moved with the SAME
-          // credential to verify its own mutation — a read cannot escalate
-          // privileges; every other PAT step must not query.
-          const isRollback = run.includes("ROLLBACK FAILED") || run.includes("rollback VERIFIED");
+          // The rollback mutation step re-reads nothing with the PAT —
+          // its outcome is proven by the separate read-only read-back step
+          // (ninth-round Finding 1); every other PAT step must not query.
+          const isRollback = run.includes("rollback mutation issued");
           if (!isRollback) {
             assert.ok(!/git\/ref\/tags/.test(run), "a PAT-bearing step must not double as a query gate");
           } else {
-            assert.ok(run.includes("rollback"), "the exempted PAT query step is the verified rollback");
+            assert.ok(run.includes("rollback"), "the exempted PAT step is the verified rollback mutation");
           }
           mutationsFound.push(...matched.map(() => name));
         } else if (stepEnv(step)["GH_TOKEN"] === "${{ github.token }}") {
@@ -1006,18 +1006,37 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
     assert.match(runs, /\[ "\$message" != "\$POINTER_JSON" \]/, "the activated object's message must equal the validated pointer JSON");
   });
 
-  test("the rollback step runs on failure, restores the recorded previous pointer, and fails LOUDLY on unverifiable rollback", () => {
-    const rollback = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("ROLLBACK FAILED")));
-    assert.ok(rollback, "the rollback step exists");
-    assert.equal(rollback?.["if"], "failure() && steps.activation_gate.outputs.activation_started == 'true'", "the rollback runs ONLY on failure AND only when activation was attempted (SEVENTH-ROUND CORRECTION)");
-    assert.equal(stepEnv(rollback!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the rollback is a privileged mutation (PAT, step-level env)");
-    const runs = (rollback!["run"] as string) ?? "";
-    assert.match(runs, /ref_mode/i, "the rollback branches on the pre-mutation ref state");
-    assert.match(runs, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "first-publication rollback removes the ref via the COMPLETE repository-qualified endpoint (restores the absent state)");
-    assert.match(runs, /rollback_ok/, "the rollback outcome is tracked explicitly");
-    assert.match(runs, /ROLLBACK FAILED[\s\S]*UNVERIFIED/s, "an unverifiable rollback fails LOUDLY — the state is reported as unverified");
-    assert.match(runs, /rollback VERIFIED/, "a successful rollback is verified by read-back before being claimed");
-    assert.match(runs, /previous_pointer_json|PREV_POINTER_JSON/, "the rollback restores the RECORDED previous pointer verbatim");
+  test("the in-job rollback is a compare-before-rollback chain that runs on failure, restores the recorded previous pointer, and fails LOUDLY on unverifiable rollback", () => {
+    // NINTH-ROUND CORRECTION (Finding 1): the former single rollback step
+    // is now a three-step chain — read-only compare → PAT mutation →
+    // read-only read-back — where the mutation is gated on the compare's
+    // verdict over the LIVE remote state.
+    const compare = promote.steps.find((s) => s["id"] === "rollback_compare");
+    const mutate = promote.steps.find((s) => s["id"] === "rollback_mutate");
+    const verify = promote.steps.find((s) => s["id"] === "rollback_verify");
+    assert.ok(compare && mutate && verify, "the compare → mutate → verify rollback chain exists");
+    const expectedCond = "failure() && steps.activation_gate.outputs.activation_started == 'true'";
+    assert.equal(compare!["if"], expectedCond, "the compare runs ONLY on failure AND only when activation was attempted");
+    assert.equal(
+      mutate!["if"],
+      "failure() && steps.activation_gate.outputs.activation_started == 'true' && steps.rollback_compare.outputs.rollback_case == 'restore'",
+      "the mutation runs ONLY on failure, with the marker, AND only after the compare classified the live ref as this run's pointer",
+    );
+    assert.equal(
+      verify!["if"],
+      "failure() && steps.activation_gate.outputs.activation_started == 'true' && steps.rollback_compare.outputs.rollback_case == 'restore'",
+      "the read-back verification is likewise unreachable without the compare verdict and the marker",
+    );
+    assert.equal(stepEnv(mutate!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "only the mutation step carries the PAT");
+    assert.equal(stepEnv(compare!)["GH_TOKEN"], "${{ github.token }}", "the compare is a READ-ONLY step (automatic token)");
+    assert.equal(stepEnv(verify!)["GH_TOKEN"], "${{ github.token }}", "the read-back is a READ-ONLY step (automatic token)");
+    const mutateRuns = (mutate!["run"] as string) ?? "";
+    assert.match(mutateRuns, /ref_mode/i, "the rollback branches on the pre-mutation ref state");
+    assert.match(mutateRuns, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "first-publication rollback removes the ref via the COMPLETE repository-qualified endpoint (restores the absent state)");
+    assert.match(mutateRuns, /previous_pointer_json|PREV_POINTER_JSON/, "the rollback restores the RECORDED previous pointer verbatim");
+    const verifyRuns = (verify!["run"] as string) ?? "";
+    assert.match(verifyRuns, /ROLLBACK UNVERIFIED[\s\S]*exit 1/s, "an unverifiable rollback fails LOUDLY — the state is reported as unverified");
+    assert.match(verifyRuns, /rollback VERIFIED/, "a successful rollback is verified by read-back before being claimed");
   });
 
   test("the three-way stable-ref gate aborts on any failure (never treats an API failure as 'ref absent')", () => {
@@ -1046,7 +1065,12 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
   const markerIdx = steps.findIndex((s) => s["id"] === "activation_gate");
   const activateIdx = steps.findIndex((s) => s["id"] === "activate");
   const readbackIdx = steps.findIndex((s) => s["id"] === "readback");
-  const rollbackIdx = steps.findIndex((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"));
+  // NINTH-ROUND CORRECTION (Finding 1): the in-job rollback is a
+  // compare → mutate → verify chain; the endpoint pins target the
+  // mutation and read-back steps by their step ids.
+  const rollbackMutateIdx = steps.findIndex((s) => s["id"] === "rollback_mutate");
+  const rollbackVerifyIdx = steps.findIndex((s) => s["id"] === "rollback_verify");
+  const rollbackCompareIdx = steps.findIndex((s) => s["id"] === "rollback_compare");
 
   test("activation PATCH uses the COMPLETE repository-qualified endpoint repos/$REPO/git/refs/tags/console-snapshot-prod", () => {
     assert.ok(activateIdx > -1, "the activation step exists");
@@ -1061,24 +1085,26 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
   });
 
   test("existing-pointer rollback PATCH uses the SAME complete repository-qualified endpoint", () => {
-    assert.ok(rollbackIdx > -1, "the rollback step exists");
-    const runs = steps[rollbackIdx]!["run"] as string;
+    assert.ok(rollbackMutateIdx > -1, "the rollback mutation step exists");
+    const runs = steps[rollbackMutateIdx]!["run"] as string;
     assert.match(
       runs,
       /gh api --method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" -f sha="\$old_sha" -F force=true/,
       "the rollback ref update is the exact repository-qualified PATCH restoring the re-created previous pointer object",
     );
     assert.ok(!runs.includes('PATCH "$STABLE_REF"'), "the rollback does NOT address the bare ref constant as an endpoint");
-    // The rollback still verifies the restoration by read-back: ref sha,
-    // tag-object message (previous pointer JSON verbatim) and the previous
-    // versioned release identity.
-    assert.match(runs, /\[ "\$sha" = "\$old_sha" \]/, "read-back checks the ref resolves to the restored tag object");
-    assert.match(runs, /\[ "\$message" = "\$PREV_POINTER_JSON" \]/, "read-back checks the restored object carries the previous pointer JSON verbatim");
-    assert.match(runs, /\[ "\$restored_tag" = "\$PREV_VERSIONED_TAG" \]/, "read-back checks the restored pointer names the previous versioned release");
+    // The restoration is verified by the separate READ-ONLY read-back
+    // step: ref sha, tag-object message (previous pointer JSON verbatim)
+    // and the previous versioned release identity.
+    const verifyRuns = steps[rollbackVerifyIdx]!["run"] as string;
+    assert.match(verifyRuns, /\[ "\$sha" = "\$OLD_SHA" \]/, "read-back checks the ref resolves to the restored tag object");
+    assert.match(verifyRuns, /\[ "\$message" = "\$PREV_POINTER_JSON" \]/, "read-back checks the restored object carries the previous pointer JSON verbatim");
+    assert.match(verifyRuns, /\[ "\$restored_tag" = "\$PREV_VERSIONED_TAG" \]/, "read-back checks the restored pointer names the previous versioned release");
   });
 
   test("first-publication rollback DELETE uses the COMPLETE repository-qualified endpoint and proves absence by read-back only", () => {
-    const runs = steps[rollbackIdx]!["run"] as string;
+    const runs = steps[rollbackMutateIdx]!["run"] as string;
+    const verifyRuns = steps[rollbackVerifyIdx]!["run"] as string;
     assert.match(
       runs,
       /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/,
@@ -1089,9 +1115,9 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
     // never by the DELETE command's own exit status (an auth failure,
     // network error, rate limit or unexpected API response is not evidence
     // that the ref is absent).
-    assert.match(runs, /-w '%\{http_code\}'[\s\S]*git\/ref\/tags\/console-snapshot-prod/, "the read-back queries the dedicated ref through the repository-qualified GET");
-    assert.match(runs, /\[ "\$code" = "404" \]/, "rollback is claimed VERIFIED only when the read-back returns exactly 404");
-    assert.match(runs, /rollback verification FAILED[\s\S]*expected 404/, "any other read-back result leaves the rollback UNVERIFIED");
+    assert.match(verifyRuns, /-w '%\{http_code\}'[\s\S]*git\/ref\/tags\/console-snapshot-prod/, "the read-back queries the dedicated ref through the repository-qualified GET");
+    assert.match(verifyRuns, /\[ "\$code" = "404" \]/, "rollback is claimed VERIFIED only when the read-back returns exactly 404");
+    assert.match(verifyRuns, /rollback verification FAILED[\s\S]*expected a genuine 404/, "any other read-back result leaves the rollback UNVERIFIED");
     // The DELETE's own error output is NOT suppressed: an UNVERIFIED outcome
     // must carry the API's own failure detail for the operator.
     assert.match(runs, /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" \|\| true/, "the DELETE keeps running so the read-back decides the outcome, but its errors stay visible in the log");
@@ -1139,12 +1165,15 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
     for (const idx of [stablegateIdx, markerIdx, activateIdx]) {
       assert.equal(steps[idx]!["continue-on-error"], undefined, "no pre-activation step can continue past its own failure");
     }
-    const cond = steps[rollbackIdx]!["if"] as string;
-    assert.match(cond, /steps\.activation_gate\.outputs\.activation_started == 'true'/, "the rollback condition requires the marker that only exists after the gate passed");
-    // The workflow-level condition is a single if-expression: without the
-    // marker (gate failed → step skipped → output unset), failure() alone
-    // cannot trigger the rollback.
-    assert.equal(steps[rollbackIdx]!["continue-on-error"], undefined, "the rollback itself cannot be silently skipped either");
+    // EVERY step of the rollback chain (compare, mutate, verify) requires
+    // the marker that only exists after the gate passed — without it
+    // (gate failed → step skipped → output unset), failure() alone cannot
+    // trigger any rollback step.
+    for (const idx of [rollbackCompareIdx, rollbackMutateIdx, rollbackVerifyIdx]) {
+      const cond = steps[idx]!["if"] as string;
+      assert.match(cond, /steps\.activation_gate\.outputs\.activation_started == 'true'/, "the rollback condition requires the marker that only exists after the gate passed");
+      assert.equal(steps[idx]!["continue-on-error"], undefined, "no rollback step can be silently skipped either");
+    }
   });
 
   test("rollback EXECUTES when activation was attempted and its result is uncertain (timeout/interruption after the request was issued)", () => {
@@ -1153,7 +1182,7 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
     // though GitHub may already have applied the ref update — the marker
     // is already set and failure() is true, so the rollback runs.
     assert.equal(markerIdx + 1, activateIdx, "the marker precedes the mutation");
-    const cond = steps[rollbackIdx]!["if"] as string;
+    const cond = steps[rollbackCompareIdx]!["if"] as string;
     assert.match(cond, /failure\(\)/, "the rollback condition includes failure() — any failure at or after the marker (including the activate step itself) triggers it");
     assert.match(cond, /activation_started == 'true'/, "and the marker is the attempt evidence");
     // Regression guard against the rejected design: the condition must not
@@ -1163,16 +1192,16 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
 
   test("rollback EXECUTES when read-back verification fails after successful activation", () => {
     assert.ok(readbackIdx > -1, "the read-back step exists");
-    assert.ok(readbackIdx < rollbackIdx, `read-back precedes the rollback (readback=${readbackIdx}, rollback=${rollbackIdx})`);
+    assert.ok(readbackIdx < rollbackCompareIdx, `read-back precedes the rollback (readback=${readbackIdx}, rollback=${rollbackCompareIdx})`);
     assert.equal(steps[readbackIdx]!["if"], "success()", "read-back runs when activation succeeded");
     const readbackRun = steps[readbackIdx]!["run"] as string;
     assert.match(readbackRun, /READ-BACK MISMATCH[\s\S]*exit 1/, "a read-back divergence fails the step — failure() becomes true with the marker already set, so the rollback runs");
-    const cond = steps[rollbackIdx]!["if"] as string;
+    const cond = steps[rollbackCompareIdx]!["if"] as string;
     assert.match(cond, /failure\(\)/, "the rollback condition fires on the read-back failure");
   });
 
   test("rollback does NOT execute after successful activation AND successful read-back", () => {
-    const cond = steps[rollbackIdx]!["if"] as string;
+    const cond = steps[rollbackCompareIdx]!["if"] as string;
     assert.equal(
       cond,
       "failure() && steps.activation_gate.outputs.activation_started == 'true'",
@@ -1283,10 +1312,14 @@ describe("publish-console-snapshot workflow — downstream rollback job (eighth 
     const cond = rollback["if"] ?? "";
     assert.match(cond, /needs\.promote\.result == 'success'/, "a failed or skipped promotion can never trigger this job");
     // The in-job promote rollback still owns the pre-activation / failed-
-    // activation cases (unchanged seventh-round behavior).
-    const promoteRollback = promote.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"));
-    assert.ok(promoteRollback, "the promote job's own rollback step still exists for failures before/at activation");
-    assert.equal(promoteRollback!["if"], "failure() && steps.activation_gate.outputs.activation_started == 'true'", "the in-job rollback still requires the activation-start marker");
+    // activation cases (ninth-round Finding 1 adds the compare guard to it).
+    const promoteRollback = promote.steps.find((s) => s["id"] === "rollback_mutate");
+    assert.ok(promoteRollback, "the promote job's own rollback mutation step still exists for failures before/at activation");
+    assert.match(
+      String(promoteRollback!["if"] ?? ""),
+      /failure\(\) && steps\.activation_gate\.outputs\.activation_started == 'true' && steps\.rollback_compare\.outputs\.rollback_case == 'restore'/,
+      "the in-job rollback still requires the activation-start marker AND the live-state compare verdict",
+    );
   });
 
   test("an ambiguous activation result is decided from REMOTE state, never from reported step success", () => {
@@ -1300,10 +1333,13 @@ describe("publish-console-snapshot workflow — downstream rollback job (eighth 
     // The design is documented on the compare step (raw file, comments included).
     const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
     assert.match(raw, /The decision to roll back is made from the REMOTE state/, "the design is documented in the step itself");
-    // The promote job's in-job rollback keeps the same property (marker
-    // precedes mutation; the read-back, not the step status, decides).
-    const promoteRollback = promote.steps.find((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"))!;
-    assert.match((promoteRollback["run"] as string), /rollback_ok/, "the in-job rollback also verifies by read-back rather than trusting the activation status");
+    // The promote job's in-job rollback keeps the same property: the
+    // compare step reads the LIVE ref with the read-only token and its
+    // verdict gates the mutation — the activation status never decides.
+    const promoteCompare = promote.steps.find((s) => s["id"] === "rollback_compare")!;
+    assert.equal(stepEnv(promoteCompare)["GH_TOKEN"], "${{ github.token }}", "the in-job compare reads the live ref with the READ-ONLY token");
+    assert.match((promoteCompare["run"] as string), /git\/ref\/tags\/console-snapshot-prod/, "the in-job compare reads the live stable ref");
+    assert.ok(!((promoteCompare["if"] ?? "") as string).includes("steps.activate.outcome"), "the in-job rollback does not rely on steps.activate.outcome either");
   });
 
   test("a rollback mutation or read-back failure reports failure and preserves diagnostic evidence", () => {
@@ -1337,5 +1373,312 @@ describe("publish-console-snapshot workflow — downstream rollback job (eighth 
     }
     // The downstream verification job that TRIGGERS the rollback stays read-only.
     assert.deepEqual(verifyStable.permissions, { contents: "read" }, "verify-stable remains read-only — a failing verification job must not need write access to recover");
+  });
+});
+
+// ─── Ninth round (review Finding 1) — in-job compare-before-rollback ────────
+//
+// The promote job's former single rollback step restored the recorded
+// previous pointer from CAPTURED state without ever re-reading the live
+// reference — a second writer could move the ref between the activation
+// marker and the rollback, and the restore would overwrite it. These tests
+// pin the corrected THREE-STEP in-job rollback chain: a READ-ONLY compare
+// step that classifies the LIVE remote state (cases A–D), a PAT mutation
+// step gated on the compare's verdict, and a READ-ONLY read-back
+// verification. The conditions and endpoint paths are pinned exactly.
+
+describe("publish-console-snapshot workflow — in-job compare-before-rollback chain (ninth round, Finding 1)", () => {
+  const wf = loadWorkflow();
+  const promote = wf.jobs["promote"]!;
+  const compare = promote.steps.find((s) => s["id"] === "rollback_compare")!;
+  const mutate = promote.steps.find((s) => s["id"] === "rollback_mutate")!;
+  const verify = promote.steps.find((s) => s["id"] === "rollback_verify")!;
+  const compareRun = (compare["run"] as string) ?? "";
+  const mutateRun = (mutate["run"] as string) ?? "";
+  const verifyRun = (verify["run"] as string) ?? "";
+
+  test("the chain exists in order: compare → mutate → verify, all gated on the activation-start marker", () => {
+    const ids = promote.steps.map((s) => s["id"]);
+    const compareIdx = ids.indexOf("rollback_compare");
+    const mutateIdx = ids.indexOf("rollback_mutate");
+    const verifyIdx = ids.indexOf("rollback_verify");
+    assert.ok(compareIdx > -1 && mutateIdx > -1 && verifyIdx > -1, "all three rollback steps exist");
+    assert.ok(compareIdx < mutateIdx && mutateIdx < verifyIdx, "the rollback runs compare → mutate → verify");
+    const markerCond = "steps.activation_gate.outputs.activation_started == 'true'";
+    for (const cond of [compare["if"], mutate["if"], verify["if"]]) {
+      assert.match(cond as string, /failure\(\)/, "every rollback step runs only on failure");
+      assert.match(cond as string, new RegExp(markerCond.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "every rollback step requires the activation-start marker");
+    }
+    // Activation was NEVER attempted (any pre-activation gate failed →
+    // marker never written) → the output is unset and NO rollback step can
+    // run, even though failure() is true.
+    assert.ok(!(compare["if"] as string).includes("steps.activate.outcome"), "the compare never inspects steps.activate.outcome");
+  });
+
+  test("CASE A — activation attempted but the ref remains at its ORIGINAL pre-activation state: no mutation, original state verified", () => {
+    // update mode: the observed sha equals the recorded previous tag object.
+    assert.match(compareRun, /\[ "\$REF_MODE" = "update" \] && \[ "\$sha" = "\$PREV_TAG_OBJECT_SHA" \]/, "an unchanged ref (still the pre-activation tag object) is classified CASE A");
+    assert.match(compareRun, /CASE A: the stable ref still carries its ORIGINAL pre-activation tag object/, "CASE A is reported explicitly");
+    assert.match(compareRun, /rollback_case=none/, "CASE A outputs 'none' — the mutation step's gate cannot open");
+    // create mode: the ref is still absent (404) — original absent state intact.
+    assert.match(compareRun, /CASE A: the stable ref is still ABSENT/, "a still-absent ref in first-publication mode is CASE A (no mutation needed)");
+    // The compare step itself contains NO mutation command at all.
+    assert.ok(!/gh api\s+--method\s+(POST|PATCH|DELETE)/.test(compareRun), "the read-only compare step issues NO mutation");
+    assert.equal(mutate["if"], "failure() && steps.activation_gate.outputs.activation_started == 'true' && steps.rollback_compare.outputs.rollback_case == 'restore'", "the mutation is unreachable unless the compare said 'restore'");
+  });
+
+  test("CASE B — the ref points at THIS run's new tag object: the previous pointer is restored and verified", () => {
+    assert.match(compareRun, /\[ "\$sha" = "\$NEW_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "CASE B matches THIS run's created tag object (by sha or by the run's pointer content)");
+    assert.match(compareRun, /rollback_case=restore/, "CASE B opens the mutation gate");
+    assert.equal(stepEnv(compare)["NEW_SHA"], "${{ steps.activate.outputs.new_tag_object_sha }}", "the compare anchors on THIS run's created tag object");
+    // The restore: re-create the previous pointer object + repository-qualified PATCH.
+    assert.match(mutateRun, /--method POST "repos\/\$REPO\/git\/tags"/, "the previous pointer tag object is re-created");
+    assert.match(mutateRun, /-f message="\$PREV_POINTER_JSON"/, "the restored object carries the recorded previous pointer JSON verbatim");
+    assert.match(mutateRun, /gh api --method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" -f sha="\$old_sha" -F force=true/, "the ref is moved back via the repository-qualified PATCH");
+    // The restored state is verified by the separate read-only read-back.
+    assert.match(verifyRun, /\[ "\$sha" = "\$OLD_SHA" \] && \[ "\$message" = "\$PREV_POINTER_JSON" \] && \[ "\$restored_tag" = "\$PREV_VERSIONED_TAG" \]/, "read-back verifies ref sha + pointer message + previous release identity");
+    assert.match(verifyRun, /rollback VERIFIED: the stable ref again resolves to/, "the restoration is claimed only after the read-back proof");
+  });
+
+  test("CASE B (first publication) — the newly created reference is deleted and absence is verified by a genuine 404", () => {
+    assert.match(mutateRun, /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "the first-publication rollback deletes the ref via the repository-qualified endpoint");
+    assert.match(verifyRun, /\[ "\$code" = "404" \]/, "absence is proven ONLY by a genuine 404 read-back");
+    assert.match(verifyRun, /rollback VERIFIED: the stable ref is absent again/, "the restored absent state is explicitly verified");
+    assert.match(verifyRun, /\|\| code="transport-error"/, "a transport failure during read-back is NEVER interpreted as absence");
+  });
+
+  test("CASE C — the ref moved independently: the rollback REFUSES to overwrite or delete it", () => {
+    assert.match(compareRun, /CASE C/, "the unexpected-target case is classified explicitly");
+    assert.match(compareRun, /OPERATOR INTERVENTION REQUIRED/, "the refusal is an explicit operator-intervention failure");
+    assert.match(compareRun, /it will NOT be recreated blindly/, "a deleted pointer is not blindly recreated either");
+    assert.match(compareRun, /The documented single-writer assumption was violated/, "the refusal cites the single-writer assumption");
+    assert.match(compareRun, /exit 1/, "the compare fails the job instead of proceeding to any mutation");
+    assert.match(compareRun, /GITHUB_STEP_SUMMARY/, "the observed reference state is preserved as evidence");
+    // Every verdict output (the ONLY way the mutation gate can open) is
+    // immediately followed by `exit 0`; there is exactly ONE restore path
+    // (CASE B) and exactly the two CASE A no-mutation paths. Every refusal
+    // path (CASE C / CASE D) ends in `exit 1` without a verdict output.
+    const cmpLines = compareRun.split("\n");
+    for (let i = 0; i < cmpLines.length; i++) {
+      if (/rollback_case=(restore|none)/.test(cmpLines[i]!)) {
+        assert.match(cmpLines[i + 1] ?? "", /exit 0/, `a verdict output is always immediately followed by exit 0 (line: ${cmpLines[i]!.trim()})`);
+      }
+    }
+    assert.equal((compareRun.match(/rollback_case=restore/g) ?? []).length, 1, "exactly ONE path (CASE B) opens the mutation gate");
+    assert.equal((compareRun.match(/rollback_case=none/g) ?? []).length, 2, "exactly the two CASE A paths close the rollback without mutation");
+  });
+
+  test("CASE D — the ref cannot be read or its state is unusable: FAIL CLOSED without any mutation", () => {
+    assert.match(compareRun, /code="transport-error"/, "a curl transport failure is captured as an unreadable state");
+    assert.match(compareRun, /CASE D[\s\S]*fail closed/s, "the unreadable state is classified CASE D and fails closed");
+    assert.match(compareRun, /unusable object\.sha/, "an HTTP 200 response without a usable object.sha cannot establish state");
+    const caseDPaths = compareRun.split("CASE D").slice(1).join("CASE D");
+    assert.match(caseDPaths, /exit 1/, "CASE D fails the job");
+    assert.match(caseDPaths, /no mutation was issued/, "CASE D records that nothing was mutated");
+    assert.ok(!/gh api\s+--method\s+(POST|PATCH|DELETE)/.test(compareRun), "no mutation exists anywhere in the compare step (fail closed means exactly that)");
+  });
+
+  test("an ambiguous activation API outcome is decided from the REMOTE state, never from the activation step's report", () => {
+    // The decision inputs are the observed ref sha and the observed
+    // tag-object message — NOT steps.activate.outcome, NOT step status.
+    assert.match(compareRun, /\[ "\$sha" = "\$NEW_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "an activation whose output capture died mid-flight is still recognized: the live object carrying THIS run's pointer JSON is CASE B");
+    assert.equal(stepEnv(compare)["POINTER_JSON"], "${{ needs.verify-versioned.outputs.pointer_json }}", "the compare reads THIS run's pointer JSON across the (already validated) job boundary");
+    assert.ok(!(compare["if"] as string).includes("steps.activate.outcome") && !(mutate["if"] as string).includes("steps.activate.outcome"), "neither the compare nor the mutation consults the activation step's reported outcome");
+    // The design is documented in the workflow itself.
+    const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
+    assert.match(raw, /never from the\s*\n\s*# activation step's reported outcome|rollback decision is therefore made from the OBSERVED REMOTE/, "the remote-state decision design is documented on the compare step");
+  });
+
+  test("PAT isolation holds across the in-job rollback chain: only the mutation step carries the release-write credential", () => {
+    assert.equal(stepEnv(compare)["GH_TOKEN"], "${{ github.token }}", "the compare uses the READ-ONLY automatic token");
+    assert.equal(stepEnv(verify)["GH_TOKEN"], "${{ github.token }}", "the read-back uses the READ-ONLY automatic token");
+    assert.equal(stepEnv(mutate)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "ONLY the mutation step carries the PAT");
+    // The PAT-bearing mutation step makes no authenticated reads.
+    assert.ok(!/git\/ref\/tags/.test(mutateRun), "the mutation step never doubles as a query gate");
+    assert.ok(!/\bnode\b|pnpm|npm|npx|\.mjs|tsx/.test(mutateRun), "the mutation step executes only pinned gh api, never custom code");
+  });
+
+  test("a rollback mutation or read-back failure reports failure loudly and preserves diagnostic evidence", () => {
+    // Unusable previous-pointer evidence refuses the blind restore.
+    assert.match(mutateRun, /refusing a blind rollback/, "an unusable recorded pointer refuses a blind restore");
+    assert.match(mutateRun, /OPERATOR INTERVENTION REQUIRED/, "the refusal is an explicit operator-intervention failure");
+    // The read-back failure path preserves the full evidence.
+    assert.match(verifyRun, /ROLLBACK UNVERIFIED[\s\S]*exit 1/s, "an unverifiable restoration fails LOUDLY");
+    assert.match(verifyRun, /OPERATOR INTERVENTION REQUIRED/, "the unverified state demands operator intervention");
+    assert.match(verifyRun, /GITHUB_STEP_SUMMARY/, "the evidence (previous pointer JSON + restoration procedure) is preserved in the run summary");
+    assert.match(verifyRun, /PREV_POINTER_JSON/, "the recorded previous pointer JSON is part of the preserved evidence");
+    assert.match(verifyRun, /docs\/SNAPSHOT_PUBLICATION\.md §13\.3/, "the operator is given the documented restoration path");
+    assert.match(verifyRun, /The run does NOT claim the pointer was restored/, "the run never claims restoration without evidence");
+  });
+});
+
+// ─── Ninth round (review Findings 2 and 3) — rehearsal corrections ──────────
+//
+// Finding 2: the rehearsal's first-publication rollback drill DELETES the
+// dedicated reference; the former reactivation step then unconditionally
+// PATCHed it — an endpoint that requires an EXISTING ref, so the expected
+// first-publication happy path could never complete. The corrected
+// reactivation is aware of the actual reference state (404 → POST /git/refs,
+// 200 → PATCH, else fail closed) and verifies the result in both paths.
+//
+// Finding 3: the rehearsal previously demonstrated rollback API operations
+// via a MANUAL drill, but never proved that a failure AFTER activation
+// actually invokes the failure-triggered rollback path. The new
+// `post-activation-failure` scenario injects a deliberate, controlled
+// failure after a VERIFIED activation and exercises the SAME `if: failure()`
+// gating production uses, including compare-before-rollback.
+
+describe("rehearsal-publication workflow — state-aware reactivation (ninth round, Finding 2)", () => {
+  const loadRehearsal = (): Workflow => {
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    const json = execFileSync(
+      "python3",
+      ["-c", "import sys,yaml,json;d=yaml.safe_load(sys.stdin.read());\nif True in d: d['on']=d.pop(True)\nprint(json.dumps(d))"],
+      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, input: raw },
+    );
+    return JSON.parse(json) as Workflow;
+  };
+  const rehearsal = loadRehearsal();
+  const steps = rehearsal.jobs["rehearse"]!.steps;
+  const reactivate = steps.find((s) => typeof s["name"] === "string" && (s["name"] as string).startsWith("Re-activate the rehearsal pointer"))!;
+  const reactivateRun = (reactivate["run"] as string) ?? "";
+
+  test("reactivation is state-aware: an ABSENT reference is re-created via POST repos/$REPO/git/refs", () => {
+    assert.match(reactivateRun, /case "\$code" in/, "the reactivation reads the actual reference state first");
+    assert.match(reactivateRun, /reactivation from an ABSENT reference \(first-publication restore\): POST repos\/\$REPO\/git\/refs/, "the absent-ref path is explicit");
+    assert.match(reactivateRun, /gh api --method POST "repos\/\$REPO\/git\/refs" \\\n\s*-f ref="\$STABLE_REF" \\\n\s*-f sha="\$new_sha"/, "a deleted reference is re-created with POST repos/$REPO/git/refs (never PATCH)");
+  });
+
+  test("reactivation onto an EXISTING reference uses the repository-qualified PATCH", () => {
+    assert.match(reactivateRun, /reactivation onto an EXISTING reference: PATCH repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod/, "the existing-ref path is explicit");
+    assert.match(reactivateRun, /gh api --method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" \\\n\s*-f sha="\$new_sha" \\\n\s*-F force=true/, "an existing reference is moved with the repository-qualified PATCH");
+  });
+
+  test("BOTH reactivation paths read back and verify the expected annotated tag object, then the full identity chain", () => {
+    assert.match(reactivateRun, /\[ "\$sha" != "\$new_sha" \]/, "the reactivated ref is read back against the created tag object");
+    assert.match(reactivateRun, /REACTIVATION READ-BACK MISMATCH/, "a divergence fails loudly in BOTH paths");
+    assert.match(reactivateRun, /\[ "\$message" != "\$POINTER_JSON" \]/, "the reactivated tag object's message is verified against the pointer JSON");
+    assert.match(reactivateRun, /verify-stable "\$REPO" --expected-tag "\$TAG"/, "the full production identity chain confirms the reactivated pointer");
+  });
+
+  test("an unexpected or ambiguous reference state fails closed (never PATCH-into-404, never guess)", () => {
+    assert.match(reactivateRun, /\*\) echo "reactivation gate FAILED \(unexpected HTTP \$code\); refusing to reactivate"; exit 1/, "any status other than 404/200 aborts the reactivation");
+    assert.match(reactivateRun, /\[ "\$code" != "404" \] && \[ "\$code" != "200" \]|\*\) echo "reactivation gate FAILED/, "the gate is a genuine three-way classification");
+  });
+
+  test("the first-publication drill deletes the reference and reactivation completes the cycle (404 → POST)", () => {
+    const rollbackDrill = steps.find((s) => typeof s["name"] === "string" && (s["name"] as string).startsWith("Rollback drill"))!;
+    const drillRun = (rollbackDrill["run"] as string) ?? "";
+    assert.match(drillRun, /\[ "\$PRIOR_KIND" = "found" \]/, "the drill branches on the recorded prior state");
+    assert.match(drillRun, /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "the first-publication branch DELETES the ref");
+    assert.match(drillRun, /\[ "\$code" != "404" \]/, "and proves absence by a genuine 404 read-back");
+    // The reactivation step's POST branch is what completes the deleted-ref
+    // cycle — PATCH (the retired unconditional endpoint) would fail here.
+    assert.match(reactivateRun, /POST repos\/\$REPO\/git\/refs/, "the deleted-ref cycle ends in a POST re-creation");
+  });
+});
+
+describe("rehearsal-publication workflow — genuine post-activation failure injection (ninth round, Finding 3)", () => {
+  const loadRehearsal = (): Workflow => {
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    const json = execFileSync(
+      "python3",
+      ["-c", "import sys,yaml,json;d=yaml.safe_load(sys.stdin.read());\nif True in d: d['on']=d.pop(True)\nprint(json.dumps(d))"],
+      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, input: raw },
+    );
+    return JSON.parse(json) as Workflow;
+  };
+  const rehearsal = loadRehearsal();
+  const steps = rehearsal.jobs["rehearse"]!.steps;
+  const names = steps.map((s) => String(s["name"] ?? s["uses"] ?? ""));
+  const inject = steps.find((s) => s["id"] === "inject_failure")!;
+  const frRollback = steps.find((s) => s["id"] === "failure_rollback")!;
+  const verifyChainIdx = names.findIndex((n) => n.startsWith("Verify the stable reference serves the activated artifact"));
+  const injectIdx = names.findIndex((n) => n.startsWith("INJECT a controlled post-activation failure"));
+  const rollbackIdx = names.findIndex((n) => n.startsWith("Failure-triggered rollback"));
+
+  test("the post-activation-failure scenario is a declared dispatch input", () => {
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    assert.match(raw, /post-activation-failure/, "the scenario exists");
+  });
+
+  test("the failure is injected strictly AFTER the stable reference has verifiably moved", () => {
+    assert.ok(injectIdx > verifyChainIdx, `the injection step runs after the activation + read-back + identity-chain verification (inject=${injectIdx}, verify=${verifyChainIdx})`);
+    const injectRun = (inject["run"] as string) ?? "";
+    // Pre-injection precondition: the ref MUST point at this run's tag object.
+    assert.match(injectRun, /\[ "\$sha" != "\$NEW_TAG_OBJECT_SHA" \]/, "the injection verifies the ref points at this run's tag object first");
+    assert.match(injectRun, /INJECTION PRECONDITION FAILED/, "an unexpected pre-injection state refuses the injection");
+    // The failure itself is deliberate and identifiable — an explicit exit.
+    assert.match(injectRun, /exit 1/, "the failure is an explicit, controlled exit");
+    assert.match(injectRun, /INJECTED POST-ACTIVATION FAILURE/, "the injection is identifiable in the log");
+    assert.match(injectRun, /::error::INJECTED POST-ACTIVATION FAILURE/, "the injection is announced as a workflow error annotation");
+    assert.ok(!injectRun.includes("gh release delete") && !injectRun.includes("gh api --method DELETE"), "the injection performs NO destructive action");
+  });
+
+  test("the FAILURE-TRIGGERED rollback path runs: gated on failure() after the injected step failed", () => {
+    assert.equal(
+      frRollback["if"],
+      "failure() && env.SCENARIO == 'post-activation-failure' && steps.inject_failure.outcome == 'failure'",
+      "the rollback runs because the injected step FAILED (the same failure() gating production uses) — not via a manual invocation",
+    );
+    assert.ok(rollbackIdx > injectIdx, "the rollback step is ordered after the injection step");
+    // The rollback step exists and performs the real restore operations.
+    const runs = (frRollback["run"] as string) ?? "";
+    assert.match(runs, /--method POST "repos\/\$REPO\/git\/tags"/, "the previous pointer tag object is re-created");
+    assert.match(runs, /--method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" -f sha="\$old_sha" -F force=true/, "the previous pointer is restored");
+    assert.match(runs, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "the first-publication absent state is restored by deleting the ref");
+  });
+
+  test("the compare-before-rollback guard is exercised INSIDE the failure-triggered rollback", () => {
+    const runs = (frRollback["run"] as string) ?? "";
+    assert.match(runs, /COMPARE-BEFORE-ROLLBACK/, "the live ref is classified BEFORE any mutation");
+    assert.match(runs, /git\/ref\/tags\/console-snapshot-prod/, "the comparison reads the LIVE reference");
+    assert.match(runs, /\[ "\$sha" = "\$NEW_TAG_OBJECT_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "the guard anchors on THIS run's pointer (sha or pointer content)");
+    assert.match(runs, /OPERATOR INTERVENTION REQUIRED/, "an independently moved ref triggers the refusal");
+    assert.match(runs, /refusing to overwrite it|refusing a blind recreation/, "both unexpected states refuse mutation");
+    assert.match(runs, /fail closed, no mutation/, "an unreadable ref state fails closed");
+    // The compare precedes every mutation command in the script.
+    const compareEnd = runs.indexOf("esac") + "esac".length;
+    const firstMutation = runs.search(/gh api --method (POST|PATCH|DELETE)/);
+    assert.ok(firstMutation > compareEnd, "no mutation command appears before the compare classification completes");
+  });
+
+  test("the restored state is verified: full identity chain for the previous pointer, genuine 404 for first publication", () => {
+    const runs = (frRollback["run"] as string) ?? "";
+    assert.match(runs, /verify-stable "\$REPO" --expected-tag "\$PRIOR_TAG"/, "the restored pointer is verified through the FULL production identity chain");
+    assert.match(runs, /\[ "\$code_after" != "404" \]/, "the first-publication restore proves absence by a genuine 404 read-back");
+    assert.match(runs, /SAFETY FAILURE: the ref read returned HTTP \$code_after/, "any other read-back result fails loudly");
+    assert.match(runs, /failure-triggered rollback VERIFIED/, "the verified restoration is reported distinctly");
+  });
+
+  test("the injected scenario is NEVER reported as an ordinary successful publication", () => {
+    // The happy-scenario result step is gated to the happy scenario only.
+    const happyResult = steps.find((s) => typeof s["name"] === "string" && (s["name"] as string).startsWith("Rehearsal result (happy)"))!;
+    assert.equal(happyResult["if"], "env.SCENARIO == 'happy'", "the success summary cannot fire for the injected-failure scenario");
+    // The scenario's own result step runs always() and declares the EXPECTED failure.
+    const scenarioResult = steps.find((s) => typeof s["name"] === "string" && (s["name"] as string).startsWith("Rehearsal result (post-activation-failure)"))!;
+    assert.equal(scenarioResult["if"], "always() && env.SCENARIO == 'post-activation-failure'", "the scenario summary is written even when the job failed");
+    const resultRun = (scenarioResult["run"] as string) ?? "";
+    assert.match(resultRun, /run conclusion: EXPECTED FAILURE \(injected\)/, "the summary declares the injected failure");
+    assert.match(resultRun, /NOT a successful publication/, "the summary explicitly disclaims publication success");
+    assert.match(resultRun, /job outcome: \$\{\{ job\.status \}\}/, "the actual job outcome is reported, not asserted to be success");
+    // The four phases are reported distinctly.
+    for (const phase of ["Phase 1", "Phase 2", "Phase 3", "Phase 4"]) {
+      const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+      assert.ok(raw.includes(phase), `phase marker ${phase} exists in the workflow`);
+    }
+  });
+
+  test("the rehearsal hard guard and repository scoping are untouched by the new scenario", () => {
+    const raw = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    assert.match(raw, /GraveYield\/grave-indexer-pub-rehearsal/, "the rehearsal still targets only the designated repository");
+    assert.ok(!raw.includes("secrets."), "no repository secret is referenced anywhere in the rehearsal");
+    const guard = steps[0]!;
+    const guardRun = (guard["run"] as string) ?? "";
+    assert.match(guardRun, /grave-indexer-pub-rehearsal/, "the FIRST step is still the hard repository-identity guard");
+    // The new scenario's rollback runs in the same single job — after the guard.
+    const guardIdx = names.findIndex((n) => n.startsWith("HARD GUARD"));
+    assert.equal(guardIdx, 0, "the guard remains the first step");
+    assert.ok(rollbackIdx > guardIdx, "the failure-triggered rollback runs after the guard");
   });
 });

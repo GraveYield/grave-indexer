@@ -55,13 +55,29 @@ name: rehearsal-publication
 # verified. See docs/PUBLICATION_REHEARSAL.md.
 #
 # SCENARIOS (workflow_dispatch input):
-#   happy               full pointer-architecture sequence: versioned
-#                       release (--latest=false) → asset verification →
-#                       pointer build → annotated tag object → dedicated
-#                       ref create/update → read-back + verify-stable →
+#   happy               the FULL pointer architecture end-to-end: versioned
+#                       release → pointer build → annotated tag object →
+#                       dedicated ref create/update → read-back + verify-stable →
 #                       unrelated-release probe → rollback drill (restore
 #                       previous pointer, or delete ref + 404 on first
-#                       publication) → re-activation
+#                       publication) → re-activation (POST when the ref was
+#                       deleted by the first-publication drill, PATCH when it
+#                       still exists — ninth-round Finding 2)
+#   post-activation-failure NINTH-ROUND CORRECTION (review Finding 3): the
+#                       FULL pointer architecture up to and INCLUDING a
+#                       verified activation, then a DELIBERATE, CONTROLLED
+#                       failure injection (an explicit exit — never a
+#                       network error, a credential problem, or a destructive
+#                       action). The failure-triggered rollback path — the
+#                       SAME `if: failure()` gating production uses — then
+#                       runs: compare-before-rollback against the live ref,
+#                       restore the previous pointer (or delete the
+#                       first-publication ref), read-back + full identity
+#                       chain verification. The run summary reports the
+#                       phases distinctly (publication → injected failure →
+#                       rollback → restored-state verification); the job
+#                       conclusion for this scenario is EXPECTED to be
+#                       failure and is NEVER a successful publication.
 #   partial-upload      upload only the snapshot asset; same-release
 #                       verification must fail; the dedicated stable
 #                       reference must be UNCHANGED; the previously active
@@ -77,7 +93,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "rehearsal scenario: happy | partial-upload | promotion-failure | incomplete-artifact"
+        description: "rehearsal scenario: happy | partial-upload | promotion-failure | incomplete-artifact | post-activation-failure"
         required: false
         default: "happy"
 
@@ -138,7 +154,7 @@ jobs:
       # hardened `stable-pointer-current` gate exits non-zero on ANY
       # discovery failure; only a genuine HTTP 404 means "first publication".
       - name: Record the current stable pointer (rollback reference for this drill)
-        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'promotion-failure'
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'promotion-failure' || env.SCENARIO == 'post-activation-failure'
         id: rollback
         run: |
           node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp.out
@@ -214,7 +230,7 @@ jobs:
 
       # ── Scenario: partial upload (versioned release missing sidecars) ─
       - name: Build a COMPLETE fixture bundle
-        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: node --import tsx/esm test/fixturePublicationBundle.ts --out data
       - name: Create the versioned release and upload ONLY the snapshot asset (partial upload)
         if: env.SCENARIO == 'partial-upload'
@@ -264,7 +280,7 @@ jobs:
 
       # ── Scenario: happy path — the FULL pointer architecture + rollback drill ─
       - name: Publish the immutable versioned release (created explicitly NOT latest)
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
           echo "tag=$TAG" >> "$GITHUB_ENV"
@@ -275,13 +291,13 @@ jobs:
             data/console-snapshot.json data/console-snapshot-provenance.json data/console-snapshot.sha256
           echo "versioned release published: $TAG"
       - name: Verify the versioned release's own assets (lengths + SHA-256 digests, same-release cross-check)
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           node --import tsx/esm src/cli.ts verify-release-assets \
             "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
           echo "verified: the uploaded assets form ONE complete artifact set naming $TAG (checksum + provenance digest + tag cross-check)"
       - name: The versioned release must NOT be the stable reference before activation
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp-pre.out
           pre_tag=$(sed -n 's/^tag=//p' /tmp/sp-pre.out)
@@ -294,7 +310,7 @@ jobs:
           fi
           echo "verified: creating + uploading with --latest=false did NOT move the dedicated stable reference (${pre_tag:-<none — first publication>})"
       - name: Build the stable-pointer JSON from the VERIFIED release
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           node --import tsx/esm src/cli.ts stable-pointer-build \
             "$REPO" --tag "$TAG" --expected-tag "$TAG" > /tmp/pointer.out
@@ -319,7 +335,7 @@ jobs:
           echo "POINTER_JSON=$pointer_json" >> "$GITHUB_ENV"
           echo "stable pointer built for $TAG (previous: ${{ steps.rollback.outputs.prior_tag }})"
       - name: Activate the dedicated stable reference (create the annotated pointer tag object + create-or-update the ref)
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           new_sha=$(gh api --method POST "repos/$REPO/git/tags" \
             -f tag="console-snapshot-prod" \
@@ -356,7 +372,7 @@ jobs:
           esac
           echo "activation issued: $STABLE_REF -> $new_sha (pointer for $TAG)"
       - name: Read back the reference and the tag object (the ref MUST name the created pointer)
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
@@ -370,11 +386,183 @@ jobs:
           fi
           echo "read-back verified: $STABLE_REF -> $NEW_TAG_OBJECT_SHA (pointer for $TAG)"
       - name: Verify the stable reference serves the activated artifact (full production identity chain)
-        if: env.SCENARIO == 'happy'
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           node --import tsx/esm src/cli.ts verify-stable \
             "$REPO" --expected-tag "$TAG"
           echo "verified: refs/tags/console-snapshot-prod → annotated tag object → pointer JSON → release record for $TAG → complete verified asset set"
+          if [ "$SCENARIO" = "post-activation-failure" ]; then
+            {
+              echo "## Phase 1 — publication and verification BEFORE injection: PASS"
+              echo "- the versioned release, asset verification, pointer build, activation and the full identity chain all succeeded"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # ── Scenario: post-activation failure injection (ninth round, Finding 3) ─
+      # The happy path proves the rollback API OPERATIONS work; this scenario
+      # proves the FAILURE-TRIGGERED rollback path works: a deliberate,
+      # controlled failure AFTER the stable reference has verifiably moved
+      # (an explicit `exit 1` — never an accidental network error, an
+      # invalid credential, or a destructive action against unrelated
+      # resources) exercises the SAME `if: failure()` gating production
+      # uses, INCLUDING the compare-before-rollback guard. The job
+      # conclusion for this scenario is EXPECTED to be failure and the
+      # summary below must never read as a successful publication.
+      - name: INJECT a controlled post-activation failure (deliberate — the ref has verifiably moved)
+        if: env.SCENARIO == 'post-activation-failure'
+        id: inject_failure
+        run: |
+          # Pre-injection proof: the dedicated reference is confirmed to
+          # point at THIS run's activated tag object (read-back above), so
+          # the injection happens strictly AFTER the ref has moved.
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$NEW_TAG_OBJECT_SHA" ]; then
+            echo "INJECTION PRECONDITION FAILED: the ref does not point at this run's tag object ('$sha' vs '$NEW_TAG_OBJECT_SHA') — refusing to inject outside the required state"; exit 1
+          fi
+          {
+            echo "## Phase 2 — INJECTED post-activation failure (deliberate, controlled)"
+            echo "- injected AFTER \`refs/tags/console-snapshot-prod\` verifiably pointed at this run's tag object \`$NEW_TAG_OBJECT_SHA\`"
+            echo "- mechanism: an explicit \`exit 1\` below — no network error, no credential problem, no destructive action"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::INJECTED POST-ACTIVATION FAILURE (controlled, deliberate — scenario post-activation-failure; the failure-triggered rollback path must now run)"
+          echo "INJECTED POST-ACTIVATION FAILURE: activation had completed and was verified; this explicit exit triggers the failure-triggered rollback path"
+          exit 1
+      - name: Failure-triggered rollback (compare-before-rollback → restore → verify — the SAME failure() gating production uses)
+        # NINTH-ROUND CORRECTION (review Finding 3): this step is gated on
+        # `if: failure()` exactly like the production rollback steps — it
+        # runs because the injected step FAILED, not because it was
+        # manually invoked. It applies the same compare-before-rollback
+        # protection required in production Finding 1: the LIVE remote ref
+        # is classified BEFORE any mutation (CASE A original state intact →
+        # no mutation; CASE B this run's pointer is live → restore; CASE C
+        # moved independently → refuse + OPERATOR INTERVENTION; CASE D
+        # unreadable → fail closed). It then restores the previous pointer
+        # (or deletes the first-publication ref), reads the reference back,
+        # and verifies the complete restored pointer and asset chain
+        # (verify-stable, or a genuine HTTP 404 for the first-publication
+        # case). The rollback re-uses the prior pointer state recorded at
+        # drill start (steps.rollback) — or, explicitly, the absent
+        # first-publication state.
+        if: failure() && env.SCENARIO == 'post-activation-failure' && steps.inject_failure.outcome == 'failure'
+        id: failure_rollback
+        env:
+          PRIOR_KIND: ${{ steps.rollback.outputs.prior_kind }}
+          PRIOR_TAG: ${{ steps.rollback.outputs.prior_tag }}
+          PRIOR_POINTER_JSON: ${{ steps.rollback.outputs.prior_pointer_json }}
+          PRIOR_COMMIT: ${{ steps.rollback.outputs.prior_source_commit }}
+          NEW_TAG_OBJECT_SHA: ${{ env.NEW_TAG_OBJECT_SHA }}
+          POINTER_JSON: ${{ env.POINTER_JSON }}
+        run: |
+          # ── Compare-before-rollback: classify the LIVE remote state ──
+          code=$(curl -sS -o /tmp/fr-ref.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod") || code="transport-error"
+          case "$code" in
+            200)
+              sha=$(jq -r '.object.sha // ""' /tmp/fr-ref.json)
+              message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/git/tags/$sha" | jq -r '.message // ""') || message=""
+              observed_tag=$(jq -r '.versionedTag // ""' <<<"$message" 2>/dev/null || true)
+              if [ "$sha" = "$NEW_TAG_OBJECT_SHA" ] || [ "$message" = "$POINTER_JSON" ]; then
+                echo "compare-before-rollback OK: the stable ref still points at this run's injected pointer — the failure-triggered rollback may proceed"
+              else
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                  echo "The stable ref points at \`$sha\` (tag '${observed_tag:-<not a pointer tag>}'), not at this run's pointer — it moved independently."
+                  echo "The rollback will NOT overwrite a pointer that moved independently (documented single-writer assumption)."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref moved independently; refusing to overwrite it"
+                exit 1
+              fi
+              ;;
+            404)
+              if [ "$PRIOR_KIND" = "none" ]; then
+                echo "compare-before-rollback OK: the ref is absent AND this was a first publication — activation never moved it; nothing to roll back"
+                {
+                  echo "## Phase 3 — failure-triggered rollback: compare verified the ref is still in its original (absent) pre-activation state — no mutation needed"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref is absent but a previous pointer existed — refusing a blind recreation"
+              exit 1
+              ;;
+            *)
+              echo "COMPARE-BEFORE-ROLLBACK FAILED (HTTP '$code'): the remote state cannot be established — fail closed, no mutation"
+              exit 1
+              ;;
+          esac
+          # ── Restore: previous pointer, or the absent first-publication state ──
+          rollback_ok=false
+          if [ "$PRIOR_KIND" = "found" ]; then
+            if [ -z "$PRIOR_COMMIT" ]; then
+              echo "the recorded prior pointer carries no sourceCommit — refusing a blind rollback"; exit 1
+            fi
+            echo "failure-triggered rollback: restoring the previous pointer ($PRIOR_TAG)"
+            old_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+              -f tag="console-snapshot-prod" \
+              -f object="$PRIOR_COMMIT" \
+              -f type="commit" \
+              -f message="$PRIOR_POINTER_JSON" \
+              --jq '.sha')
+            gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true
+            {
+              echo "## Phase 3 — failure-triggered rollback EXECUTED (compare-before-rollback applied)"
+              echo "- the previous pointer was restored: \`refs/tags/console-snapshot-prod\` → \`$old_sha\` ($PRIOR_TAG)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "failure-triggered rollback: FIRST PUBLICATION — deleting the ref restores the absent pre-publication state"
+            gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod"
+            {
+              echo "## Phase 3 — failure-triggered rollback EXECUTED (compare-before-rollback applied)"
+              echo "- the first-publication reference was deleted, restoring the absent pre-publication state"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # ── Final restored-state verification ──
+          if [ "$PRIOR_KIND" = "found" ]; then
+            node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$PRIOR_TAG"
+            rollback_ok=true
+            {
+              echo "## Phase 4 — restored-state verification: PASS"
+              echo "- \`verify-stable --expected-tag $PRIOR_TAG\` proved the FULL identity chain over the restored pointer (ref → annotated tag object → pointer → release record → verified asset set)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            code_after=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+            if [ "$code_after" != "404" ]; then
+              echo "SAFETY FAILURE: the ref read returned HTTP $code_after after the first-publication rollback (expected 404)"; exit 1
+            fi
+            rollback_ok=true
+            {
+              echo "## Phase 4 — restored-state verification: PASS"
+              echo "- the ref read-back returned a genuine HTTP 404 — the absent pre-publication state is restored"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$rollback_ok" != "true" ]; then
+            echo "ROLLBACK UNVERIFIED"; exit 1
+          fi
+          echo "failure-triggered rollback VERIFIED: the restored pointer and asset chain were proven from the remote"
+      - name: Rehearsal result (post-activation-failure)
+        # The job conclusion for this scenario is EXPECTED to be failure —
+        # the injected failure is deliberately NOT reported as an ordinary
+        # successful publication. This summary runs always() so the four
+        # phases are reported distinctly even if the rollback itself failed.
+        if: always() && env.SCENARIO == 'post-activation-failure'
+        run: |
+          {
+            echo "## Rehearsal scenario \`post-activation-failure\` — run conclusion: EXPECTED FAILURE (injected)"
+            echo "- this run is NOT a successful publication; the failure was injected deliberately after a verified activation"
+            echo "- phase report:"
+            echo "  1. publication + verification before injection: see 'Phase 1' above (must be PASS)"
+            echo "  2. injected post-activation failure: see 'Phase 2' above (deliberate \`exit 1\` after the ref verifiably moved)"
+            echo "  3. failure-triggered rollback (compare-before-rollback → restore): see 'Phase 3' above"
+            echo "  4. restored-state verification: see 'Phase 4' above (verify-stable identity chain, or a genuine 404 for first publication)"
+            echo "- job outcome: ${{ job.status }} (failure is the EXPECTED conclusion for this scenario)"
+            echo "- no production resource was touched: every operation ran against \`$REPO\` only"
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: An UNRELATED release must NOT move the dedicated stable reference
         if: env.SCENARIO == 'happy'
         run: |
@@ -442,6 +630,17 @@ jobs:
           fi
       - name: Re-activate the rehearsal pointer (restore post-rollback state)
         if: env.SCENARIO == 'happy'
+        # NINTH-ROUND CORRECTION (review Finding 2): reactivation is aware
+        # of the ACTUAL reference state. After a first-publication rollback
+        # drill the ref was DELETED — PATCH repos/<repo>/git/refs/tags/
+        # console-snapshot-prod requires an EXISTING ref and would fail.
+        # The three-way gate (identical to the activation step) decides:
+        # 404 = the ref is absent → CREATE it (POST repos/$REPO/git/refs);
+        # 200 = the ref exists → MOVE it (PATCH, force); anything else =
+        # gate failure (abort — never guess). The resulting reference is
+        # read back and verified against the expected annotated tag object
+        # in BOTH branches, and the full production identity chain
+        # (verify-stable) confirms the pointer end-to-end.
         run: |
           new_sha=$(gh api --method POST "repos/$REPO/git/tags" \
             -f tag="console-snapshot-prod" \
@@ -449,11 +648,39 @@ jobs:
             -f type="commit" \
             -f message="$POINTER_JSON" \
             --jq '.sha')
-          gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
-            -f sha="$new_sha" \
-            -F force=true
+          code=$(curl -sS -o /tmp/stableref-react.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+          case "$code" in
+            404)
+              echo "reactivation from an ABSENT reference (first-publication restore): POST repos/$REPO/git/refs"
+              gh api --method POST "repos/$REPO/git/refs" \
+                -f ref="$STABLE_REF" \
+                -f sha="$new_sha"
+              ;;
+            200)
+              echo "reactivation onto an EXISTING reference: PATCH repos/$REPO/git/refs/tags/console-snapshot-prod"
+              gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
+                -f sha="$new_sha" \
+                -F force=true
+              ;;
+            *) echo "reactivation gate FAILED (unexpected HTTP $code); refusing to reactivate"; exit 1 ;;
+          esac
+          # Read back and verify the reference points at the expected tag
+          # object in BOTH reactivation paths.
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$new_sha" ]; then
+            echo "REACTIVATION READ-BACK MISMATCH: the stable ref resolves to '$sha', expected '$new_sha'"; exit 1
+          fi
+          message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/tags/$new_sha" | jq -r '.message // ""')
+          if [ "$message" != "$POINTER_JSON" ]; then
+            echo "REACTIVATION READ-BACK MISMATCH: the reactivated tag object's message does not equal the pointer JSON"; exit 1
+          fi
           node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$TAG"
-          echo "verified: re-activation of $TAG confirmed through the full identity chain"
+          echo "verified: re-activation of $TAG confirmed through the full identity chain (POST path exercised when the ref was absent; PATCH path when it existed)"
       - name: Rehearsal result (happy)
         if: env.SCENARIO == 'happy'
         run: |
