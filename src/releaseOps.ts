@@ -67,6 +67,7 @@ import {
   SnapshotPublicationError,
   STABLE_TAG,
   verifySnapshotIntegrity,
+  verifyRawArtifactCompleteness,
   stableProvenanceUrl,
   stableRefApiUrl,
   stableSnapshotUrl,
@@ -380,6 +381,37 @@ async function fetchAssetsFromRecord(
 }
 
 /**
+ * The INDEPENDENT completeness gate over fetched bytes (eighth round —
+ * review Finding 3): the verifier that inspects a released/staged
+ * artifact enforces the SAME completeness conditions as the producer's
+ * staging gate. The snapshot bytes are strictly parsed (a malformed
+ * artifact never verifies), completeness failure stages
+ * ("discovery-completeness" / "enrichment-completeness") are rejected,
+ * the provenance's enriched count must be present and well-formed, and
+ * it must EXACTLY equal the artifact's own enriched count. Any violation
+ * is a typed MALFORMED_RESPONSE failure — never an endorsement.
+ */
+function verifyFetchedArtifactCompleteness(
+  snapshotBytes: Uint8Array,
+  provenance: PublicationProvenance,
+): void {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(Buffer.from(snapshotBytes).toString("utf8")) as unknown;
+  } catch (err) {
+    throw new ReleaseOpsError("MALFORMED_RESPONSE", `the released snapshot bytes are not JSON: ${String((err as Error).message ?? err)}`);
+  }
+  try {
+    verifyRawArtifactCompleteness(raw, provenance);
+  } catch (err) {
+    if (err instanceof SnapshotPublicationError) {
+      throw new ReleaseOpsError("MALFORMED_RESPONSE", `independent completeness verification failed: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+/**
  * Verify that the snapshot / provenance / checksum triple fetched through
  * `scope` URLs is ONE release's complete, internally consistent artifact
  * set naming `expectedTag`.
@@ -485,6 +517,9 @@ export async function verifyReleaseAssetSet(args: {
     }
     throw err;
   }
+  // Eighth round (Finding 3): the same-release verification gate ALSO
+  // enforces the producer's completeness contract over the fetched bytes.
+  verifyFetchedArtifactCompleteness(snapshotBytes, provenance);
 }
 
 // ─── 3. Dedicated stable reference — resolve, verify, build (sixth round) ──
@@ -699,6 +734,13 @@ async function loadVerifiedVersionedArtifacts(args: {
     }
     throw err;
   }
+  // Eighth round (Finding 3): completeness is enforced over the EXACT
+  // fetched bytes everywhere — the stable-reference identity chain and
+  // the versioned-release loader share this gate, so a released artifact
+  // carrying a completeness failure marker (or a sidecar whose enriched
+  // count disagrees with the bytes) can never be endorsed by
+  // `verify-release-assets` or `verify-stable` either.
+  verifyFetchedArtifactCompleteness(snapshotBytes, provenance);
   return { snapshotBytes, provenanceBytes, checksumBytes, provenance };
 }
 

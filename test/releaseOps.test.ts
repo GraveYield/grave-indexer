@@ -46,6 +46,7 @@ import {
   type MinimalHttpResponse,
 } from "../src/releaseOps.js";
 import { cmdReleaseLatest, cmdVerifyReleaseAssets, cmdVerifyStable } from "../src/cli.js";
+import { parseConsoleSnapshot } from "../src/consoleSnapshotParse.js";
 
 // ─── Fixture machinery (real schema-v2 snapshots, same builders as prod) ───
 
@@ -1042,5 +1043,159 @@ interface FakeState {
     assert.equal(failed, 1, "an unexpected pointer target fails the CLI gate");
     delete process.env.GH_TOKEN;
     globalThis.fetch = realFetch;
+  });
+});
+
+// ─── Independent completeness gate over FETCHED bytes (Finding 3, eighth round) ──
+//
+// The same-release verification path (`verify-release-assets`) and the
+// stable-reference identity chain (`verify-stable`) must enforce the SAME
+// completeness conditions as the producer: a released artifact carrying a
+// "discovery-completeness" / "enrichment-completeness" marker — or a
+// sidecar whose enriched count disagrees with the bytes — is a typed
+// rejection, never an endorsement.
+
+describe("releaseOps — independent completeness gate over fetched bytes (Finding 3)", () => {
+  const READ_TOKEN = "ghs_readonly-runner-token";
+  const TAG_OBJECT_SHA = "a".repeat(40);
+  const ASSET_BASE = `https://api.github.com/repos/${REPO}/releases/assets`;
+  /** A bundle whose SNAPSHOT carries a completeness failure marker (sidecar rebuilt over the exact modified bytes). */
+  function markerBundle(tag: string, stage: string): ReturnType<typeof bundleFor> {
+    const { snapshot, bytes } = realSnapshotAt(NOW_MS);
+    const raw = JSON.parse(Buffer.from(bytes).toString("utf8")) as { failures: unknown[] };
+    raw.failures.push({ stage, reason: "injected regression marker (test)" });
+    const modified = new TextEncoder().encode(JSON.stringify(raw));
+    const provenance = buildPublicationProvenance(
+      parseConsoleSnapshot(JSON.parse(new TextDecoder().decode(modified))),
+      modified,
+      {
+        sourceCommitSha: SOURCE_COMMIT,
+        workflowRunId: "1",
+        workflowAttempt: "1",
+        repository: REPO,
+        versionedTag: tag,
+      },
+    );
+    return {
+      provenance,
+      snapshot: modified,
+      provenanceBytes: new TextEncoder().encode(JSON.stringify(provenance)),
+      checksum: new TextEncoder().encode(`${snapshotSha256(modified)}  ${SNAPSHOT_ASSET_NAME}\n`),
+    };
+  }
+
+  /** The VALID bundle's provenance with a drifted enriched count (integrity still holds). */
+  function countDriftedProvenanceBytes(tag: string): Uint8Array {
+    const drifted = JSON.parse(JSON.stringify(B.provenance)) as PublicationProvenance;
+    drifted.counts.enriched += 1;
+    drifted.versionedTag = tag;
+    return new TextEncoder().encode(JSON.stringify(drifted));
+  }
+
+  test("verifyReleaseAssetSet REJECTS a released snapshot carrying a discovery-completeness marker", async () => {
+    const M = markerBundle(TAG_B, "discovery-completeness");
+    const base = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    const byUrl = new Map([
+      [`${base}/${SNAPSHOT_ASSET_NAME}`, M.snapshot],
+      [`${base}/${PROVENANCE_ASSET_NAME}`, M.provenanceBytes],
+      [`${base}/${CHECKSUM_ASSET_NAME}`, M.checksum],
+    ]);
+    const { impl } = fetcherFor(byUrl);
+    await assert.rejects(
+      () => verifyReleaseAssetSet({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B, fetchAsset: impl }),
+      (err: unknown) =>
+        err instanceof ReleaseOpsError &&
+        err.category === "MALFORMED_RESPONSE" &&
+        err.message.includes("discovery-completeness"),
+      "a completeness-marker artifact must never be endorsed by the release verification gate",
+    );
+  });
+
+  test("verifyReleaseAssetSet REJECTS a released snapshot carrying an enrichment-completeness marker", async () => {
+    const M = markerBundle(TAG_B, "enrichment-completeness");
+    const base = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    const byUrl = new Map([
+      [`${base}/${SNAPSHOT_ASSET_NAME}`, M.snapshot],
+      [`${base}/${PROVENANCE_ASSET_NAME}`, M.provenanceBytes],
+      [`${base}/${CHECKSUM_ASSET_NAME}`, M.checksum],
+    ]);
+    const { impl } = fetcherFor(byUrl);
+    await assert.rejects(
+      () => verifyReleaseAssetSet({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B, fetchAsset: impl }),
+      (err: unknown) =>
+        err instanceof ReleaseOpsError &&
+        err.category === "MALFORMED_RESPONSE" &&
+        err.message.includes("enrichment-completeness"),
+    );
+  });
+
+  test("verifyReleaseAssetSet REJECTS a sidecar whose enriched count disagrees with the released bytes", async () => {
+    const base = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    const byUrl = new Map([
+      [`${base}/${SNAPSHOT_ASSET_NAME}`, B.snapshot],
+      [`${base}/${PROVENANCE_ASSET_NAME}`, countDriftedProvenanceBytes(TAG_B)],
+      [`${base}/${CHECKSUM_ASSET_NAME}`, B.checksum],
+    ]);
+    const { impl } = fetcherFor(byUrl);
+    await assert.rejects(
+      () => verifyReleaseAssetSet({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B, fetchAsset: impl }),
+      (err: unknown) =>
+        err instanceof ReleaseOpsError &&
+        err.category === "MALFORMED_RESPONSE" &&
+        err.message.includes("does not describe these bytes"),
+      "a count-drifted sidecar must fail the completeness gate (the digest alone does not catch it)",
+    );
+  });
+
+  test("verifyStableReference REJECTS a marker-carrying artifact behind an otherwise valid identity chain", async () => {
+    const realFetch = globalThis.fetch;
+    try {
+      const M = markerBundle(TAG_B, "discovery-completeness");
+      const built = buildStablePointer({
+        versionedTag: TAG_B,
+        sourceCommit: SOURCE_COMMIT,
+        publishedAtUnixMs: NOW_MS,
+        snapshotBytes: M.snapshot,
+        provenanceBytes: M.provenanceBytes,
+        checksumBytes: M.checksum,
+        previous: null,
+      });
+      globalThis.fetch = (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === `https://api.github.com/repos/${REPO}/git/ref/tags/console-snapshot-prod`) {
+          return new Response(JSON.stringify({ object: { sha: TAG_OBJECT_SHA, type: "tag" } }), { status: 200 });
+        }
+        if (url.startsWith(`https://api.github.com/repos/${REPO}/git/tags/`)) {
+          return new Response(JSON.stringify({ message: built.pointerJson, object: { sha: SOURCE_COMMIT, type: "commit" } }), { status: 200 });
+        }
+        if (url === `https://api.github.com/repos/${REPO}/releases/tags/${TAG_B}`) {
+          return new Response(JSON.stringify({
+            tag_name: TAG_B,
+            assets: [
+              { name: SNAPSHOT_ASSET_NAME, url: `${ASSET_BASE}/1` },
+              { name: PROVENANCE_ASSET_NAME, url: `${ASSET_BASE}/2` },
+              { name: CHECKSUM_ASSET_NAME, url: `${ASSET_BASE}/3` },
+            ],
+          }), { status: 200 });
+        }
+        const bytes = new Map([
+          [`${ASSET_BASE}/1`, M.snapshot],
+          [`${ASSET_BASE}/2`, M.provenanceBytes],
+          [`${ASSET_BASE}/3`, M.checksum],
+        ]).get(url);
+        if (bytes) return binaryResponse(bytes);
+        return textResponse("not found", 404);
+      }) as typeof fetch;
+      await assert.rejects(
+        () => verifyStableReference({ repository: REPO, expectedTag: TAG_B, authToken: READ_TOKEN }),
+        (err: unknown) =>
+          err instanceof ReleaseOpsError &&
+          err.category === "MALFORMED_RESPONSE" &&
+          err.message.includes("completeness"),
+        "the stable-reference identity chain must enforce the completeness contract over the fetched bytes",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });

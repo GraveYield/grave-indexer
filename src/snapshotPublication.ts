@@ -493,6 +493,139 @@ export function verifySnapshotIntegrity(
   }
 }
 
+// ─── Independent completeness contract (eighth round — Finding 3) ──────────
+
+/**
+ * The failure stages that mark an artifact as INCOMPLETE (never
+ * publication-ready). The PRODUCER (`publish-snapshot`) refuses to stage
+ * an artifact carrying either stage; the INDEPENDENT verification paths
+ * (`verify-snapshot`, and the release-ops asset verification behind
+ * `verify-release-assets` / `verify-stable`) re-enforce the SAME contract
+ * against the actual bytes, so an artifact that somehow reached a release
+ * or a staged bundle with a completeness marker can never be endorsed by
+ * the independent verifier either.
+ */
+export const COMPLETENESS_STAGES = ["discovery-completeness", "enrichment-completeness"] as const;
+
+/** The completeness failure stages present in a parsed snapshot (in order). */
+export function findCompletenessFailures(snapshot: ConsoleSnapshotV2): ConsoleSnapshotV2["failures"] {
+  return snapshot.failures.filter((f) => (COMPLETENESS_STAGES as readonly string[]).includes(f.stage));
+}
+
+/**
+ * The INDEPENDENT completeness gate (eighth round, review Finding 3) —
+ * the ZERO-DEPENDENCY core operating on the raw parsed JSON of an
+ * artifact. This function stays inside the release-ops bundle graph (no
+ * npm imports), so the workflow's verification jobs enforce the producer's
+ * completeness contract over fetched bytes exactly like `verify-snapshot`
+ * does over staged bytes. Fail closed on missing, malformed,
+ * contradictory or incomplete completeness evidence:
+ *
+ *   1. the artifact's `failures` array must EXIST and be well-formed — a
+ *      snapshot without inspectable completeness evidence is rejected,
+ *      never defaulted to "complete";
+ *   2. no failure entry may carry a "discovery-completeness" or
+ *      "enrichment-completeness" stage — the same markers the producer's
+ *      staging gate rejects;
+ *   3. the artifact's own `counts.enriched` must be a finite non-negative
+ *      integer;
+ *   4. the provenance sidecar must carry a well-formed `counts.enriched`
+ *      (a finite non-negative integer) — missing or malformed evidence is
+ *      a failure, not a pass;
+ *   5. the two counts must EXACTLY agree — a mismatch means the sidecar
+ *      does not describe these bytes;
+ *   6. the agreed count must be positive — an empty publication can never
+ *      be a production snapshot.
+ *
+ * Throws `SnapshotPublicationError` on ANY violation.
+ */
+export function verifyRawArtifactCompleteness(
+  raw: unknown,
+  provenance: PublicationProvenance,
+): void {
+  const notComplete = (detail: string): SnapshotPublicationError =>
+    new SnapshotPublicationError(`completeness evidence: ${detail}`);
+
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw notComplete("the snapshot payload is not a JSON object");
+  }
+  const obj = raw as Record<string, unknown>;
+
+  // 1+2. the completeness failure markers, inspected fail-closed.
+  const failures = obj["failures"];
+  if (!Array.isArray(failures)) {
+    throw notComplete("the snapshot carries no failures array — completeness evidence is missing");
+  }
+  for (const [i, f] of failures.entries()) {
+    if (typeof f !== "object" || f === null || Array.isArray(f)) {
+      throw notComplete(`failures[${i}] is not an object — completeness evidence is malformed`);
+    }
+    const stage = (f as { stage?: unknown }).stage;
+    if (typeof stage !== "string" || stage.length === 0) {
+      throw notComplete(`failures[${i}].stage is not a non-empty string — completeness evidence is malformed`);
+    }
+    if ((COMPLETENESS_STAGES as readonly string[]).includes(stage)) {
+      const reason = (f as { reason?: unknown }).reason;
+      const detail = typeof reason === "string" ? reason : "(no reason recorded)";
+      throw notComplete(`the artifact carries a "${stage}" failure marker — ${detail}`);
+    }
+  }
+
+  // 3. the artifact's own enriched count must be present and well-formed.
+  const counts = obj["counts"];
+  if (typeof counts !== "object" || counts === null || Array.isArray(counts)) {
+    throw notComplete("the snapshot carries no counts object — the enriched-pool count is missing");
+  }
+  const enrichedActual = (counts as { enriched?: unknown })["enriched"];
+  if (typeof enrichedActual !== "number" || !Number.isInteger(enrichedActual) || enrichedActual < 0) {
+    throw notComplete(
+      `the snapshot's counts.enriched is malformed (${JSON.stringify(enrichedActual ?? null)}) — expected a non-negative integer`,
+    );
+  }
+
+  // 4. the provenance claim must be present and well-formed (never
+  // defaulted to a passing value).
+  const provenanceCounts = provenance.counts as { enriched?: unknown } | undefined;
+  if (typeof provenanceCounts !== "object" || provenanceCounts === null || Array.isArray(provenanceCounts)) {
+    throw notComplete("the provenance sidecar carries no counts object — the enriched-pool count is missing");
+  }
+  const enrichedClaim = provenanceCounts.enriched;
+  if (typeof enrichedClaim !== "number" || !Number.isInteger(enrichedClaim) || enrichedClaim < 0) {
+    throw notComplete(
+      `the provenance sidecar's counts.enriched is malformed (${JSON.stringify(enrichedClaim ?? null)}) — expected a non-negative integer`,
+    );
+  }
+
+  // 5. the two counts must agree exactly.
+  if (enrichedActual !== enrichedClaim) {
+    throw notComplete(
+      `the artifact reports ${enrichedActual} enriched pool(s) but the provenance sidecar claims ${enrichedClaim} — the sidecar does not describe these bytes`,
+    );
+  }
+
+  // 6. an empty publication is never a production snapshot.
+  if (!(enrichedActual > 0)) {
+    throw notComplete("the artifact reports zero enriched pools — refusing to endorse an empty snapshot");
+  }
+}
+
+/**
+ * The typed wrapper over `verifyRawArtifactCompleteness` for callers that
+ * have already run the strict schema-v2 parser (`verify-snapshot`): the
+ * parsed artifact's shape is guaranteed by the parser, and the gate adds
+ * the independent completeness contract on top. The two share ONE logic
+ * path, so the producer-side gate (`publish-snapshot`), the staged-bundle
+ * gate (`verify-snapshot`) and the released-bytes gates
+ * (`verify-release-assets`, `verify-stable`) enforce exactly the same
+ * conditions.
+ */
+export function verifyPublicationCompleteness(
+  snapshot: ConsoleSnapshotV2,
+  provenance: PublicationProvenance,
+): void {
+  verifyRawArtifactCompleteness(snapshot as unknown, provenance);
+}
+
 // ─── Versioned tag naming ──────────────────────────────────────────────────
 
 /**

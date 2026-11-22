@@ -22,7 +22,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,6 +36,11 @@ import {
 } from "../src/cli.js";
 import { buildM1WsolQuoteSideRpcFilter, WSOL_MEMCMP_BYTES } from "../src/m1SourcingFilter.js";
 import { parseConsoleSnapshot } from "../src/consoleSnapshotParse.js";
+import {
+  buildPublicationProvenance,
+  verifyRawArtifactCompleteness,
+  type PublicationProvenance,
+} from "../src/snapshotPublication.js";
 import { DEVNET_SCANNER_PROGRAM_ID, DEVNET_VAULT_PROGRAM_ID, type PipelineConfig } from "../src/config.js";
 import { buildAmmInfoSlice, synth } from "./fixtures.js";
 
@@ -405,5 +410,191 @@ describe("cmdPublishSnapshot / cmdVerifySnapshot — staged publication gate", (
       assert.equal(existsSync(join(dataDir, "console-snapshot.sha256")), false, "no checksum staged");
       // The diagnostic artifact itself may exist, but nothing publishable was produced.
     });
+  });
+});
+
+// ─── The INDEPENDENT completeness contract (Finding 3, eighth round) ─────────
+
+// The independent `verify-snapshot` gate must enforce the SAME completeness
+// conditions as the producer's staging gate: a completeness failure marker
+// in the artifact is refused, the provenance count must exist and be
+// well-formed, and it must exactly agree with the artifact's own enriched
+// count. Fixtures are built from a REAL complete staged bundle, then
+// re-provenanced over the exact modified bytes so the INTEGRITY gate passes
+// and the COMPLETENESS gate is the one that fires.
+
+describe("cmdVerifySnapshot — the independent completeness contract (Finding 3)", () => {
+  /** Stage a REAL complete bundle, then hand the raw artifact+sidecar JSON to the caller. */
+  async function stageRealBundle(): Promise<{
+    dataDir: string;
+    artifactPath: string;
+    provPath: string;
+    snapshotRaw: Record<string, unknown>;
+    provRaw: Record<string, unknown>;
+  }> {
+    const dataDir = mkdtempSync(join(tmpdir(), "grave-indexer-verifycompleteness-"));
+    const { fetch: fetchImpl } = gpaFetch(2);
+    const code = await withEnv(
+      { GITHUB_RUN_ID: "", GITHUB_RUN_ATTEMPT: "", GITHUB_REPOSITORY: "" },
+      () =>
+        cmdPublishSnapshot(snapshotConfig(dataDir), {
+          maxPools: 10,
+          enrich: 10,
+          maxAgeHours: 24,
+          discoveryConnection: new DiscoveryRpc().asConnection(),
+          verificationConnection: new VerificationRpc().asConnection(),
+          discoveryFetchImpl: fetchImpl,
+        }),
+    );
+    assert.equal(code, 0, "the fixture bundle must stage cleanly");
+    const artifactPath = join(dataDir, "console-snapshot.json");
+    const provPath = join(dataDir, "console-snapshot-provenance.json");
+    const snapshotRaw = JSON.parse(readFileSync(artifactPath, "utf8")) as Record<string, unknown>;
+    const provRaw = JSON.parse(readFileSync(provPath, "utf8")) as Record<string, unknown>;
+    return { dataDir, artifactPath, provPath, snapshotRaw, provRaw };
+  }
+
+  /**
+   * Rebuild the provenance sidecar over the EXACT (possibly modified)
+   * artifact bytes so the SHA-256/length integrity gate passes and the
+   * COMPLETENESS gate is the one that decides the outcome.
+   */
+  function rebuildProvenanceOver(snapshotRaw: Record<string, unknown>, original: Record<string, unknown>): PublicationProvenance {
+    const bytes = new TextEncoder().encode(JSON.stringify(snapshotRaw));
+    return buildPublicationProvenance(
+      parseConsoleSnapshot(JSON.parse(new TextDecoder().decode(bytes))),
+      bytes,
+      {
+        sourceCommitSha: (original["indexerSourceCommitSha"] as string | null) ?? null,
+        workflowRunId: null,
+        workflowAttempt: null,
+        repository: null,
+        versionedTag: (original["versionedTag"] as string | null) ?? null,
+      },
+    );
+  }
+
+  function writeVariant(
+    dataDir: string,
+    snapshotRaw: Record<string, unknown>,
+    prov: unknown,
+  ): { artifactPath: string; provPath: string } {
+    const artifactPath = join(dataDir, "variant-console-snapshot.json");
+    const provPath = join(dataDir, "variant-console-snapshot-provenance.json");
+    writeFileSync(artifactPath, JSON.stringify(snapshotRaw));
+    writeFileSync(provPath, JSON.stringify(prov));
+    return { artifactPath, provPath };
+  }
+
+  test("a complete, consistent artifact still passes (existing valid schema-v2 fixtures are unaffected)", async () => {
+    const { dataDir, artifactPath, provPath, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 0);
+      // The raw gate agrees on the exact same bytes.
+      const prov = rebuildProvenanceOver(snapshotRaw, provRaw);
+      assert.doesNotThrow(() => verifyRawArtifactCompleteness(snapshotRaw, prov));
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a NONEMPTY snapshot carrying a discovery-completeness failure marker is refused", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      assert.equal((snapshotRaw["counts"] as { enriched: number }).enriched > 0, true, "fixture is nonempty");
+      (snapshotRaw["failures"] as unknown[]).push({
+        stage: "discovery-completeness",
+        reason: "injected regression marker: the corpus was truncated",
+      });
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(snapshotRaw)), provRaw);
+      const { artifactPath, provPath } = writeVariant(dataDir, snapshotRaw, prov);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1, "the marker must fail the independent verifier");
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a NONEMPTY snapshot carrying an enrichment-completeness failure marker is refused", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      (snapshotRaw["failures"] as unknown[]).push({
+        stage: "enrichment-completeness",
+        reason: "injected regression marker: enrichment targets were capped",
+      });
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(snapshotRaw)), provRaw);
+      const { artifactPath, provPath } = writeVariant(dataDir, snapshotRaw, prov);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an artifact whose enriched count differs from the provenance count is refused", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(snapshotRaw)), provRaw);
+      // Integrity still holds (digest covers the snapshot bytes, not counts)…
+      (prov.counts as { enriched: number }).enriched += 1;
+      const { artifactPath, provPath } = writeVariant(dataDir, snapshotRaw, prov);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1, "the count mismatch must fail the verifier");
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("missing completeness evidence (no counts object in the sidecar) is refused", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(snapshotRaw)), provRaw);
+      const bare = JSON.parse(JSON.stringify(prov)) as Record<string, unknown>;
+      delete bare["counts"];
+      const { artifactPath, provPath } = writeVariant(dataDir, snapshotRaw, bare);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("malformed completeness evidence (a non-integer enriched count) is refused", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(snapshotRaw)), provRaw);
+      const malformed = JSON.parse(JSON.stringify(prov)) as { counts: { enriched: unknown } };
+      malformed.counts.enriched = "2"; // a string is not a count
+      const { artifactPath, provPath } = writeVariant(dataDir, snapshotRaw, malformed);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty snapshot (zero enriched pools, agreeing sidecar) is refused — fail closed", async () => {
+    const { dataDir, snapshotRaw, provRaw } = await stageRealBundle();
+    try {
+      const empty = JSON.parse(JSON.stringify(snapshotRaw)) as Record<string, unknown>;
+      (empty["counts"] as { enriched: number }).enriched = 0;
+      (empty["pools"] as unknown[]).length = 0;
+      const prov = rebuildProvenanceOver(JSON.parse(JSON.stringify(empty)), provRaw);
+      const { artifactPath, provPath } = writeVariant(dataDir, empty, prov);
+      assert.equal(cmdVerifySnapshot(artifactPath, provPath), 1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the raw gate fails closed on a snapshot with NO failures array (missing evidence)", () => {
+    const prov = { counts: { enriched: 2 } } as unknown as PublicationProvenance;
+    assert.throws(
+      () => verifyRawArtifactCompleteness({ counts: { enriched: 2 }, pools: [{}] }, prov),
+      /completeness evidence: the snapshot carries no failures array/,
+    );
+  });
+
+  test("the raw gate fails closed on a malformed failures entry (malformed evidence)", () => {
+    const prov = { counts: { enriched: 2 } } as unknown as PublicationProvenance;
+    assert.throws(
+      () => verifyRawArtifactCompleteness({ failures: [{ stage: 42 }], counts: { enriched: 2 } }, prov),
+      /completeness evidence: failures\[0\]\.stage is not a non-empty string/,
+    );
   });
 });
