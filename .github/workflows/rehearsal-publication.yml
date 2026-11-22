@@ -432,7 +432,15 @@ jobs:
         # `if: failure()` exactly like the production rollback steps — it
         # runs because the injected step FAILED, not because it was
         # manually invoked. It applies the same compare-before-rollback
-        # protection required in production Finding 1: the LIVE remote ref
+        # protection required in production Finding 1 — including the
+        # TENTH-ROUND ownership-identity rule: the rollback mutation is
+        # permitted ONLY when the live ref's object.sha EXACTLY equals
+        # this run's captured NEW_TAG_OBJECT_SHA. Pointer-message equality
+        # (even byte-for-byte) is NOT an ownership test — a different
+        # writer can mint a DISTINCT annotated tag object carrying an
+        # identical pointer JSON — and if NEW_TAG_OBJECT_SHA is absent,
+        # empty, or malformed, identity cannot be established and the
+        # step FAILS CLOSED without mutation. The LIVE remote ref
         # is classified BEFORE any mutation (CASE A original state intact →
         # no mutation; CASE B this run's pointer is live → restore; CASE C
         # moved independently → refuse + OPERATOR INTERVENTION; CASE D
@@ -454,6 +462,15 @@ jobs:
           POINTER_JSON: ${{ env.POINTER_JSON }}
         run: |
           # ── Compare-before-rollback: classify the LIVE remote state ──
+          # OWNERSHIP IDENTITY RULE (tenth round): the rollback mutation is
+          # permitted ONLY when the live ref's object.sha EXACTLY equals
+          # this run's captured NEW_TAG_OBJECT_SHA. Pointer-message
+          # equality is NOT an ownership test — a different writer can
+          # mint a DISTINCT annotated tag object whose message is
+          # byte-for-byte identical to this run's POINTER_JSON and move
+          # the ref to it. If NEW_TAG_OBJECT_SHA is absent, empty or
+          # malformed, identity cannot be established: fail closed, no
+          # mutation.
           code=$(curl -sS -o /tmp/fr-ref.json -w '%{http_code}' \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
@@ -461,31 +478,62 @@ jobs:
           case "$code" in
             200)
               sha=$(jq -r '.object.sha // ""' /tmp/fr-ref.json)
+              case "$sha" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                *) echo "COMPARE-BEFORE-ROLLBACK FAILED (CASE D): the stable-ref read returned an unusable object.sha ('$sha') — the remote state cannot be established; fail closed, no mutation"
+                   exit 1 ;;
+              esac
+              # DIAGNOSTIC ONLY: the live object's message is shown in the
+              # summary to help operator recovery. It is NEVER an ownership
+              # test: pointer-message equality proves payload equality, not
+              # tag-object identity, and never authorizes mutation.
               message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$REPO/git/tags/$sha" | jq -r '.message // ""') || message=""
               observed_tag=$(jq -r '.versionedTag // ""' <<<"$message" 2>/dev/null || true)
-              if [ "$sha" = "$NEW_TAG_OBJECT_SHA" ] || [ "$message" = "$POINTER_JSON" ]; then
-                echo "compare-before-rollback OK: the stable ref still points at this run's injected pointer — the failure-triggered rollback may proceed"
+              # OWNERSHIP IDENTITY GATE: if this run's captured
+              # NEW_TAG_OBJECT_SHA is unusable, the identity of the live
+              # reference CANNOT be established — fail closed.
+              if ! printf '%s' "$NEW_TAG_OBJECT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                  echo "This run's captured tag-object sha (NEW_TAG_OBJECT_SHA) is unusable (\`${NEW_TAG_OBJECT_SHA:-<empty>}\`) — identity cannot be established; fail closed, no mutation."
+                  echo "Observed live ref sha: \`$sha\`. Message or payload equality NEVER proves tag-object identity."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED: this run's captured tag-object sha is unusable — identity cannot be established; fail closed, no mutation"
+                exit 1
+              fi
+              if [ "$sha" = "$NEW_TAG_OBJECT_SHA" ]; then
+                echo "compare-before-rollback OK: the stable ref still points EXACTLY at this run's activated tag object (strict sha identity) — the failure-triggered rollback may proceed"
               else
                 {
                   echo
                   echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
-                  echo "The stable ref points at \`$sha\` (tag '${observed_tag:-<not a pointer tag>}'), not at this run's pointer — it moved independently."
-                  echo "The rollback will NOT overwrite a pointer that moved independently (documented single-writer assumption)."
+                  echo "The stable ref points at \`$sha\` (tag '${observed_tag:-<not a pointer tag>}'), not at this run's activated tag object — it moved independently."
+                  echo "Even if that object's message equals this run's pointer JSON byte-for-byte, message equality is NOT identity: the rollback will NOT overwrite a pointer that moved independently (documented single-writer assumption)."
+                  echo "This run's pointer JSON (for operator comparison):"
+                  echo '```json'
+                  echo "$POINTER_JSON"
+                  echo '```'
                 } >> "$GITHUB_STEP_SUMMARY"
                 echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref moved independently; refusing to overwrite it"
                 exit 1
               fi
               ;;
             404)
-              if [ "$PRIOR_KIND" = "none" ]; then
-                echo "compare-before-rollback OK: the ref is absent AND this was a first publication — activation never moved it; nothing to roll back"
-                {
-                  echo "## Phase 3 — failure-triggered rollback: compare verified the ref is still in its original (absent) pre-activation state — no mutation needed"
-                } >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              fi
-              echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref is absent but a previous pointer existed — refusing a blind recreation"
+              # This step can only be reached AFTER the injected-failure
+              # precondition verified that the ref pointed at THIS run's
+              # activated tag object — a 404 here means the reference was
+              # DELETED independently. Absence is an unexpected,
+              # independently created state: refuse (no mutation), never
+              # interpret it as the original pre-activation state.
+              {
+                echo
+                echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                echo "The stable ref is ABSENT, but this run's activation was verified before the injection (the ref pointed at \`${NEW_TAG_OBJECT_SHA:-<unusable>}\`)."
+                echo "The reference was deleted independently — the rollback will NOT interpret absence as the original state."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref is absent after a verified activation — the reference moved independently; refusing a blind recreation"
               exit 1
               ;;
             *)

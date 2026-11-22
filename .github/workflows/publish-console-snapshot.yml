@@ -1069,25 +1069,40 @@ jobs:
         # rollback decision is therefore made from the OBSERVED REMOTE
         # state (read with the READ-ONLY automatic token), never from the
         # activation step's reported outcome (an ambiguous API result is
-        # resolved by observing what actually happened). Four cases:
+        # resolved by observing what actually happened).
+        #
+        # TENTH-ROUND CORRECTION (ownership identity): CASE B is decided
+        # by EXACT TAG-OBJECT SHA IDENTITY ONLY — the live ref's
+        # object.sha must equal THIS run's captured created tag-object
+        # sha (NEW_SHA). Pointer-message equality is NOT an ownership
+        # test: it proves payload equality, not tag-object identity — a
+        # different writer can mint a DISTINCT annotated tag object
+        # carrying an identical pointer JSON and move the stable ref to
+        # it, so message equality must never authorize a rollback
+        # mutation. Ownership is never inferred from pointer JSON, tag
+        # message, source commit, versioned release tag, or matching
+        # asset digests. Four cases:
         #   A — the ref still carries its ORIGINAL pre-activation state
         #       (create mode: absent; update mode: the previous tag
         #       object sha): activation never moved it — NO mutation; the
         #       intact previous state is verified and recorded.
-        #   B — the ref points at THIS run's created pointer (its sha
-        #       equals the created tag-object sha, or — for an
-        #       interrupted activation whose output capture died
-        #       mid-flight — the object's message equals THIS run's
-        #       pointer JSON byte-for-byte, content no other writer can
-        #       know): restore the previous pointer (or delete the ref on
-        #       first publication) and verify the result.
-        #   C — the ref points somewhere unexpected: ANOTHER writer moved
-        #       it — REFUSE to overwrite or delete; fail with an explicit
+        #   B — the ref points EXACTLY at THIS run's created pointer
+        #       (its sha equals the captured created tag-object sha,
+        #       NEW_SHA — strict tag-object identity): restore the
+        #       previous pointer (or delete the ref on first publication)
+        #       and verify the result.
+        #   C — the ref points anywhere else (a different tag object,
+        #       even one whose message is byte-for-byte identical to
+        #       this run's pointer JSON): ANOTHER writer moved it —
+        #       REFUSE to overwrite or delete; fail with an explicit
         #       OPERATOR INTERVENTION REQUIRED and preserve the observed
         #       state in the run summary.
-        #   D — the ref cannot be read or its state cannot be
-        #       established: FAIL CLOSED — no mutation, no guessing;
-        #       diagnostics preserved, operator intervention required.
+        #   D — the ref cannot be read, returns an unexpected status,
+        #       has an unusable sha, or NEW_SHA itself is absent, empty,
+        #       or malformed (e.g. the activation output capture was
+        #       interrupted): identity cannot be established — FAIL
+        #       CLOSED, no mutation, no guessing; diagnostics preserved,
+        #       operator intervention required.
         if: failure() && steps.activation_gate.outputs.activation_started == 'true'
         id: rollback_compare
         env:
@@ -1095,7 +1110,6 @@ jobs:
           PREV_TAG_OBJECT_SHA: ${{ steps.stablegate.outputs.previous_tag_object_sha }}
           PREV_VERSIONED_TAG: ${{ steps.stablegate.outputs.previous_versioned_tag }}
           NEW_SHA: ${{ steps.activate.outputs.new_tag_object_sha }}
-          POINTER_JSON: ${{ needs.verify-versioned.outputs.pointer_json }}
           GH_TOKEN: ${{ github.token }} # READ-ONLY token (job grants contents:read only), scoped to this step
         run: |
           code=$(curl -sS -o /tmp/rollback-ref.json -w '%{http_code}' \
@@ -1141,6 +1155,13 @@ jobs:
                    } >> "$GITHUB_STEP_SUMMARY"
                    exit 1 ;;
               esac
+              # DIAGNOSTIC ONLY: the live object's message is fetched for
+              # the run summary to help operator recovery. It is NEVER an
+              # ownership test: pointer-message equality proves payload
+              # equality, not tag-object identity — a different writer
+              # can mint a DISTINCT annotated tag object carrying an
+              # identical pointer JSON, so message equality must never
+              # authorize a rollback mutation.
               message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$REPO/git/tags/$sha" | jq -r '.message // ""') || message=""
               observed_tag=$(jq -r '.versionedTag // ""' <<<"$message" 2>/dev/null || true)
@@ -1148,11 +1169,6 @@ jobs:
                 echo "- observed stable ref object.sha: \`$sha\` (HTTP 200)"
                 echo "- observed pointer versionedTag: \`${observed_tag:-<not a pointer tag>}\`"
               } >> "$GITHUB_STEP_SUMMARY"
-              if [ "$sha" = "$NEW_SHA" ] || [ "$message" = "$POINTER_JSON" ]; then
-                echo "CASE B: the stable ref points at THIS run's created pointer (observed remote state, independent of the activation step's reported outcome) — rollback to the previous state may proceed"
-                echo "rollback_case=restore" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
               if [ "$REF_MODE" = "update" ] && [ "$sha" = "$PREV_TAG_OBJECT_SHA" ]; then
                 echo "CASE A: the stable ref still carries its ORIGINAL pre-activation tag object (${PREV_VERSIONED_TAG}) — activation never moved it; no rollback mutation needed"
                 {
@@ -1161,12 +1177,36 @@ jobs:
                 echo "rollback_case=none" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              echo "CASE C: the stable ref points somewhere unexpected ('$sha', tag '${observed_tag:-<none>}') — another writer moved it; refusing to overwrite or delete it"
+              # OWNERSHIP IDENTITY GATE (tenth round): the rollback is
+              # authorized ONLY by EXACT tag-object sha identity with
+              # THIS run's captured created-object sha (NEW_SHA). If
+              # NEW_SHA is absent, empty, or malformed — e.g. the
+              # activation output capture was interrupted — the identity
+              # of the live reference CANNOT be established: classify the
+              # live state as unknown (CASE D) and FAIL CLOSED.
+              if ! printf '%s' "$NEW_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                echo "CASE D: this run's captured created tag-object sha (NEW_SHA) is absent, empty, or malformed — ownership identity cannot be established (the activation output capture may have been interrupted); fail closed"
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — in-job rollback REFUSED (CASE D)"
+                  echo "- this run's captured created tag-object sha is unusable (\`${NEW_SHA:-<empty>}\`) — the identity of the live reference cannot be established"
+                  echo "- observed live ref sha: \`$sha\` — no mutation was issued: message or payload equality NEVER proves tag-object identity"
+                  echo "- recovery requires manual inspection per docs/SNAPSHOT_PUBLICATION.md §13.3"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 1
+              fi
+              if [ "$sha" = "$NEW_SHA" ]; then
+                echo "CASE B: the stable ref points EXACTLY at THIS run's created tag object (strict tag-object sha identity, observed remote state independent of the activation step's reported outcome) — rollback to the previous state may proceed"
+                echo "rollback_case=restore" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "CASE C: the stable ref points somewhere unexpected ('$sha', tag '${observed_tag:-<none>}') — another writer moved it; even a byte-for-byte identical pointer message is NOT identity; refusing to overwrite or delete it"
               {
                 echo
                 echo "## OPERATOR INTERVENTION REQUIRED — in-job rollback REFUSED (CASE C)"
-                echo "The stable reference no longer matches its original pre-activation state and does not point at this run's pointer."
+                echo "The stable reference no longer matches its original pre-activation state and does not point at this run's created tag object."
                 echo "Observed target: \`${sha:-<none>}\` (pointer tag: \`${observed_tag:-<not a pointer tag>}\`)."
+                echo "Message equality is NOT accepted as ownership: a distinct tag object carrying an identical pointer JSON is still an independent move."
                 echo "The documented single-writer assumption was violated — the rollback will NOT overwrite a pointer that moved independently."
                 echo "Recovery: inspect the current pointer and this run's versioned release, then restore manually per docs/SNAPSHOT_PUBLICATION.md §13.3."
               } >> "$GITHUB_STEP_SUMMARY"

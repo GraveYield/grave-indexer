@@ -33,7 +33,9 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 interface Workflow {
   name: string;
@@ -1428,7 +1430,16 @@ describe("publish-console-snapshot workflow — in-job compare-before-rollback c
   });
 
   test("CASE B — the ref points at THIS run's new tag object: the previous pointer is restored and verified", () => {
-    assert.match(compareRun, /\[ "\$sha" = "\$NEW_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "CASE B matches THIS run's created tag object (by sha or by the run's pointer content)");
+    // TENTH-ROUND CORRECTION (ownership identity): CASE B is authorized by
+    // EXACT tag-object sha identity ONLY. Pointer-message equality was
+    // removed as an ownership alternative: it proves payload equality,
+    // not tag-object identity — a different writer can mint a distinct
+    // annotated tag object carrying an identical pointer JSON and move
+    // the stable ref to it, so message equality must never authorize a
+    // rollback mutation.
+    assert.match(compareRun, /if \[ "\$sha" = "\$NEW_SHA" \]; then/, "CASE B is authorized by the EXACT tag-object sha identity ONLY (a single strict condition)");
+    assert.ok(!compareRun.includes('|| [ "$message" = "$POINTER_JSON" ]'), "pointer-message equality is NO LONGER an ownership alternative");
+    assert.ok(!compareRun.includes('[ "$message" = "$POINTER_JSON" ]'), "no message-equality ownership test exists anywhere in the compare step");
     assert.match(compareRun, /rollback_case=restore/, "CASE B opens the mutation gate");
     assert.equal(stepEnv(compare)["NEW_SHA"], "${{ steps.activate.outputs.new_tag_object_sha }}", "the compare anchors on THIS run's created tag object");
     // The restore: re-create the previous pointer object + repository-qualified PATCH.
@@ -1478,15 +1489,25 @@ describe("publish-console-snapshot workflow — in-job compare-before-rollback c
     assert.ok(!/gh api\s+--method\s+(POST|PATCH|DELETE)/.test(compareRun), "no mutation exists anywhere in the compare step (fail closed means exactly that)");
   });
 
-  test("an ambiguous activation API outcome is decided from the REMOTE state, never from the activation step's report", () => {
-    // The decision inputs are the observed ref sha and the observed
-    // tag-object message — NOT steps.activate.outcome, NOT step status.
-    assert.match(compareRun, /\[ "\$sha" = "\$NEW_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "an activation whose output capture died mid-flight is still recognized: the live object carrying THIS run's pointer JSON is CASE B");
-    assert.equal(stepEnv(compare)["POINTER_JSON"], "${{ needs.verify-versioned.outputs.pointer_json }}", "the compare reads THIS run's pointer JSON across the (already validated) job boundary");
+  test("an ambiguous activation API outcome is decided from the REMOTE state; an unusable captured NEW_SHA fails closed (never message equality)", () => {
+    // The decision inputs are the observed ref sha and THIS run's captured
+    // created-object sha — NOT steps.activate.outcome, NOT step status,
+    // and NEVER the pointer message.
+    assert.match(compareRun, /if \[ "\$sha" = "\$NEW_SHA" \]; then/, "ownership is anchored on the live ref's EXACT tag-object sha");
+    // TENTH-ROUND CORRECTION: an activation whose output capture died
+    // mid-flight (absent/empty/malformed NEW_SHA) can NO LONGER be
+    // recognized by pointer-message equality — that state is classified
+    // CASE D (identity cannot be established) and FAILS CLOSED.
+    assert.ok(!compareRun.includes('[ "$message" = "$POINTER_JSON" ]'), "an interrupted capture is never papered over with a message-equality test");
+    assert.match(compareRun, /ownership identity cannot be established/, "an unusable NEW_SHA classifies the live state as unknown (CASE D) and fails closed");
+    const newShaGate = compareRun.split("NEW_SHA\" | grep -Eq")[1] ?? "";
+    assert.match(newShaGate, /exit 1/, "the unusable-NEW_SHA path fails closed");
+    assert.match(newShaGate, /OPERATOR INTERVENTION REQUIRED/, "the unusable-NEW_SHA path demands operator intervention");
     assert.ok(!(compare["if"] as string).includes("steps.activate.outcome") && !(mutate["if"] as string).includes("steps.activate.outcome"), "neither the compare nor the mutation consults the activation step's reported outcome");
     // The design is documented in the workflow itself.
     const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
-    assert.match(raw, /never from the\s*\n\s*# activation step's reported outcome|rollback decision is therefore made from the OBSERVED REMOTE/, "the remote-state decision design is documented on the compare step");
+    assert.match(raw, /rollback decision is therefore made from the OBSERVED REMOTE/, "the remote-state decision design is documented on the compare step");
+    assert.match(raw, /Pointer-message equality is NOT an ownership\s*\n\s*# test/, "the ownership-identity rule (message equality \u2260 identity) is documented on the compare step");
   });
 
   test("PAT isolation holds across the in-job rollback chain: only the mutation step carries the release-write credential", () => {
@@ -1633,7 +1654,13 @@ describe("rehearsal-publication workflow — genuine post-activation failure inj
     const runs = (frRollback["run"] as string) ?? "";
     assert.match(runs, /COMPARE-BEFORE-ROLLBACK/, "the live ref is classified BEFORE any mutation");
     assert.match(runs, /git\/ref\/tags\/console-snapshot-prod/, "the comparison reads the LIVE reference");
-    assert.match(runs, /\[ "\$sha" = "\$NEW_TAG_OBJECT_SHA" \] \|\| \[ "\$message" = "\$POINTER_JSON" \]/, "the guard anchors on THIS run's pointer (sha or pointer content)");
+    // TENTH-ROUND CORRECTION (ownership identity): the guard anchors on
+    // THIS run's captured tag-object sha ONLY — pointer-message equality
+    // (even byte-for-byte) is NOT an ownership test.
+    assert.match(runs, /if \[ "\$sha" = "\$NEW_TAG_OBJECT_SHA" \]; then/, "the guard anchors on THIS run's tag-object EXACT sha identity (a single strict condition)");
+    assert.ok(!runs.includes('|| [ "$message" = "$POINTER_JSON" ]'), "pointer-message equality is NO LONGER an ownership alternative");
+    assert.ok(!runs.includes('[ "$message" = "$POINTER_JSON" ]'), "no message-equality ownership test exists anywhere in the failure-triggered rollback");
+    assert.match(runs, /identity cannot be established/, "an unusable captured sha fails closed (identity cannot be established)");
     assert.match(runs, /OPERATOR INTERVENTION REQUIRED/, "an independently moved ref triggers the refusal");
     assert.match(runs, /refusing to overwrite it|refusing a blind recreation/, "both unexpected states refuse mutation");
     assert.match(runs, /fail closed, no mutation/, "an unreadable ref state fails closed");
@@ -1680,5 +1707,246 @@ describe("rehearsal-publication workflow — genuine post-activation failure inj
     const guardIdx = names.findIndex((n) => n.startsWith("HARD GUARD"));
     assert.equal(guardIdx, 0, "the guard remains the first step");
     assert.ok(rollbackIdx > guardIdx, "the failure-triggered rollback runs after the guard");
+  });
+});
+
+// ─── Tenth round — rollback ownership: strict tag-object SHA identity ────────
+//
+// The rollback comparison logic previously authorized the restore when the
+// live ref's tag-object sha matched this run's NEW_SHA **or** the live tag
+// object's message equaled this run's POINTER_JSON. Message equality is NOT
+// an ownership test: a different writer can mint a DISTINCT annotated tag
+// object whose message is byte-for-byte identical to this run's pointer JSON
+// and move the stable ref to it — the rollback would then overwrite that
+// independently created object. Pointer-message equality proves payload
+// equality, not tag-object identity.
+//
+// The tests below EXECUTE the actual `run:` block text extracted from both
+// workflows (production promote job `rollback_compare`, rehearsal
+// `failure_rollback`) against mocked `curl` / `gh` / `node` binaries, so the
+// classification AND the absence of mutation are proven against the real
+// workflow scripts — not against copies or comment strings.
+
+describe("rollback ownership — strict tag-object SHA identity (tenth round)", () => {
+  const SHA_LIVE = "a".repeat(40); // a DIFFERENT writer's tag object (the live ref)
+  const SHA_NEW = "b".repeat(40); // THIS run's created tag object (captured NEW_SHA)
+  const SHA_PREV = "c".repeat(40); // the recorded previous pointer's tag object
+  const POINTER_JSON = JSON.stringify({
+    pointerSchema: "graveyield.console-snapshot-stable-pointer.v1",
+    stableRef: "console-snapshot-prod",
+    versionedTag: "console-snapshot-prod-20260101T000000Z-" + SHA_NEW,
+    sourceCommit: "d".repeat(40),
+  });
+
+  interface SimResult {
+    status: number;
+    stdout: string;
+    summary: string;
+    outputs: string;
+    ghCalls: string[];
+  }
+
+  function loadWorkflowFile(path: string): Workflow {
+    const raw = readFileSync(path, "utf8");
+    const json = execFileSync(
+      "python3",
+      ["-c", "import sys,yaml,json;d=yaml.safe_load(sys.stdin.read());\nif True in d: d['on']=d.pop(True)\nprint(json.dumps(d))"],
+      { encoding: "utf8", maxBuffer: 8 * 1024 * 1024, input: raw },
+    );
+    return JSON.parse(json) as Workflow;
+  }
+
+  const prodCompareRun = ((loadWorkflowFile(".github/workflows/publish-console-snapshot.yml").jobs["promote"]!)
+    .steps.find((s) => s["id"] === "rollback_compare")!["run"] as string);
+  const rehearsalRollbackRun = ((loadWorkflowFile(".github/workflows/rehearsal-publication.yml").jobs["rehearse"]!)
+    .steps.find((s) => s["id"] === "failure_rollback")!["run"] as string);
+
+  // Mock curl: in every curl call of both rollback scripts the URL is the
+  // LAST argument. Serves the ref / tag-object state configured via env.
+  const mockCurl = [
+    "#!/usr/bin/env bash",
+    "# test-harness mock: serves the ref / tag-object state configured via env",
+    'url=""',
+    'outfile=""',
+    'prev=""',
+    'for a in "$@"; do',
+    '  if [ "$prev" = "-o" ]; then outfile="$a"; fi',
+    '  prev="$a"',
+    '  case "$a" in http://*|https://*) url="$a" ;; esac',
+    "done",
+    'case "$url" in',
+    "  */git/ref/tags/*)",
+    '    if [ -n "$outfile" ]; then printf "%s" "$MOCK_REF_BODY" > "$outfile"; fi',
+    '    printf "%s" "$MOCK_REF_CODE"',
+    "    ;;",
+    "  */git/tags/*)",
+    '    jq -cn --arg m "$MOCK_TAG_MESSAGE" "{message:\\$m}"',
+    "    ;;",
+    "  *)",
+    '    echo "mock curl: unexpected URL: $url" >&2',
+    "    exit 1",
+    "    ;;",
+    "esac",
+  ].join("\n");
+  const mockGh = '#!/usr/bin/env bash\nprintf \'%s\\n\' "gh $*" >> "$MOCK_GH_LOG"\nexit 0\n';
+  const mockNode = '#!/usr/bin/env bash\nprintf \'%s\\n\' "node $*" >> "$MOCK_GH_LOG"\nexit 0\n';
+
+  function runStepScript(script: string, env: Record<string, string>): SimResult {
+    const dir = mkdtempSync(join(tmpdir(), "wf-ownership-sim-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "curl"), mockCurl, { mode: 0o755 });
+    writeFileSync(join(bin, "gh"), mockGh, { mode: 0o755 });
+    writeFileSync(join(bin, "node"), mockNode, { mode: 0o755 });
+    const summaryPath = join(dir, "summary.md");
+    const outputPath = join(dir, "outputs.txt");
+    const ghLogPath = join(dir, "gh.log");
+    writeFileSync(summaryPath, "");
+    writeFileSync(outputPath, "");
+    writeFileSync(ghLogPath, "");
+    const scriptPath = join(dir, "step.sh");
+    writeFileSync(scriptPath, script);
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", scriptPath], {
+        encoding: "utf8",
+        cwd: dir,
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          HOME: process.env.HOME ?? dir,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          GITHUB_OUTPUT: outputPath,
+          MOCK_GH_LOG: ghLogPath,
+          ...env,
+        },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stdout?: string };
+      status = e.status ?? 1;
+      stdout = String(e.stdout ?? "");
+    }
+    const result: SimResult = {
+      status,
+      stdout,
+      summary: readFileSync(summaryPath, "utf8"),
+      outputs: readFileSync(outputPath, "utf8"),
+      // every mutation (and every gh api call) issued by the step under test
+      ghCalls: readFileSync(ghLogPath, "utf8").split("\n").filter((l) => l.startsWith("gh ")),
+    };
+    rmSync(dir, { recursive: true, force: true });
+    return result;
+  }
+
+  const refBody = (sha: string) =>
+    JSON.stringify({ ref: "refs/tags/console-snapshot-prod", object: { sha, type: "tag" } });
+
+  function prodCompareEnv(overrides: Record<string, string>): Record<string, string> {
+    return {
+      REPO: "GraveYield/grave-indexer",
+      REF_MODE: "update",
+      PREV_TAG_OBJECT_SHA: SHA_PREV,
+      PREV_VERSIONED_TAG: "console-snapshot-prod-20251231T000000Z-" + SHA_PREV,
+      NEW_SHA: SHA_NEW,
+      GH_TOKEN: "sim-read-only-token",
+      MOCK_REF_CODE: "200",
+      MOCK_REF_BODY: refBody(SHA_LIVE),
+      MOCK_TAG_MESSAGE: POINTER_JSON, // byte-for-byte identical to this run's pointer JSON
+      ...overrides,
+    };
+  }
+
+  function rehearsalRollbackEnv(overrides: Record<string, string>): Record<string, string> {
+    return {
+      REPO: "GraveYield/grave-indexer-pub-rehearsal",
+      PRIOR_KIND: "found",
+      PRIOR_TAG: "console-snapshot-prod-20251231T000000Z-" + SHA_PREV,
+      PRIOR_POINTER_JSON: POINTER_JSON,
+      PRIOR_COMMIT: SHA_PREV,
+      NEW_TAG_OBJECT_SHA: SHA_NEW,
+      POINTER_JSON,
+      GH_TOKEN: "sim-rehearsal-token",
+      MOCK_REF_CODE: "200",
+      MOCK_REF_BODY: refBody(SHA_LIVE),
+      MOCK_TAG_MESSAGE: POINTER_JSON, // byte-for-byte identical to this run's pointer JSON
+      ...overrides,
+    };
+  }
+
+  test("Test A (production) — a DIFFERENT tag object whose message is byte-identical to this run's pointer JSON is Case C: rollback mutation refused", () => {
+    const res = runStepScript(prodCompareRun, prodCompareEnv({}));
+    assert.notEqual(res.status, 0, "the compare FAILS instead of authorizing a rollback");
+    assert.ok(!res.outputs.includes("rollback_case=restore"), "the mutation gate never opens");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is issued — message equality alone never authorizes mutation");
+    assert.match(res.stdout, /CASE C/, "the live state is classified Case C (independently moved)");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.match(res.summary, /Message equality is NOT accepted as ownership/, "the summary explains why the identical message did not authorize mutation");
+  });
+
+  test("Test B (production) — missing captured NEW_SHA with a byte-identical pointer message live is Case D: fail closed, no mutation", () => {
+    const res = runStepScript(prodCompareRun, prodCompareEnv({ NEW_SHA: "" }));
+    assert.notEqual(res.status, 0, "the compare FAILS CLOSED when identity cannot be established");
+    assert.ok(!res.outputs.includes("rollback_case=restore"), "the mutation gate never opens");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is issued without an usable captured sha");
+    assert.match(res.stdout, /CASE D/, "the live state is classified Case D (unknown identity)");
+    assert.match(res.stdout, /ownership identity cannot be established/, "the run reports that identity cannot be established");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  test("control (production) — the EXACT captured sha authorizes restore even when the live message DIFFERS: identity is sha-based, not message-based", () => {
+    const res = runStepScript(prodCompareRun, prodCompareEnv({
+      NEW_SHA: SHA_LIVE, // the live ref points EXACTLY at this run's captured object ...
+      MOCK_TAG_MESSAGE: "a different writer's message — ownership is decided by sha identity, not payload equality", // ... whose message differs
+    }));
+    assert.equal(res.status, 0, "the strict sha identity authorizes the rollback classification");
+    assert.match(res.outputs, /rollback_case=restore/, "the strict sha identity opens the mutation gate");
+    assert.match(res.stdout, /CASE B/,);
+    assert.deepEqual(res.ghCalls, [], "the compare step itself issues no mutation (mutation is a separate gated step)");
+  });
+
+  test("Test A (rehearsal) — a DIFFERENT tag object whose message is byte-identical to this run's pointer JSON: failure-triggered rollback refused, no mutation", () => {
+    const res = runStepScript(rehearsalRollbackRun, rehearsalRollbackEnv({}));
+    assert.notEqual(res.status, 0, "the failure-triggered rollback FAILS instead of mutating");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is issued — message equality alone never authorizes mutation");
+    assert.match(res.stdout, /COMPARE-BEFORE-ROLLBACK FAILED/, "the guard refuses the mutation");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.match(res.summary, /message equality is NOT identity/, "the summary explains why the identical message did not authorize mutation");
+  });
+
+  test("Test B (rehearsal) — missing captured NEW_TAG_OBJECT_SHA with a byte-identical pointer message live: fail closed, no mutation", () => {
+    const res = runStepScript(rehearsalRollbackRun, rehearsalRollbackEnv({ NEW_TAG_OBJECT_SHA: "" }));
+    assert.notEqual(res.status, 0, "the failure-triggered rollback FAILS CLOSED when identity cannot be established");
+    assert.deepEqual(res.ghCalls, [], "NO PATCH/POST/DELETE is issued without a usable captured sha");
+    assert.match(res.stdout, /COMPARE-BEFORE-ROLLBACK FAILED/, "the guard refuses the mutation");
+    assert.match(res.summary, /identity cannot be established/, "the run reports that identity cannot be established");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  test("control (rehearsal) — the EXACT captured sha authorizes the rollback even when the live message DIFFERS: the restore mutations are issued", () => {
+    const res = runStepScript(rehearsalRollbackRun, rehearsalRollbackEnv({
+      NEW_TAG_OBJECT_SHA: SHA_LIVE, // the live ref points EXACTLY at this run's captured object ...
+      MOCK_TAG_MESSAGE: "a different writer's message — ownership is decided by sha identity, not payload equality", // ... whose message differs
+    }));
+    assert.equal(res.status, 0, "the strict sha identity authorizes the failure-triggered rollback");
+    assert.match(res.stdout, /compare-before-rollback OK/, "the guard passes on exact sha identity alone");
+    assert.ok(
+      res.ghCalls.some((l) => l.includes("--method POST") && l.includes("/git/tags")),
+      "the previous pointer tag object is re-created (mutation authorized ONLY by sha identity)",
+    );
+    assert.ok(
+      res.ghCalls.some((l) => l.includes("--method PATCH") && l.includes("/git/refs/tags/console-snapshot-prod")),
+      "the ref is moved back via the repository-qualified PATCH",
+    );
+  });
+
+  test("rehearsal guard — an independently DELETED reference (404 after a verified activation) refuses mutation", () => {
+    const res = runStepScript(rehearsalRollbackRun, rehearsalRollbackEnv({
+      MOCK_REF_CODE: "404",
+      MOCK_REF_BODY: "",
+    }));
+    assert.notEqual(res.status, 0, "the absence of the ref after a verified activation is NOT interpreted as the original state");
+    assert.deepEqual(res.ghCalls, [], "NO mutation is issued against an independently deleted reference");
+    assert.match(res.stdout, /refusing a blind recreation/, "the deleted reference is not blindly recreated");
+    assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
   });
 });
