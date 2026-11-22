@@ -721,3 +721,125 @@ the three assets FROM THAT EXACT RECORD → checksum + provenance +
 integrity → pointer digests over the fetched bytes. The command
 authenticates with a READ-scoped token when one is in the environment
 and falls back to unauthenticated reads on a public repository.
+
+## 14. Seventh-round correction — repository-qualified ref API endpoints, attempted-activation rollback gating, and the single-writer assumption
+
+An independent review of the sixth-round implementation identified three
+defects in the promotion job's ref mutations and one weak test assertion.
+All are corrected in this round; the owner-selected dedicated stable
+reference architecture (`refs/tags/console-snapshot-prod`) is unchanged.
+
+### 14.1 Finding A — the activation PATCH endpoint
+
+The mode=update activation branch issued
+`gh api --method PATCH "$STABLE_REF"`. A bare ref is NOT a GitHub API
+path: without the `repos/<owner>/<repo>/git/refs/...` prefix the request
+does not address the git-refs endpoint at all. The activation now issues
+exactly:
+
+```
+gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
+  -f sha="$new_sha" \
+  -F force=true
+```
+
+`$REPO` resolves to `GraveYield/grave-indexer` through the promote job's
+`REPO: ${{ github.repository }}` environment. The architecture is
+preserved exactly: the annotated tag object carrying the validated
+pointer JSON is still created by a SEPARATE request
+(`POST repos/<repo>/git/tags`), the ref still moves with ONE atomic
+update, no versioned release asset is touched, and the repo-wide
+`latest` designation is still never written.
+
+### 14.2 Finding B — both rollback endpoints
+
+The rollback step used the same bare-`$STABLE_REF` form for both of its
+operations. Both are now repository-qualified:
+
+* Existing-pointer rollback:
+  `gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true`
+  — after re-creating a tag object that carries the previous pointer
+  JSON verbatim. The restoration is then verified by read-back: the ref
+  must resolve to the restored tag-object sha, the object message must
+  equal the previous pointer JSON byte-for-byte, and the parsed pointer
+  must name the previous versioned release. Anything less is reported
+  UNVERIFIED.
+* First-publication rollback:
+  `gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod"`
+  — restoring the absent state. Absence is proven ONLY by an
+  authenticated read-back returning exactly HTTP 404. The DELETE
+  command's own errors are no longer suppressed from the log (its exit
+  status is deliberately not trusted): an authentication failure,
+  network error, rate limit or unexpected API response is NEVER treated
+  as proof that the ref is absent, and rollback is claimed VERIFIED only
+  when the read-back confirms the expected state.
+
+### 14.3 Finding C — rollback runs only when activation was attempted
+
+The rollback step previously ran on `if: failure()`, which also fired
+when an earlier pre-activation gate failed — e.g. the three-way
+stable-ref discovery gate or the pointer re-validation — even though
+activation was never attempted and the ref was never touched. The
+workflow now writes an explicit activation-start marker
+(`id: activation_gate`, output `activation_started=true`) as the step
+IMMEDIATELY BEFORE the privileged activation step, and the rollback
+condition is:
+
+```
+if: failure() && steps.activation_gate.outputs.activation_started == 'true'
+```
+
+This distinguishes exactly the required cases:
+
+| Scenario | Rollback? |
+| --- | --- |
+| Failure before the stable-reference gate (artifact/pointer gates) | no |
+| Failure during stable-reference discovery (the three-way gate itself) | no |
+| Failure after the gate but before activation begins (marker step skipped) | no |
+| Activation request failure or uncertain response (timeout/interruption) | rollback ATTEMPTED |
+| Successful activation followed by read-back failure | rollback ATTEMPTED |
+| Successful activation and successful read-back | no |
+
+The marker deliberately precedes the mutation: an activation request
+that times out or is interrupted may STILL have been applied by GitHub,
+so the marker is written before the first mutation command and the
+rollback is attempted even when the activation step reports failure.
+The condition does not consult `steps.activate.outcome`. The rollback
+itself fails LOUDLY (UNVERIFIED) when it cannot determine or restore
+the correct state.
+
+### 14.4 Single-writer assumption and the residual concurrent-writer race
+
+The GitHub git-refs REST API does not offer a compare-and-swap update:
+`PATCH /repos/<repo>/git/refs/<ref>` accepts the NEW sha and `force`,
+but there is no "update only if the current sha is X" precondition and
+no If-Match-style header. The workflow therefore CANNOT make the ref
+update conditional on the state it read during the three-way gate.
+
+Within the intended single-writer model the existing protections are:
+
+* the workflow's own publication runs are serialized by the
+  `publish-console-snapshot` concurrency group
+  (`cancel-in-progress: false`), so two workflow runs can never race
+  each other;
+* the three-way gate re-reads the ref IMMEDIATELY before the mutation,
+  and the post-activation read-back plus the read-only `verify-stable`
+  identity gate detect a ref that does not resolve to the activated
+  pointer.
+
+Residual race (documented, not eliminated): an EXTERNAL writer — an
+authorized user or a process outside this workflow — could move
+`console-snapshot-prod` between the pre-activation read and the
+mutation. In that case the workflow's PATCH overwrites the external
+pointer without detecting it (no CAS is available), and if the external
+writer moves the ref again between the mutation and the read-back, the
+read-back mismatch triggers a rollback to the recorded previous
+pointer — which would itself replace the external writer's pointer.
+Mitigations the owner should keep in force: (1) treat
+`console-snapshot-prod` as written ONLY by the publish workflow
+(branch protection / rulesets may restrict tag creation and deletion);
+(2) the pointer chain makes any overwrite detectable after the fact —
+every pointer carries `previousVersionedTag`/`previousTagObjectSha`,
+and the run summary records the replaced pointer verbatim, so an
+unexpected promotion is reconstructable and auditable. No protection
+beyond the single-writer assumption is claimed.

@@ -462,7 +462,11 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     const expectedMutations: Array<[string, RegExp]> = [
       ["release", /gh release create "\$TAG"/],
       ["release", /gh release upload "\$TAG"/],
-      ["promote", /git\/tags[\s\S]*git\/refs/s],
+      // SEVENTH ROUND: the activation's ref update is the repository-qualified
+      // PATCH; the pattern is anchored on the activation's own completion
+      // echo so it cannot also match the rollback step (which now contains
+      // the same repo-qualified endpoint for its own PATCH).
+      ["promote", /git\/tags[\s\S]*stable ref activation issued/s],
       ["promote", /git\/tags[\s\S]*ROLLBACK FAILED/s],
     ];
     // The ONLY authenticated non-mutation steps allowed in the privileged
@@ -842,7 +846,8 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
     // (via the literal name or the job-level STABLE_REF constant).
     const promoteRuns = runBlocks(promote).join("\n");
     assert.match(promoteRuns, /-f ref="\$STABLE_REF"/, "ref creation uses the dedicated ref constant");
-    assert.match(promoteRuns, /--method PATCH "\$STABLE_REF"/, "ref update uses the dedicated ref constant");
+    assert.match(promoteRuns, /--method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "ref update uses the COMPLETE repository-qualified API endpoint (SEVENTH-ROUND CORRECTION)");
+    assert.ok(!promoteRuns.includes('PATCH "$STABLE_REF"'), "no ref update addresses the bare ref constant as an API endpoint");
     assert.equal(promote.env?.["STABLE_REF"], "refs/tags/console-snapshot-prod", "the job pins the exact dedicated ref name");
   });
 
@@ -868,7 +873,7 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
     assert.match(runs, /-f type="commit"/, "the tag object points at the release commit");
     assert.match(runs, /-f message="\$POINTER_JSON"/, "the pointer JSON is the tag-object message");
     assert.match(runs, /--method POST "repos\/\$REPO\/git\/refs"/, "first publication CREATES the ref");
-    assert.match(runs, /--method PATCH "\$STABLE_REF"/, "subsequent publications move the ref with ONE PATCH");
+    assert.match(runs, /--method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "subsequent publications move the ref with ONE PATCH against the COMPLETE repository-qualified endpoint (SEVENTH-ROUND CORRECTION)");
     assert.match(runs, /-F force=true/, "the ref move is the single atomic update");
     assert.ok(!runs.includes("--clobber"), "no asset is ever clobbered");
   });
@@ -885,11 +890,11 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
   test("the rollback step runs on failure, restores the recorded previous pointer, and fails LOUDLY on unverifiable rollback", () => {
     const rollback = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("ROLLBACK FAILED")));
     assert.ok(rollback, "the rollback step exists");
-    assert.equal(rollback?.["if"], "failure()", "the rollback runs only on failure");
+    assert.equal(rollback?.["if"], "failure() && steps.activation_gate.outputs.activation_started == 'true'", "the rollback runs ONLY on failure AND only when activation was attempted (SEVENTH-ROUND CORRECTION)");
     assert.equal(stepEnv(rollback!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the rollback is a privileged mutation (PAT, step-level env)");
     const runs = (rollback!["run"] as string) ?? "";
     assert.match(runs, /ref_mode/i, "the rollback branches on the pre-mutation ref state");
-    assert.match(runs, /--method DELETE "\$STABLE_REF"/, "first-publication rollback removes the ref (restores the absent state)");
+    assert.match(runs, /--method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/, "first-publication rollback removes the ref via the COMPLETE repository-qualified endpoint (restores the absent state)");
     assert.match(runs, /rollback_ok/, "the rollback outcome is tracked explicitly");
     assert.match(runs, /ROLLBACK FAILED[\s\S]*UNVERIFIED/s, "an unverifiable rollback fails LOUDLY — the state is reported as unverified");
     assert.match(runs, /rollback VERIFIED/, "a successful rollback is verified by read-back before being claimed");
@@ -904,5 +909,156 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
     assert.match(runs, /refusing to treat this as 'ref absent'/, "a failing gate aborts the run");
     const gateStep = promote.steps.find((s) => typeof s["run"] === "string" && ((s["run"] as string).includes("git/ref/tags/console-snapshot-prod")));
     assert.equal(stepEnv(gateStep!)["GH_TOKEN"], "${{ github.token }}", "the stable-ref gate uses the READ-ONLY automatic token, never the PAT");
+  });
+});
+
+// ─── Seventh round — repository-qualified stable-ref API endpoints and ───────
+// ─── attempted-activation rollback gating ────────────────────────────────────
+
+describe("publish-console-snapshot workflow — repository-qualified endpoints and rollback gating (seventh round)", () => {
+  const wf = loadWorkflow();
+  const promote = wf.jobs["promote"]!;
+  const steps = promote.steps;
+  const allRuns = Object.values(wf.jobs)
+    .flatMap((j) => runBlocks(j))
+    .join("\n");
+
+  const stablegateIdx = steps.findIndex((s) => s["id"] === "stablegate");
+  const markerIdx = steps.findIndex((s) => s["id"] === "activation_gate");
+  const activateIdx = steps.findIndex((s) => s["id"] === "activate");
+  const readbackIdx = steps.findIndex((s) => s["id"] === "readback");
+  const rollbackIdx = steps.findIndex((s) => typeof s["run"] === "string" && (s["run"] as string).includes("ROLLBACK FAILED"));
+
+  test("activation PATCH uses the COMPLETE repository-qualified endpoint repos/$REPO/git/refs/tags/console-snapshot-prod", () => {
+    assert.ok(activateIdx > -1, "the activation step exists");
+    const runs = steps[activateIdx]!["run"] as string;
+    assert.match(
+      runs,
+      /gh api --method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" \\\n\s*-f sha="\$new_sha" \\\n\s*-F force=true/,
+      "the activation ref update is the exact repository-qualified PATCH: new tag-object sha + force",
+    );
+    assert.ok(!runs.includes('PATCH "$STABLE_REF"'), "the activation does NOT address the bare ref constant as an endpoint");
+    assert.equal(stepEnv(steps[activateIdx]!)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the activation remains the PAT-scoped privileged step");
+  });
+
+  test("existing-pointer rollback PATCH uses the SAME complete repository-qualified endpoint", () => {
+    assert.ok(rollbackIdx > -1, "the rollback step exists");
+    const runs = steps[rollbackIdx]!["run"] as string;
+    assert.match(
+      runs,
+      /gh api --method PATCH "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" -f sha="\$old_sha" -F force=true/,
+      "the rollback ref update is the exact repository-qualified PATCH restoring the re-created previous pointer object",
+    );
+    assert.ok(!runs.includes('PATCH "$STABLE_REF"'), "the rollback does NOT address the bare ref constant as an endpoint");
+    // The rollback still verifies the restoration by read-back: ref sha,
+    // tag-object message (previous pointer JSON verbatim) and the previous
+    // versioned release identity.
+    assert.match(runs, /\[ "\$sha" = "\$old_sha" \]/, "read-back checks the ref resolves to the restored tag object");
+    assert.match(runs, /\[ "\$message" = "\$PREV_POINTER_JSON" \]/, "read-back checks the restored object carries the previous pointer JSON verbatim");
+    assert.match(runs, /\[ "\$restored_tag" = "\$PREV_VERSIONED_TAG" \]/, "read-back checks the restored pointer names the previous versioned release");
+  });
+
+  test("first-publication rollback DELETE uses the COMPLETE repository-qualified endpoint and proves absence by read-back only", () => {
+    const runs = steps[rollbackIdx]!["run"] as string;
+    assert.match(
+      runs,
+      /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod"/,
+      "the first-publication rollback deletes the ref via the repository-qualified endpoint",
+    );
+    assert.ok(!runs.includes('DELETE "$STABLE_REF"'), "the rollback does NOT delete the bare ref constant as an endpoint");
+    // Absence is proven ONLY by the authenticated read-back returning 404 —
+    // never by the DELETE command's own exit status (an auth failure,
+    // network error, rate limit or unexpected API response is not evidence
+    // that the ref is absent).
+    assert.match(runs, /-w '%\{http_code\}'[\s\S]*git\/ref\/tags\/console-snapshot-prod/, "the read-back queries the dedicated ref through the repository-qualified GET");
+    assert.match(runs, /\[ "\$code" = "404" \]/, "rollback is claimed VERIFIED only when the read-back returns exactly 404");
+    assert.match(runs, /rollback verification FAILED[\s\S]*expected 404/, "any other read-back result leaves the rollback UNVERIFIED");
+    // The DELETE's own error output is NOT suppressed: an UNVERIFIED outcome
+    // must carry the API's own failure detail for the operator.
+    assert.match(runs, /gh api --method DELETE "repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod" \|\| true/, "the DELETE keeps running so the read-back decides the outcome, but its errors stay visible in the log");
+  });
+
+  test("NO mutation command anywhere in the workflow uses the bare \"$STABLE_REF\" as its API endpoint", () => {
+    const mutationLines = allRuns
+      .split("\n")
+      .filter((line) => /gh api\s+--method\s+(POST|PATCH|DELETE)|gh api\s+-X\s+(POST|PATCH|DELETE)/.test(line));
+    assert.ok(mutationLines.length >= 6, `the workflow contains the expected pinned mutation commands (found ${mutationLines.length})`);
+    for (const line of mutationLines) {
+      const endpoint = line.match(/gh api\s+(?:--method|-X)\s+(?:POST|PATCH|DELETE)\s+"([^"]+)"/)?.[1];
+      assert.ok(endpoint, `every mutation command quotes its endpoint: ${line.trim()}`);
+      assert.match(endpoint!, /^repos\//, `every mutation endpoint is repository-qualified (got "${endpoint}"): ${line.trim()}`);
+    }
+    assert.ok(!allRuns.includes('gh api --method PATCH "$STABLE_REF"'), "no bare-$STABLE_REF PATCH endpoint anywhere");
+    assert.ok(!allRuns.includes('gh api --method DELETE "$STABLE_REF"'), "no bare-$STABLE_REF DELETE endpoint anywhere");
+    assert.ok(!allRuns.includes('gh api "$STABLE_REF"'), "no bare-$STABLE_REF default-method endpoint anywhere");
+  });
+
+  test("the stable ref name remains exactly refs/tags/console-snapshot-prod", () => {
+    assert.equal(promote.env?.["STABLE_REF"], "refs/tags/console-snapshot-prod", "the job pins the exact dedicated ref name");
+    const promoteRuns = runBlocks(promote).join("\n");
+    // Every ref mutation addresses the tags/console-snapshot-prod path and
+    // the tag OBJECT is always created with the same name.
+    assert.match(promoteRuns, /repos\/\$REPO\/git\/refs\/tags\/console-snapshot-prod/, "ref updates address the dedicated ref path");
+    assert.match(promoteRuns, /-f tag="console-snapshot-prod"/, "pointer tag objects are always created with the dedicated tag name");
+    assert.ok(!runBlocks(promote).join("\n").includes("releases/latest"), "no repo-wide latest dependency exists in the promotion job");
+  });
+
+  test("the activation-start marker exists and is written IMMEDIATELY before the mutation step", () => {
+    assert.ok(markerIdx > -1, "the activation_gate marker step exists");
+    const markerRun = steps[markerIdx]!["run"] as string;
+    assert.match(markerRun, /activation_started=true/, "the marker records activation_started=true");
+    assert.match(markerRun, /GITHUB_OUTPUT/, "the marker is a step output consumable by the rollback condition");
+    assert.equal(markerIdx + 1, activateIdx, `the marker is the step immediately before the mutation (marker=${markerIdx}, activate=${activateIdx})`);
+    assert.equal(steps[markerIdx]!["continue-on-error"], undefined, "the marker step cannot be skipped by continue-on-error");
+    const activateRun = steps[activateIdx]!["run"] as string;
+    assert.ok(!activateRun.includes("activation_started"), "the marker is NOT written by the mutation step itself — an interrupted step cannot be relied on to have written it");
+  });
+
+  test("rollback CANNOT execute when the stable-reference gate fails (activation never attempted)", () => {
+    assert.ok(stablegateIdx > -1, "the three-way stable-ref gate exists");
+    assert.ok(stablegateIdx < markerIdx, `the gate runs BEFORE the marker (gate=${stablegateIdx}, marker=${markerIdx}) — its failure prevents the marker from ever being written`);
+    for (const idx of [stablegateIdx, markerIdx, activateIdx]) {
+      assert.equal(steps[idx]!["continue-on-error"], undefined, "no pre-activation step can continue past its own failure");
+    }
+    const cond = steps[rollbackIdx]!["if"] as string;
+    assert.match(cond, /steps\.activation_gate\.outputs\.activation_started == 'true'/, "the rollback condition requires the marker that only exists after the gate passed");
+    // The workflow-level condition is a single if-expression: without the
+    // marker (gate failed → step skipped → output unset), failure() alone
+    // cannot trigger the rollback.
+    assert.equal(steps[rollbackIdx]!["continue-on-error"], undefined, "the rollback itself cannot be silently skipped either");
+  });
+
+  test("rollback EXECUTES when activation was attempted and its result is uncertain (timeout/interruption after the request was issued)", () => {
+    // The marker is written BEFORE the first mutation command: if the
+    // activation step fails, times out or is killed mid-request — even
+    // though GitHub may already have applied the ref update — the marker
+    // is already set and failure() is true, so the rollback runs.
+    assert.equal(markerIdx + 1, activateIdx, "the marker precedes the mutation");
+    const cond = steps[rollbackIdx]!["if"] as string;
+    assert.match(cond, /failure\(\)/, "the rollback condition includes failure() — any failure at or after the marker (including the activate step itself) triggers it");
+    assert.match(cond, /activation_started == 'true'/, "and the marker is the attempt evidence");
+    // Regression guard against the rejected design: the condition must not
+    // depend on the activation step REPORTING success/failure.
+    assert.ok(!cond.includes("steps.activate.outcome"), "the rollback does NOT rely on steps.activate.outcome — a failed/interrupted request may still have changed the ref");
+  });
+
+  test("rollback EXECUTES when read-back verification fails after successful activation", () => {
+    assert.ok(readbackIdx > -1, "the read-back step exists");
+    assert.ok(readbackIdx < rollbackIdx, `read-back precedes the rollback (readback=${readbackIdx}, rollback=${rollbackIdx})`);
+    assert.equal(steps[readbackIdx]!["if"], "success()", "read-back runs when activation succeeded");
+    const readbackRun = steps[readbackIdx]!["run"] as string;
+    assert.match(readbackRun, /READ-BACK MISMATCH[\s\S]*exit 1/, "a read-back divergence fails the step — failure() becomes true with the marker already set, so the rollback runs");
+    const cond = steps[rollbackIdx]!["if"] as string;
+    assert.match(cond, /failure\(\)/, "the rollback condition fires on the read-back failure");
+  });
+
+  test("rollback does NOT execute after successful activation AND successful read-back", () => {
+    const cond = steps[rollbackIdx]!["if"] as string;
+    assert.equal(
+      cond,
+      "failure() && steps.activation_gate.outputs.activation_started == 'true'",
+      "the exact condition: on a fully successful promotion failure() is false, so the rollback never runs even though the marker is set",
+    );
+    assert.equal(steps[readbackIdx]!["if"], "success()", "the read-back gate lets a verified activation complete the job without the rollback");
   });
 });

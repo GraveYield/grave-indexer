@@ -221,14 +221,22 @@ name: publish-console-snapshot
 #      of THAT EXACT VERSIONED RELEASE through its tag URLs with
 #      same-release cross-checks (`verify-release-assets --scope
 #      versioned`).
-#   6. promote (privileged, one gh command) — activate the stable
-#      reference with a single latest-release metadata promotion. Only
-#      reached when every prior job is green.
-#   7. verify-stable (read-only) — the repo-wide latest designation must
-#      equal the activated tag AND the stable URL must serve exactly one
-#      complete artifact set naming that tag (`verify-release-assets
-#      --scope latest`); then the publication summary (incl. the
-#      rollback pointer) is written.
+#   6. promote (privileged, pinned gh api mutations, zero custom code) —
+#      activate the DEDICATED stable reference: create the NEW annotated
+#      pointer tag object, then move refs/tags/console-snapshot-prod
+#      with ONE repository-qualified ref-update request (PATCH
+#      repos/<repo>/git/refs/tags/console-snapshot-prod, force). Only
+#      reached when every prior job is green AND the three-way
+#      stable-ref gate has read the current ref state. An
+#      activation-start marker is written immediately BEFORE the first
+#      mutation; the rollback step runs only when that marker exists AND
+#      the run has failed — never for a failure that happened before
+#      activation was attempted.
+#   7. verify-stable (read-only) — the DEDICATED stable reference must
+#      resolve to a pointer naming exactly the activated versioned tag
+#      AND that release must serve one complete verified artifact set
+#      (full identity chain via `verify-stable --expected-tag`); then
+#      the publication summary (incl. the rollback pointer) is written.
 #
 # PERMISSIONS: least privilege — the workflow default is `contents:
 # read`, and EVERY ONE of the seven jobs declares `contents: read`
@@ -923,6 +931,22 @@ jobs:
               ;;
             *) echo "stable-ref gate FAILED (unexpected HTTP $code); refusing to treat this as 'ref absent'"; exit 1 ;;
           esac
+      - name: Mark the activation start (the rollback gate — written immediately BEFORE the first mutation)
+        # SEVENTH-ROUND CORRECTION: the rollback step below previously ran
+        # on `if: failure()`, which also fired when an earlier gate (the
+        # three-way stable-ref read, the pointer re-validation) failed —
+        # i.e. when activation was never attempted and the ref was never
+        # touched. The rollback must run ONLY when activation was
+        # actually ATTEMPTED. This step writes the marker immediately
+        # before the privileged mutation step; every gate that precedes
+        # it can fail the run without triggering a rollback. Because the
+        # marker precedes the mutation, a timed-out or interrupted
+        # activation request (which GitHub may nevertheless have applied)
+        # still yields activation_started=true — the rollback is
+        # attempted even though the activation step reports failure or
+        # was killed mid-request.
+        id: activation_gate
+        run: echo "activation_started=true" >> "$GITHUB_OUTPUT"
       - name: Activate the dedicated stable reference (create annotated pointer tag object + ONE atomic ref update)
         # Only reached when: artifact complete + schema-valid + integrity
         # verified + versioned release published + same-release asset
@@ -962,7 +986,11 @@ jobs:
               -f ref="$STABLE_REF" \
               -f sha="$new_sha"
           else
-            gh api --method PATCH "$STABLE_REF" \
+            # SEVENTH-ROUND CORRECTION: the ref-update endpoint must be
+            # repository-qualified. A bare ref is not a GitHub API path —
+            # the PATCH must address
+            # repos/<repo>/git/refs/tags/console-snapshot-prod.
+            gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
               -f sha="$new_sha" \
               -F force=true
           fi
@@ -992,16 +1020,29 @@ jobs:
             exit 1
           fi
           echo "read-back verified: refs/tags/console-snapshot-prod -> $NEW_SHA (pointer for ${{ needs.verify-versioned.outputs.versioned_tag }})"
-      - name: Roll back the stable reference to the recorded previous pointer (on any activation/verification failure)
-        # Runs ONLY when the activation or the read-back failed. Restores
-        # the recorded previous pointer: for a first publication (no
-        # previous pointer) it DELETES the ref (restoring the absent
-        # state); otherwise it re-creates a tag object carrying the
-        # PREVIOUS pointer JSON verbatim and re-points the ref to it.
-        # The result is verified by read-back. ANY rollback failure fails
-        # LOUDLY with the stable state reported as UNVERIFIED — the run
-        # NEVER claims restoration without evidence.
-        if: failure()
+      - name: Roll back the stable reference to the recorded previous pointer (only when activation was ATTEMPTED and failed)
+        # SEVENTH-ROUND CORRECTION: runs ONLY when (a) the run has failed
+        # AND (b) the activation-start marker exists — i.e. the workflow
+        # passed every pre-activation gate and reached the privileged
+        # mutation. Failures BEFORE activation (artifact gates, pointer
+        # validation, the three-way stable-ref gate) never run the
+        # rollback, because the stable ref was never touched. Failures
+        # AT or AFTER activation — including an activation request that
+        # timed out or was interrupted after GitHub may have applied the
+        # ref update (the marker is written before the mutation) — DO run
+        # the rollback. Restores the recorded previous pointer: for a
+        # first publication (no previous pointer) it DELETES the ref via
+        # the repository-qualified endpoint (restoring the absent state);
+        # otherwise it re-creates a tag object carrying the PREVIOUS
+        # pointer JSON verbatim and re-points the ref to it. Every
+        # mutation addresses the COMPLETE repository-qualified API path
+        # repos/<repo>/git/refs/tags/console-snapshot-prod. The result is
+        # verified by read-back. ANY rollback failure fails LOUDLY with
+        # the stable state reported as UNVERIFIED — the run NEVER claims
+        # restoration without evidence (an auth failure, network error,
+        # rate limit or unexpected API response is never treated as proof
+        # that the ref is absent).
+        if: failure() && steps.activation_gate.outputs.activation_started == 'true'
         env:
           REF_MODE: ${{ steps.stablegate.outputs.ref_mode }}
           PREV_POINTER_JSON: ${{ steps.stablegate.outputs.previous_pointer_json }}
@@ -1012,7 +1053,11 @@ jobs:
           rollback_ok=false
           if [ "$REF_MODE" = "create" ]; then
             echo "first publication: rolling back to the ABSENT stable-ref state (deleting the ref)"
-            gh api --method DELETE "$STABLE_REF" >/dev/null 2>&1 || true
+            # Errors are NOT suppressed: they appear in the run log so an
+            # UNVERIFIED outcome carries the API's own failure detail. The
+            # `|| true` only prevents an early abort before the read-back
+            # below can determine the actual ref state.
+            gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod" || true
             code=$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
             if [ "$code" = "404" ]; then
@@ -1035,7 +1080,7 @@ jobs:
                 -f type="commit" \
                 -f message="$PREV_POINTER_JSON" \
                 --jq '.sha')
-              gh api --method PATCH "$STABLE_REF" -f sha="$old_sha" -F force=true >/dev/null 2>&1 || true
+              gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true || true
               sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
               message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
