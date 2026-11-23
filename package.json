@@ -18,6 +18,7 @@
   "scripts": {
     "build:sdk": "pnpm --filter @graveyield/sdk build",
     "build": "pnpm run build:sdk && tsc -p tsconfig.json",
+    "bundle:release-ops": "esbuild src/releaseOpsCli.ts --bundle --platform=node --format=esm --target=node18 --legal-comments=none --outfile=dist/release-ops.mjs",
     "typecheck": "pnpm run build:sdk && tsc -p tsconfig.typecheck.json --noEmit",
     "test": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec --test-name-pattern='.*' 'test/**/*.test.ts'",
     "test:offline": "pnpm run build:sdk && node --test --import tsx/esm --test-reporter=spec 'test/*.test.ts'",
@@ -28,13 +29,14 @@
   },
   "dependencies": {
     "@graveyield/sdk": "workspace:*",
-    "@solana/web3.js": "^3.1.1",
     "@solana/spl-token": "^0.4.6",
+    "@solana/web3.js": "^3.1.1",
     "bs58": "^6.0.0",
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
+    "esbuild": "^0.28.2",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   },

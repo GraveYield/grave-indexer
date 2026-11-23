@@ -24,8 +24,12 @@ import type { Cluster } from "./provenance.js";
 import type { EndpointKind } from "./provenance.js";
 import type { DiscoveredPoolRecord } from "./discovery.js";
 import { assertM1Sourcing } from "./m1Sourcing.js";
-
-export const CONSOLE_SNAPSHOT_SCHEMA_VERSION = 2;
+// The schema version is DEFINED in the leaf module src/consoleSnapshotVersion.ts
+// (single source of truth) and re-exported here so every existing import
+// site keeps working. See that module's header for why the constant
+// cannot be defined in this file.
+import { CONSOLE_SNAPSHOT_SCHEMA_VERSION } from "./consoleSnapshotVersion.js";
+export { CONSOLE_SNAPSHOT_SCHEMA_VERSION };
 
 /** Criteria states the snapshot can express. Everything not derivable is "pending". */
 export type SnapshotCriterionState = "pass" | "fail" | "pending";

@@ -1,0 +1,854 @@
+name: rehearsal-publication
+
+# NON-PRODUCTION publication rehearsal (PR #5 remediation — review Task 6;
+# EIGHTH-ROUND CORRECTION — review Finding 2: the rehearsal now exercises
+# the SAME dedicated stable-reference architecture as production, never the
+# retired repo-wide "latest" mechanism).
+#
+# This workflow exists ONLY to rehearse the real GitHub operations of
+# publish-console-snapshot.yml against a clearly separate, clearly named
+# non-production target:
+#
+#     GraveYield/grave-indexer-pub-rehearsal
+#
+# HARD SAFETY GUARD: the FIRST step refuses to run anywhere else — the
+# guard runs BEFORE checkout and BEFORE any write operation. If this file
+# is ever dispatched in GraveYield/grave-indexer (or any other repository),
+# it aborts immediately. It must never create, modify, or promote anything
+# in a production repository, and it never touches the production stable
+# reference or production assets.
+#
+# ARCHITECTURE UNDER TEST (identical to production, eighth round):
+#   1. build/verify a schema-v2 snapshot artifact + provenance + checksum;
+#   2. publish the triple to an immutable VERSIONED release created with
+#      `--latest=false` (NEVER the repo-wide latest designation);
+#   3. verify the uploaded assets (lengths + SHA-256 digests + same-release
+#      cross-checks) through `verify-release-assets --scope versioned`;
+#   4. build the stable-pointer JSON (graveyield.console-snapshot-stable-
+#      pointer.v1) from the VERIFIED bytes via `stable-pointer-build`;
+#   5. create an ANNOTATED git tag object carrying that pointer JSON
+#      (POST /git/tags) and create-or-update the DEDICATED reference
+#      `refs/tags/console-snapshot-prod` in the rehearsal repository
+#      (POST /git/refs for a first publication, PATCH /git/refs for an
+#      update — the same repository-qualified endpoints production uses);
+#   6. read the reference back, retrieve the tag object, parse the pointer,
+#      and verify it names the expected release (`verify-stable
+#      --expected-tag` — the FULL production identity chain, including
+#      asset digests over the fetched bytes);
+#   7. prove that an UNRELATED release cannot move the dedicated reference;
+#   8. exercise ROLLBACK: restore the previous pointer (or, for a first
+#      publication, delete the reference and verify 404), then re-activate;
+#   9. inject failures BEFORE and AFTER activation to establish that the
+#      prior valid pointer remains intact or is restored.
+#
+# CREDENTIAL ISOLATION (unchanged): the rehearsal uses the automatic
+# `github.token` of the workflow run — which, by the hard guard, exists
+# only inside the rehearsal repository, so it is scoped to the rehearsal
+# repository ONLY. The production release credential (`GY_RELEASE_PAT`)
+# must NEVER be wired into this workflow (pinned by
+# test/publishWorkflow.test.ts). No credential value is ever echoed.
+#
+# STATUS: this workflow is PREPARED, not yet executed. It is registered
+# for workflow_dispatch only from the default branch of the repository it
+# lives in; no authorized rehearsal dispatch has happened yet, and NO
+# rehearsal result may be claimed until one has run and been independently
+# verified. See docs/PUBLICATION_REHEARSAL.md.
+#
+# SCENARIOS (workflow_dispatch input):
+#   happy               the FULL pointer architecture end-to-end: versioned
+#                       release → pointer build → annotated tag object →
+#                       dedicated ref create/update → read-back + verify-stable →
+#                       unrelated-release probe → rollback drill (restore
+#                       previous pointer, or delete ref + 404 on first
+#                       publication) → re-activation (POST when the ref was
+#                       deleted by the first-publication drill, PATCH when it
+#                       still exists — ninth-round Finding 2)
+#   post-activation-failure NINTH-ROUND CORRECTION (review Finding 3): the
+#                       FULL pointer architecture up to and INCLUDING a
+#                       verified activation, then a DELIBERATE, CONTROLLED
+#                       failure injection (an explicit exit — never a
+#                       network error, a credential problem, or a destructive
+#                       action). The failure-triggered rollback path — the
+#                       SAME `if: failure()` gating production uses — then
+#                       runs: compare-before-rollback against the live ref,
+#                       restore the previous pointer (or delete the
+#                       first-publication ref), read-back + full identity
+#                       chain verification. The run summary reports the
+#                       phases distinctly (publication → injected failure →
+#                       rollback → restored-state verification); the job
+#                       conclusion for this scenario is EXPECTED to be
+#                       failure and is NEVER a successful publication.
+#   partial-upload      upload only the snapshot asset; same-release
+#                       verification must fail; the dedicated stable
+#                       reference must be UNCHANGED; the previously active
+#                       artifact must remain retrievable
+#   promotion-failure   building/activating a pointer for a MISSING
+#                       release must fail; the stable reference is
+#                       unchanged
+#   incomplete-artifact an incomplete bundle must be refused by the
+#                       independent verifier and never promoted (no
+#                       release created)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "rehearsal scenario: happy | partial-upload | promotion-failure | incomplete-artifact | post-activation-failure"
+        required: false
+        default: "happy"
+
+permissions:
+  contents: write # releases + git-data mutations in the REHEARSAL repository only (hard guard below)
+
+concurrency:
+  group: rehearsal-publication
+  cancel-in-progress: false
+
+jobs:
+  rehearse:
+    name: rehearsal (${{ inputs.scenario || 'happy' }})
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }} # repo-scoped to THIS repository — valid ONLY because of the hard guard below
+      SCENARIO: ${{ inputs.scenario || 'happy' }}
+      CHECKOUT_SHA: ${{ github.sha }}
+      STABLE_REF: refs/tags/console-snapshot-prod
+    steps:
+      - name: HARD GUARD — this rehearsal may run ONLY in the designated non-production repository
+        # The FIRST step, BEFORE checkout and before ANY write operation:
+        # no release, tag, or reference can be created anywhere else.
+        run: |
+          if [ "$REPO" != "GraveYield/grave-indexer-pub-rehearsal" ]; then
+            echo "REFUSING TO RUN: rehearsal-publication is hard-guarded to GraveYield/grave-indexer-pub-rehearsal."
+            echo "This run is in: $REPO — aborting before any release operation."
+            exit 1
+          fi
+          echo "rehearsal target confirmed: $REPO (non-production)"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # actions/setup-node v7
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@f53f5227a9e83886ab598c617f3c170fab62f0d3 # pnpm/action-setup v6
+        with:
+          version: 9
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build:sdk
+      - name: Record the run identity (for the rehearsal report)
+        run: |
+          {
+            echo "## Publication rehearsal record (dedicated stable-reference architecture)"
+            echo "- repository: \`$REPO\`"
+            echo "- workflow run: [\`${GITHUB_RUN_ID}\`](https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID) (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "- commit: \`$CHECKOUT_SHA\`"
+            echo "- scenario: \`$SCENARIO\`"
+            echo "- architecture under test: \`--latest=false\` versioned release → annotated pointer tag object → \`refs/tags/console-snapshot-prod\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Shared: snapshot the CURRENT stable pointer (rollback reference) ─
+      # Used by every scenario that can mutate the dedicated reference. The
+      # hardened `stable-pointer-current` gate exits non-zero on ANY
+      # discovery failure; only a genuine HTTP 404 means "first publication".
+      - name: Record the current stable pointer (rollback reference for this drill)
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'promotion-failure' || env.SCENARIO == 'post-activation-failure'
+        id: rollback
+        run: |
+          node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp.out
+          kind=$(sed -n 's/^kind=//p' /tmp/sp.out)
+          tag=$(sed -n 's/^tag=//p' /tmp/sp.out)
+          sha=$(sed -n 's/^sha=//p' /tmp/sp.out)
+          pointer_json=$(sed -n 's/^pointer_json=//p' /tmp/sp.out)
+          if [ "$kind" = "found" ]; then PRIOR="$tag"; else PRIOR=""; fi
+          if [ -n "$pointer_json" ]; then
+            PRIOR_COMMIT=$(printf '%s' "$pointer_json" | jq -r '.sourceCommit // ""')
+          else
+            PRIOR_COMMIT=""
+          fi
+          echo "prior_kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "prior_tag=$PRIOR" >> "$GITHUB_OUTPUT"
+          echo "prior_pointer_json=$pointer_json" >> "$GITHUB_OUTPUT"
+          echo "prior_source_commit=$PRIOR_COMMIT" >> "$GITHUB_OUTPUT"
+          {
+            echo "- rollback reference at drill start: \`${PRIOR:-<none — first publication>}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: incomplete artifact is never promoted ──────────────
+      - name: Build an INCOMPLETE fixture bundle (zero enriched pools)
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: node --import tsx/esm test/fixturePublicationBundle.ts --out data-incomplete --incomplete
+      - name: verify-snapshot must REFUSE the incomplete bundle
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: |
+          if node --import tsx/esm src/cli.ts verify-snapshot \
+              data-incomplete/console-snapshot.json data-incomplete/console-snapshot-provenance.json; then
+            echo "SAFETY FAILURE: verify-snapshot ACCEPTED an incomplete artifact"; exit 1
+          fi
+          echo "verified: verify-snapshot refuses the incomplete artifact (non-zero exit)"
+      - name: Incomplete artifact must never be promoted (no release may exist for it)
+        if: env.SCENARIO == 'incomplete-artifact'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data-incomplete/console-snapshot-provenance.json','utf8')).versionedTag)")
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "SAFETY FAILURE: a release exists for the incomplete artifact's tag $TAG"; exit 1
+          fi
+          echo "verified: no release exists for the incomplete artifact's tag ($TAG) — nothing was published"
+      - name: Rehearsal result (incomplete-artifact)
+        if: env.SCENARIO == 'incomplete-artifact' && always()
+        run: |
+          echo "- outcome: incomplete artifact refused + not promoted" >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: promotion failure leaves the dedicated pointer untouched ─
+      - name: Activating a pointer for a MISSING release must fail; stable reference unchanged
+        if: env.SCENARIO == 'promotion-failure'
+        run: |
+          MISSING="console-snapshot-prod-20990101T000000Z-notrack"
+          # No pointer can be BUILT for a release that does not exist — the
+          # build verifies the release's own asset triple first (fail-closed).
+          if node --import tsx/esm src/cli.ts stable-pointer-build "$REPO" --tag "$MISSING" --expected-tag "$MISSING" > /tmp/missing.out 2>&1; then
+            echo "SAFETY FAILURE: building a pointer for a missing release unexpectedly succeeded"; exit 1
+          fi
+          echo "verified: pointer build for missing release $MISSING fails (non-zero)"
+          # And no release record exists for it either.
+          if gh release view "$MISSING" --repo "$REPO" >/dev/null 2>&1; then
+            echo "SAFETY FAILURE: a release exists for the missing tag $MISSING"; exit 1
+          fi
+          # The dedicated stable reference is UNCHANGED by the failed attempt.
+          node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp-after.out
+          kind_after=$(sed -n 's/^kind=//p' /tmp/sp-after.out)
+          tag_after=$(sed -n 's/^tag=//p' /tmp/sp-after.out)
+          if [ "${{ steps.rollback.outputs.prior_kind }}" != "$kind_after" ] || [ "${{ steps.rollback.outputs.prior_tag }}" != "$tag_after" ]; then
+            echo "SAFETY FAILURE: the stable reference moved during a FAILED activation attempt (was '${{ steps.rollback.outputs.prior_tag }}', now '${tag_after}')"; exit 1
+          fi
+          {
+            echo "- outcome: pointer build for a missing release failed closed; the dedicated stable reference is unchanged (\`${tag_after:-<none — first publication>}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "promotion-failure rehearsal OK (stable reference: ${tag_after:-<none — first publication>})"
+
+      # ── Scenario: partial upload (versioned release missing sidecars) ─
+      - name: Build a COMPLETE fixture bundle
+        if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: node --import tsx/esm test/fixturePublicationBundle.ts --out data
+      - name: Create the versioned release as a DRAFT and upload ONLY the snapshot asset (partial upload)
+        # TWELFTH ROUND: the rehearsal mirrors the §8.3 draft-first
+        # sequence. A partial upload is created as a DRAFT — under
+        # GitHub-enforced immutable releases an incomplete asset set
+        # must NEVER reach the immutable published state. The draft belt
+        # below proves the incomplete draft is refused BEFORE publish.
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
+          # FIFTEENTH ROUND (live rehearsal finding): the env var must be
+          # UPPERCASE TAG — later steps reference $TAG, and GITHUB_ENV is
+          # case-sensitive (a lowercase "tag=" write left every
+          # cross-step $TAG reference empty, failing the verification
+          # gate with a usage error on the first live dispatch).
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
+            --title "Rehearsal partial upload — $TAG" --notes "Rehearsal: partial upload scenario (non-production)."
+          PARTIAL_ID=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            PARTIAL_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$PARTIAL_ID" in [1-9]*) break ;; esac
+            echo "the partial draft is not yet visible in the release list (attempt $attempt/10); retrying"; sleep 2
+          done
+          case "$PARTIAL_ID" in [1-9]*) ;; *) echo "the partial draft release could not be resolved"; exit 1 ;; esac
+          echo "DRAFT_RELEASE_ID=$PARTIAL_ID" >> "$GITHUB_ENV"
+          gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$PARTIAL_ID/assets?name=console-snapshot.json" \
+            -H "Content-Type: application/octet-stream" --input data/console-snapshot.json > /dev/null
+          echo "partial DRAFT created: $TAG (release id $PARTIAL_ID, snapshot asset only — never published)"
+      - name: The partial DRAFT must FAIL verification and must NEVER be published
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          # The draft belt (the production release job's verify step): the
+          # presence check fails — only 1 of the 3 required assets exists.
+          names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
+          # FIFTEENTH ROUND (live rehearsal finding): jq's `sort` orders by
+          # codepoint ("-" 0x2D < "." 0x2E), so the expected list is sorted
+          # with LC_ALL=C to match — the unsorted printf order could never
+          # equal the sorted asset list.
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256' | LC_ALL=C sort)
+          if [ "$names" = "$expected_names" ]; then
+            echo "SAFETY FAILURE: the partial draft unexpectedly carries all three assets"; exit 1
+          fi
+          echo "verified: the draft belt rejects the partial upload (presence check failed on the DRAFT — before any publish)"
+          # Same-release verification ALSO fails on the un-published draft:
+          # the by-tag release endpoint serves published releases only, so
+          # an un-published draft is invisible to the verification path
+          # (fail closed in both layers).
+          if node --import tsx/esm src/cli.ts verify-release-assets \
+              "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"; then
+            echo "SAFETY FAILURE: verification PASSED on a partial release (missing sidecars)"; exit 1
+          fi
+          echo "verified: same-release verification rejects the partial release (un-published draft: missing provenance/checksum → non-zero)"
+          # And the release must STILL be a draft — never published.
+          still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+          if [ "$still_draft" != "true" ]; then
+            echo "SAFETY FAILURE: the incomplete release was PUBLISHED (draft='$still_draft') — immutable residue created"; exit 1
+          fi
+          echo "verified: the incomplete release remains an un-published DRAFT — no immutable residue exists"
+      - name: The dedicated stable reference must be UNCHANGED after the failed publication
+        if: env.SCENARIO == 'partial-upload'
+        run: |
+          node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp-after.out
+          kind_after=$(sed -n 's/^kind=//p' /tmp/sp-after.out)
+          tag_after=$(sed -n 's/^tag=//p' /tmp/sp-after.out)
+          if [ "${{ steps.rollback.outputs.prior_kind }}" != "$kind_after" ] || [ "${{ steps.rollback.outputs.prior_tag }}" != "$tag_after" ]; then
+            echo "SAFETY FAILURE: the stable reference moved after a FAILED publication (was '${{ steps.rollback.outputs.prior_tag }}', now '${tag_after}')"; exit 1
+          fi
+          echo "verified: the dedicated stable reference is unchanged after the partial-upload failure (${tag_after:-<none — first publication>})"
+      - name: The previously active artifact must remain retrievable after the failed publication
+        if: env.SCENARIO == 'partial-upload' && steps.rollback.outputs.prior_tag != ''
+        run: |
+          PRIOR="${{ steps.rollback.outputs.prior_tag }}"
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$PRIOR" --scope versioned --expected-tag "$PRIOR"
+          echo "verified: the previously active release ($PRIOR) is fully retrievable and internally consistent"
+      - name: Cleanup the partial rehearsal DRAFT (never published — no tag to clean)
+        if: env.SCENARIO == 'partial-upload' && always()
+        run: |
+          # The partial release is an un-published DRAFT addressed by ID
+          # (the by-tag endpoint serves published releases only). Deleting
+          # the draft removes its assets; no versioned tag was ever
+          # materialized, so there is nothing to clean up there.
+          if [ -n "${DRAFT_RELEASE_ID:-}" ]; then
+            gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID" && echo "cleanup: partial rehearsal DRAFT $DRAFT_RELEASE_ID deleted"
+          else
+            TAG=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)}catch{console.log('')}")
+            if [ -n "$TAG" ] && gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+              echo "cleanup: partial rehearsal release $TAG deleted"
+            fi
+          fi
+          {
+            echo "- outcome: partial upload rejected on the DRAFT (never published); the dedicated stable reference is unchanged; the previous artifact remains retrievable"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Scenario: happy path — the FULL pointer architecture + rollback drill ─
+      - name: Publish the immutable versioned release (DRAFT-FIRST sequence, created explicitly NOT latest)
+        # TWELFTH ROUND: the rehearsal rehearses the DRAFT-FIRST sequence —
+        # create as a DRAFT, upload all three assets BY RELEASE ID, verify
+        # the draft assets (presence + download-back digest belt + provenance
+        # tag), then publish with draft=false + make_latest=false. Drafts are
+        # addressed by ID because the by-tag endpoint serves published
+        # releases only.
+        # SUPERSEDED-HISTORY NOTE (status reconciliation, sixteenth round):
+        # the "production patch prepared separately" wording below is
+        # outdated — the production publisher on PR #5's branch has
+        # IMPLEMENTED this sequence since the thirteenth round, and the
+        # five rehearsal scenarios (including this one) were EXECUTED live
+        # in this repository on 2026-11-23 (docs/PUBLICATION_REHEARSAL.md
+        # §5, docs/SNAPSHOT_PUBLICATION.md §19).
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
+          # FIFTEENTH ROUND (live rehearsal finding): uppercase TAG — later
+          # steps reference $TAG; GITHUB_ENV is case-sensitive.
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
+            --title "Rehearsal ConsoleSnapshot v2 — $TAG" \
+            --notes "Rehearsal publication (non-production): immutable versioned release, draft-first sequence, created with --latest=false."
+          # FIFTEENTH ROUND (live rehearsal finding): the releases LIST
+          # endpoint may briefly not include a just-created draft — an
+          # eventual-consistency window OBSERVED LIVE (resolution queried
+          # ~300ms after `gh release create` returned and failed). The
+          # resolution is retried with a bounded backoff BEFORE failing
+          # closed (10 attempts x 2s ceiling; the fail-closed gate below
+          # is unchanged).
+          DRAFT_RELEASE_ID=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$DRAFT_RELEASE_ID" in [1-9]*) break ;; esac
+            echo "the draft is not yet visible in the release list (attempt $attempt/10); retrying"; sleep 2
+          done
+          case "$DRAFT_RELEASE_ID" in [1-9]*) ;; *) echo "the rehearsal draft could not be resolved"; exit 1 ;; esac
+          echo "DRAFT_RELEASE_ID=$DRAFT_RELEASE_ID" >> "$GITHUB_ENV"
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID/assets?name=$asset" \
+              -H "Content-Type: application/octet-stream" --input "data/$asset" > /dev/null
+          done
+          names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
+          # Expected list sorted with LC_ALL=C to match jq's codepoint sort
+          # (fifteenth-round live rehearsal finding: the unsorted printf
+          # order could never equal the sorted asset list).
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256' | LC_ALL=C sort)
+          if [ "$names" != "$expected_names" ]; then
+            echo "SAFETY FAILURE: the rehearsal draft does not carry exactly the three required assets"; echo "$names"; exit 1
+          fi
+          rm -rf dl && mkdir dl
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            asset_id=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" | jq -r --arg a "$asset" '[.[] | select(.name == $a)][0].id // 0')
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$asset_id" > "dl/$asset"
+          done
+          ( cd dl && sha256sum -c console-snapshot.sha256 )
+          jq -e --arg tag "$TAG" '.versionedTag == $tag' dl/console-snapshot-provenance.json > /dev/null \
+            || { echo "the staged provenance does not name the release tag $TAG"; exit 1; }
+          gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" -F draft=false -f make_latest=false > /dev/null
+          # Publish read-back with the SAME bounded retry (the by-ID read
+          # may also lag the PATCH — same consistency window class).
+          still_draft=""
+          published_tag=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+            published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+            if [ "$still_draft" = "false" ] && [ "$published_tag" = "$TAG" ]; then break; fi
+            echo "the published state read-back is not yet consistent (attempt $attempt/10); retrying"; sleep 2
+          done
+          if [ "$still_draft" != "false" ] || [ "$published_tag" != "$TAG" ]; then
+            echo "publish verification FAILED: draft='$still_draft' tag='$published_tag'"; exit 1
+          fi
+          echo "versioned release published (draft-first, --latest=false): $TAG"
+      - name: Verify the versioned release's own assets (lengths + SHA-256 digests, same-release cross-check)
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          node --import tsx/esm src/cli.ts verify-release-assets \
+            "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"
+          echo "verified: the uploaded assets form ONE complete artifact set naming $TAG (checksum + provenance digest + tag cross-check)"
+      - name: The versioned release must NOT be the stable reference before activation
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp-pre.out
+          pre_tag=$(sed -n 's/^tag=//p' /tmp/sp-pre.out)
+          pre_kind=$(sed -n 's/^kind=//p' /tmp/sp-pre.out)
+          if [ "$pre_kind" = "found" ] && [ "$pre_tag" = "$TAG" ]; then
+            echo "SAFETY FAILURE: the stable reference already names $TAG BEFORE activation"; exit 1
+          fi
+          if [ "${{ steps.rollback.outputs.prior_kind }}" != "$pre_kind" ] || [ "${{ steps.rollback.outputs.prior_tag }}" != "$pre_tag" ]; then
+            echo "SAFETY FAILURE: the stable reference drifted before activation (was '${{ steps.rollback.outputs.prior_tag }}', now '${pre_tag}')"; exit 1
+          fi
+          echo "verified: creating + uploading with --latest=false did NOT move the dedicated stable reference (${pre_tag:-<none — first publication>})"
+      - name: Build the stable-pointer JSON from the VERIFIED release
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          node --import tsx/esm src/cli.ts stable-pointer-build \
+            "$REPO" --tag "$TAG" --expected-tag "$TAG" > /tmp/pointer.out
+          pointer_json=$(sed -n 's/^pointer_json=//p' /tmp/pointer.out)
+          if [ -z "$pointer_json" ]; then echo "stable-pointer-build produced no pointer JSON"; exit 1; fi
+          # Strict shape validation of the pointer BEFORE any privileged command consumes it
+          # (same key set + discriminator the production promote job enforces with jq).
+          jq -e '
+            (keys | sort) == (["checksum","pointerSchema","previousTagObjectSha","previousVersionedTag","provenance","publishedAtUnixMs","snapshot","sourceCommit","stableRef","versionedTag"] | sort)
+            and .pointerSchema == "graveyield.console-snapshot-stable-pointer.v1"
+            and .stableRef == "console-snapshot-prod"
+            and .versionedTag == $tag
+            and (.publishedAtUnixMs | type == "number" and . > 0)
+            and .snapshot.name == "console-snapshot.json"
+            and .provenance.name == "console-snapshot-provenance.json"
+            and .checksum.name == "console-snapshot.sha256"
+            and ([.snapshot.sha256, .provenance.sha256, .checksum.sha256] | all(test("^[0-9a-f]{64}$")))
+            and ([.snapshot.byteLength, .provenance.byteLength, .checksum.byteLength] | all(type == "number" and . > 0))
+            and ((.previousVersionedTag == null) == (.previousTagObjectSha == null))
+          ' --arg tag "$TAG" >/dev/null <<<"$pointer_json" \
+            || { echo "the built pointer JSON fails the strict pointer validation"; exit 1; }
+          echo "POINTER_JSON=$pointer_json" >> "$GITHUB_ENV"
+          echo "stable pointer built for $TAG (previous: ${{ steps.rollback.outputs.prior_tag }})"
+      - name: Activate the dedicated stable reference (create the annotated pointer tag object + create-or-update the ref)
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          new_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+            -f tag="console-snapshot-prod" \
+            -f object="$CHECKOUT_SHA" \
+            -f type="commit" \
+            -f message="$POINTER_JSON" \
+            --jq '.sha')
+          case "$new_sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "tag-object creation returned no usable sha: $new_sha"; exit 1 ;;
+          esac
+          echo "NEW_TAG_OBJECT_SHA=$new_sha" >> "$GITHUB_ENV"
+          # Three-way ref gate (identical to production): 404 = first
+          # publication (CREATE the ref), 200 = exists (PATCH the ref),
+          # anything else = gate failure (abort).
+          code=$(curl -sS -o /tmp/stableref-pre.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+          case "$code" in
+            404)
+              echo "first publication: CREATE the dedicated reference"
+              gh api --method POST "repos/$REPO/git/refs" \
+                -f ref="$STABLE_REF" \
+                -f sha="$new_sha"
+              ;;
+            200)
+              echo "subsequent publication: MOVE the dedicated reference with ONE atomic PATCH"
+              gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
+                -f sha="$new_sha" \
+                -F force=true
+              ;;
+            *) echo "stable-ref gate FAILED (unexpected HTTP $code); refusing to activate"; exit 1 ;;
+          esac
+          echo "activation issued: $STABLE_REF -> $new_sha (pointer for $TAG)"
+      - name: Read back the reference and the tag object (the ref MUST name the created pointer)
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$NEW_TAG_OBJECT_SHA" ]; then
+            echo "READ-BACK MISMATCH: the stable ref resolves to '$sha', expected the created object '$NEW_TAG_OBJECT_SHA'"; exit 1
+          fi
+          message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/tags/$NEW_TAG_OBJECT_SHA" | jq -r '.message // ""')
+          if [ "$message" != "$POINTER_JSON" ]; then
+            echo "READ-BACK MISMATCH: the activated tag object's message does not equal the validated pointer JSON"; exit 1
+          fi
+          echo "read-back verified: $STABLE_REF -> $NEW_TAG_OBJECT_SHA (pointer for $TAG)"
+      - name: Verify the stable reference serves the activated artifact (full production identity chain)
+        if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
+        run: |
+          node --import tsx/esm src/cli.ts verify-stable \
+            "$REPO" --expected-tag "$TAG"
+          echo "verified: refs/tags/console-snapshot-prod → annotated tag object → pointer JSON → release record for $TAG → complete verified asset set"
+          if [ "$SCENARIO" = "post-activation-failure" ]; then
+            {
+              echo "## Phase 1 — publication and verification BEFORE injection: PASS"
+              echo "- the versioned release, asset verification, pointer build, activation and the full identity chain all succeeded"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # ── Scenario: post-activation failure injection (ninth round, Finding 3) ─
+      # The happy path proves the rollback API OPERATIONS work; this scenario
+      # proves the FAILURE-TRIGGERED rollback path works: a deliberate,
+      # controlled failure AFTER the stable reference has verifiably moved
+      # (an explicit `exit 1` — never an accidental network error, an
+      # invalid credential, or a destructive action against unrelated
+      # resources) exercises the SAME `if: failure()` gating production
+      # uses, INCLUDING the compare-before-rollback guard. The job
+      # conclusion for this scenario is EXPECTED to be failure and the
+      # summary below must never read as a successful publication.
+      - name: INJECT a controlled post-activation failure (deliberate — the ref has verifiably moved)
+        if: env.SCENARIO == 'post-activation-failure'
+        id: inject_failure
+        run: |
+          # Pre-injection proof: the dedicated reference is confirmed to
+          # point at THIS run's activated tag object (read-back above), so
+          # the injection happens strictly AFTER the ref has moved.
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$NEW_TAG_OBJECT_SHA" ]; then
+            echo "INJECTION PRECONDITION FAILED: the ref does not point at this run's tag object ('$sha' vs '$NEW_TAG_OBJECT_SHA') — refusing to inject outside the required state"; exit 1
+          fi
+          {
+            echo "## Phase 2 — INJECTED post-activation failure (deliberate, controlled)"
+            echo "- injected AFTER \`refs/tags/console-snapshot-prod\` verifiably pointed at this run's tag object \`$NEW_TAG_OBJECT_SHA\`"
+            echo "- mechanism: an explicit \`exit 1\` below — no network error, no credential problem, no destructive action"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::INJECTED POST-ACTIVATION FAILURE (controlled, deliberate — scenario post-activation-failure; the failure-triggered rollback path must now run)"
+          echo "INJECTED POST-ACTIVATION FAILURE: activation had completed and was verified; this explicit exit triggers the failure-triggered rollback path"
+          exit 1
+      - name: Failure-triggered rollback (compare-before-rollback → restore → verify — the SAME failure() gating production uses)
+        # NINTH-ROUND CORRECTION (review Finding 3): this step is gated on
+        # `if: failure()` exactly like the production rollback steps — it
+        # runs because the injected step FAILED, not because it was
+        # manually invoked. It applies the same compare-before-rollback
+        # protection required in production Finding 1 — including the
+        # TENTH-ROUND ownership-identity rule: the rollback mutation is
+        # permitted ONLY when the live ref's object.sha EXACTLY equals
+        # this run's captured NEW_TAG_OBJECT_SHA. Pointer-message equality
+        # (even byte-for-byte) is NOT an ownership test — a different
+        # writer can mint a DISTINCT annotated tag object carrying an
+        # identical pointer JSON — and if NEW_TAG_OBJECT_SHA is absent,
+        # empty, or malformed, identity cannot be established and the
+        # step FAILS CLOSED without mutation. The LIVE remote ref
+        # is classified BEFORE any mutation (CASE A original state intact →
+        # no mutation; CASE B this run's pointer is live → restore; CASE C
+        # moved independently → refuse + OPERATOR INTERVENTION; CASE D
+        # unreadable → fail closed). It then restores the previous pointer
+        # (or deletes the first-publication ref), reads the reference back,
+        # and verifies the complete restored pointer and asset chain
+        # (verify-stable, or a genuine HTTP 404 for the first-publication
+        # case). The rollback re-uses the prior pointer state recorded at
+        # drill start (steps.rollback) — or, explicitly, the absent
+        # first-publication state.
+        if: failure() && env.SCENARIO == 'post-activation-failure' && steps.inject_failure.outcome == 'failure'
+        id: failure_rollback
+        env:
+          PRIOR_KIND: ${{ steps.rollback.outputs.prior_kind }}
+          PRIOR_TAG: ${{ steps.rollback.outputs.prior_tag }}
+          PRIOR_POINTER_JSON: ${{ steps.rollback.outputs.prior_pointer_json }}
+          PRIOR_COMMIT: ${{ steps.rollback.outputs.prior_source_commit }}
+          NEW_TAG_OBJECT_SHA: ${{ env.NEW_TAG_OBJECT_SHA }}
+          POINTER_JSON: ${{ env.POINTER_JSON }}
+        run: |
+          # ── Compare-before-rollback: classify the LIVE remote state ──
+          # OWNERSHIP IDENTITY RULE (tenth round): the rollback mutation is
+          # permitted ONLY when the live ref's object.sha EXACTLY equals
+          # this run's captured NEW_TAG_OBJECT_SHA. Pointer-message
+          # equality is NOT an ownership test — a different writer can
+          # mint a DISTINCT annotated tag object whose message is
+          # byte-for-byte identical to this run's POINTER_JSON and move
+          # the ref to it. If NEW_TAG_OBJECT_SHA is absent, empty or
+          # malformed, identity cannot be established: fail closed, no
+          # mutation.
+          code=$(curl -sS -o /tmp/fr-ref.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod") || code="transport-error"
+          case "$code" in
+            200)
+              sha=$(jq -r '.object.sha // ""' /tmp/fr-ref.json)
+              case "$sha" in
+                [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                *) echo "COMPARE-BEFORE-ROLLBACK FAILED (CASE D): the stable-ref read returned an unusable object.sha ('$sha') — the remote state cannot be established; fail closed, no mutation"
+                   exit 1 ;;
+              esac
+              # DIAGNOSTIC ONLY: the live object's message is shown in the
+              # summary to help operator recovery. It is NEVER an ownership
+              # test: pointer-message equality proves payload equality, not
+              # tag-object identity, and never authorizes mutation.
+              message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/git/tags/$sha" | jq -r '.message // ""') || message=""
+              observed_tag=$(jq -r '.versionedTag // ""' <<<"$message" 2>/dev/null || true)
+              # OWNERSHIP IDENTITY GATE: if this run's captured
+              # NEW_TAG_OBJECT_SHA is unusable, the identity of the live
+              # reference CANNOT be established — fail closed.
+              if ! printf '%s' "$NEW_TAG_OBJECT_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                  echo "This run's captured tag-object sha (NEW_TAG_OBJECT_SHA) is unusable (\`${NEW_TAG_OBJECT_SHA:-<empty>}\`) — identity cannot be established; fail closed, no mutation."
+                  echo "Observed live ref sha: \`$sha\`. Message or payload equality NEVER proves tag-object identity."
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED: this run's captured tag-object sha is unusable — identity cannot be established; fail closed, no mutation"
+                exit 1
+              fi
+              if [ "$sha" = "$NEW_TAG_OBJECT_SHA" ]; then
+                echo "compare-before-rollback OK: the stable ref still points EXACTLY at this run's activated tag object (strict sha identity) — the failure-triggered rollback may proceed"
+              else
+                {
+                  echo
+                  echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                  echo "The stable ref points at \`$sha\` (tag '${observed_tag:-<not a pointer tag>}'), not at this run's activated tag object — it moved independently."
+                  echo "Even if that object's message equals this run's pointer JSON byte-for-byte, message equality is NOT identity: the rollback will NOT overwrite a pointer that moved independently (documented single-writer assumption)."
+                  echo "This run's pointer JSON (for operator comparison):"
+                  echo '```json'
+                  echo "$POINTER_JSON"
+                  echo '```'
+                } >> "$GITHUB_STEP_SUMMARY"
+                echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref moved independently; refusing to overwrite it"
+                exit 1
+              fi
+              ;;
+            404)
+              # This step can only be reached AFTER the injected-failure
+              # precondition verified that the ref pointed at THIS run's
+              # activated tag object — a 404 here means the reference was
+              # DELETED independently. Absence is an unexpected,
+              # independently created state: refuse (no mutation), never
+              # interpret it as the original pre-activation state.
+              {
+                echo
+                echo "## OPERATOR INTERVENTION REQUIRED — failure-triggered rollback REFUSED"
+                echo "The stable ref is ABSENT, but this run's activation was verified before the injection (the ref pointed at \`${NEW_TAG_OBJECT_SHA:-<unusable>}\`)."
+                echo "The reference was deleted independently — the rollback will NOT interpret absence as the original state."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "COMPARE-BEFORE-ROLLBACK FAILED: the ref is absent after a verified activation — the reference moved independently; refusing a blind recreation"
+              exit 1
+              ;;
+            *)
+              echo "COMPARE-BEFORE-ROLLBACK FAILED (HTTP '$code'): the remote state cannot be established — fail closed, no mutation"
+              exit 1
+              ;;
+          esac
+          # ── Restore: previous pointer, or the absent first-publication state ──
+          rollback_ok=false
+          if [ "$PRIOR_KIND" = "found" ]; then
+            if [ -z "$PRIOR_COMMIT" ]; then
+              echo "the recorded prior pointer carries no sourceCommit — refusing a blind rollback"; exit 1
+            fi
+            echo "failure-triggered rollback: restoring the previous pointer ($PRIOR_TAG)"
+            old_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+              -f tag="console-snapshot-prod" \
+              -f object="$PRIOR_COMMIT" \
+              -f type="commit" \
+              -f message="$PRIOR_POINTER_JSON" \
+              --jq '.sha')
+            gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true
+            {
+              echo "## Phase 3 — failure-triggered rollback EXECUTED (compare-before-rollback applied)"
+              echo "- the previous pointer was restored: \`refs/tags/console-snapshot-prod\` → \`$old_sha\` ($PRIOR_TAG)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "failure-triggered rollback: FIRST PUBLICATION — deleting the ref restores the absent pre-publication state"
+            gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod"
+            {
+              echo "## Phase 3 — failure-triggered rollback EXECUTED (compare-before-rollback applied)"
+              echo "- the first-publication reference was deleted, restoring the absent pre-publication state"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # ── Final restored-state verification ──
+          if [ "$PRIOR_KIND" = "found" ]; then
+            node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$PRIOR_TAG"
+            rollback_ok=true
+            {
+              echo "## Phase 4 — restored-state verification: PASS"
+              echo "- \`verify-stable --expected-tag $PRIOR_TAG\` proved the FULL identity chain over the restored pointer (ref → annotated tag object → pointer → release record → verified asset set)"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            code_after=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+            if [ "$code_after" != "404" ]; then
+              echo "SAFETY FAILURE: the ref read returned HTTP $code_after after the first-publication rollback (expected 404)"; exit 1
+            fi
+            rollback_ok=true
+            {
+              echo "## Phase 4 — restored-state verification: PASS"
+              echo "- the ref read-back returned a genuine HTTP 404 — the absent pre-publication state is restored"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$rollback_ok" != "true" ]; then
+            echo "ROLLBACK UNVERIFIED"; exit 1
+          fi
+          echo "failure-triggered rollback VERIFIED: the restored pointer and asset chain were proven from the remote"
+      - name: Rehearsal result (post-activation-failure)
+        # The job conclusion for this scenario is EXPECTED to be failure —
+        # the injected failure is deliberately NOT reported as an ordinary
+        # successful publication. This summary runs always() so the four
+        # phases are reported distinctly even if the rollback itself failed.
+        if: always() && env.SCENARIO == 'post-activation-failure'
+        run: |
+          {
+            echo "## Rehearsal scenario \`post-activation-failure\` — run conclusion: EXPECTED FAILURE (injected)"
+            echo "- this run is NOT a successful publication; the failure was injected deliberately after a verified activation"
+            echo "- phase report:"
+            echo "  1. publication + verification before injection: see 'Phase 1' above (must be PASS)"
+            echo "  2. injected post-activation failure: see 'Phase 2' above (deliberate \`exit 1\` after the ref verifiably moved)"
+            echo "  3. failure-triggered rollback (compare-before-rollback → restore): see 'Phase 3' above"
+            echo "  4. restored-state verification: see 'Phase 4' above (verify-stable identity chain, or a genuine 404 for first publication)"
+            echo "- job outcome: ${{ job.status }} (failure is the EXPECTED conclusion for this scenario)"
+            echo "- no production resource was touched: every operation ran against \`$REPO\` only"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: An UNRELATED release must NOT move the dedicated stable reference
+        if: env.SCENARIO == 'happy'
+        run: |
+          PROBE_TAG="rehearsal-unrelated-probe-$(date -u +%Y%m%dT%H%M%SZ)"
+          gh release create "$PROBE_TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest \
+            --title "Rehearsal unrelated release probe" \
+            --notes "Rehearsal: proves an unrelated release (even one taking the repo-wide latest designation) cannot move the dedicated stable reference."
+          node --import tsx/esm src/cli.ts stable-pointer-current "$REPO" > /tmp/sp-probe.out
+          probe_ptr_tag=$(sed -n 's/^tag=//p' /tmp/sp-probe.out)
+          if [ "$probe_ptr_tag" != "$TAG" ]; then
+            echo "SAFETY FAILURE: the dedicated stable reference moved to '$probe_ptr_tag' after an unrelated release took the latest designation"; exit 1
+          fi
+          node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$TAG"
+          gh release delete "$PROBE_TAG" --repo "$REPO" --yes --cleanup-tag
+          {
+            echo "- outcome: an unrelated release (which TOOK the repo-wide latest designation) did NOT move \`refs/tags/console-snapshot-prod\`; probe release cleaned up"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "verified: the dedicated stable reference still names $TAG after an unrelated release took the repo-wide latest designation"
+      - name: Rollback drill — restore the previous pointer (or delete the first-publication ref)
+        if: env.SCENARIO == 'happy'
+        # The recorded prior pointer JSON crosses into the step through the
+        # RUNNER-provided env (never textual shell interpolation — the JSON
+        # contains double quotes and would corrupt an inline assignment).
+        env:
+          PRIOR_KIND: ${{ steps.rollback.outputs.prior_kind }}
+          PRIOR_TAG: ${{ steps.rollback.outputs.prior_tag }}
+          PRIOR_POINTER_JSON: ${{ steps.rollback.outputs.prior_pointer_json }}
+          PRIOR_COMMIT: ${{ steps.rollback.outputs.prior_source_commit }}
+        run: |
+          if [ "$PRIOR_KIND" = "found" ]; then
+            if [ -z "$PRIOR_COMMIT" ]; then
+              echo "the recorded prior pointer carries no sourceCommit — refusing a blind rollback"; exit 1
+            fi
+            echo "rollback drill: restoring the previous pointer ($PRIOR_TAG)"
+            old_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+              -f tag="console-snapshot-prod" \
+              -f object="$PRIOR_COMMIT" \
+              -f type="commit" \
+              -f message="$PRIOR_POINTER_JSON" \
+              --jq '.sha')
+            gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" -f sha="$old_sha" -F force=true
+            # The restored pointer must pass the FULL production identity chain
+            # for the PREVIOUS release — this release's own verified assets.
+            node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$PRIOR_TAG"
+            {
+              echo "- rollback drill: PASS — \`refs/tags/console-snapshot-prod\` restored to \`$PRIOR_TAG\` and verified through the full identity chain"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "verified: rollback to $PRIOR_TAG succeeded AND the dedicated reference serves the restored release's complete artifact set"
+          else
+            echo "rollback drill: FIRST PUBLICATION — deleting the dedicated reference restores the absent pre-publication state"
+            gh api --method DELETE "repos/$REPO/git/refs/tags/console-snapshot-prod"
+            # Absence is proven by the authenticated read returning 404 —
+            # never by the DELETE command's own exit status.
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+            if [ "$code" != "404" ]; then
+              echo "SAFETY FAILURE: the stable ref read returned HTTP $code after the first-publication rollback (expected 404)"; exit 1
+            fi
+            {
+              echo "- rollback drill: PASS (first publication) — \`refs/tags/console-snapshot-prod\` deleted and its absence verified by HTTP 404"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "verified: the first-publication rollback deleted the dedicated reference and the read-back returned 404"
+          fi
+      - name: Re-activate the rehearsal pointer (restore post-rollback state)
+        if: env.SCENARIO == 'happy'
+        # NINTH-ROUND CORRECTION (review Finding 2): reactivation is aware
+        # of the ACTUAL reference state. After a first-publication rollback
+        # drill the ref was DELETED — PATCH repos/<repo>/git/refs/tags/
+        # console-snapshot-prod requires an EXISTING ref and would fail.
+        # The three-way gate (identical to the activation step) decides:
+        # 404 = the ref is absent → CREATE it (POST repos/$REPO/git/refs);
+        # 200 = the ref exists → MOVE it (PATCH, force); anything else =
+        # gate failure (abort — never guess). The resulting reference is
+        # read back and verified against the expected annotated tag object
+        # in BOTH branches, and the full production identity chain
+        # (verify-stable) confirms the pointer end-to-end.
+        run: |
+          new_sha=$(gh api --method POST "repos/$REPO/git/tags" \
+            -f tag="console-snapshot-prod" \
+            -f object="$CHECKOUT_SHA" \
+            -f type="commit" \
+            -f message="$POINTER_JSON" \
+            --jq '.sha')
+          code=$(curl -sS -o /tmp/stableref-react.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod")
+          case "$code" in
+            404)
+              echo "reactivation from an ABSENT reference (first-publication restore): POST repos/$REPO/git/refs"
+              gh api --method POST "repos/$REPO/git/refs" \
+                -f ref="$STABLE_REF" \
+                -f sha="$new_sha"
+              ;;
+            200)
+              echo "reactivation onto an EXISTING reference: PATCH repos/$REPO/git/refs/tags/console-snapshot-prod"
+              gh api --method PATCH "repos/$REPO/git/refs/tags/console-snapshot-prod" \
+                -f sha="$new_sha" \
+                -F force=true
+              ;;
+            *) echo "reactivation gate FAILED (unexpected HTTP $code); refusing to reactivate"; exit 1 ;;
+          esac
+          # Read back and verify the reference points at the expected tag
+          # object in BOTH reactivation paths.
+          sha=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/ref/tags/console-snapshot-prod" | jq -r '.object.sha // ""')
+          if [ "$sha" != "$new_sha" ]; then
+            echo "REACTIVATION READ-BACK MISMATCH: the stable ref resolves to '$sha', expected '$new_sha'"; exit 1
+          fi
+          message=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/git/tags/$new_sha" | jq -r '.message // ""')
+          if [ "$message" != "$POINTER_JSON" ]; then
+            echo "REACTIVATION READ-BACK MISMATCH: the reactivated tag object's message does not equal the pointer JSON"; exit 1
+          fi
+          node --import tsx/esm src/cli.ts verify-stable "$REPO" --expected-tag "$TAG"
+          echo "verified: re-activation of $TAG confirmed through the full identity chain (POST path exercised when the ref was absent; PATCH path when it existed)"
+      - name: Rehearsal result (happy)
+        if: env.SCENARIO == 'happy'
+        run: |
+          {
+            echo "- versioned release created (\`--latest=false\`) + uploaded: \`$TAG\`"
+            echo "- same-release asset verification (digests + lengths): PASS"
+            echo "- pointer build + strict pointer validation: PASS"
+            echo "- annotated tag object + dedicated ref create-or-update: PASS"
+            echo "- read-back + full identity chain (\`verify-stable\`): PASS"
+            echo "- unrelated-release probe: PASS"
+            echo "- rehearsal OK (dedicated stable-reference architecture)"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -112,6 +112,14 @@ export interface DiscoveryRunStats {
   slotLowerBound: number;
   slotUpperBound: number;
   durationMs: number;
+  /** Number of raw accounts actually iterated by the parse loop. */
+  iteratedAccounts: number;
+  /** TRUE when the local `maxPools` cap stopped the parse loop while
+   *  raw accounts remained — the run did NOT cover the full (filtered)
+   *  account set and any artifact derived from it is INCOMPLETE. The
+   *  cap must never silently truncate a candidate universe that is then
+   *  presented as complete (GY-M1-INT-001 §7). */
+  truncated: boolean;
 }
 
 export interface DiscoveryRun {
@@ -127,6 +135,15 @@ export interface DiscoverOptions {
   /** "identity-slice" (default: mainnet-safe 160-byte dataSlice) or
    *  "full" (whole 752-byte payload; viable on devnet/small clusters). */
   mode?: "full" | "identity-slice";
+  /** Optional EXTRA RPC-level filters (e.g. the M1 WSOL quote-side
+   *  `memcmp` from `m1SourcingFilter.ts`) applied SERVER-SIDE by
+   *  getProgramAccounts BEFORE any local iteration — the only mechanism
+   *  that actually shrinks the response. Merged AFTER the mandatory
+   *  `dataSize` filter; callers that omit it preserve the exact previous
+   *  behavior (dataSize-only enumeration). This is a response-shaping
+   *  efficiency measure, never a trust boundary: the caller's own
+   *  sourcing predicate stays authoritative over the parsed records. */
+  rpcFilters?: unknown[];
   /** Injectable transport for tests (defaults to global fetch). */
   fetchImpl?: typeof fetch;
 }
@@ -202,8 +219,16 @@ export async function discoverRaydiumV4Pools(
 
   const slotLowerBound = Number(await connection.getSlot());
 
+  // The mandatory dataSize filter pins the canonical 752-byte AmmInfo
+  // corpus; optional caller filters (e.g. the M1 WSOL quote-side memcmp)
+  // are appended so they are evaluated by the RPC against the SAME
+  // corpus — server-side, before any local iteration. Filters are
+  // independent of the dataSlice: the comparison runs over the FULL
+  // account bytes, the slice only shapes the returned payload window.
+  const filters = [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...(opts.rpcFilters ?? [])];
+
   const rawAccounts = await fetchProgramAccountsRaw(connection.rpcEndpoint, RAYDIUM_V4_PROGRAM_ID, {
-    filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }],
+    filters,
     ...(mode === "identity-slice" ? { dataSlice: { offset: SLICE_OFFSET, length: SLICE_LENGTH } } : {}),
     ...(opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
   });
@@ -211,6 +236,7 @@ export async function discoverRaydiumV4Pools(
   const slotUpperBound = Number(await connection.getSlot());
 
   const records = new Map<string, DiscoveredPoolRecord>();
+  let iteratedAccounts = 0;
   const stats: DiscoveryRunStats = {
     rawAccounts: rawAccounts.length,
     parsedPools: 0,
@@ -220,9 +246,12 @@ export async function discoverRaydiumV4Pools(
     slotLowerBound,
     slotUpperBound,
     durationMs: 0,
+    iteratedAccounts: 0,
+    truncated: false,
   };
 
   for (const raw of rawAccounts) {
+    iteratedAccounts++;
     let poolAddress: PublicKey;
     try {
       poolAddress = new PublicKey(raw.pubkey);
@@ -294,6 +323,12 @@ export async function discoverRaydiumV4Pools(
     if (stats.parsedPools >= maxPools) break;
   }
 
+  stats.iteratedAccounts = iteratedAccounts;
+  // Completeness of the (filtered) account-set coverage: the loop must
+  // have iterated EVERY account the RPC returned. Reaching the local
+  // cap with accounts left over is recorded — never swallowed — so an
+  // incomplete run can be distinguished from a complete one downstream.
+  stats.truncated = iteratedAccounts < rawAccounts.length;
   stats.durationMs = Date.now() - startedAt;
 
   // Deterministic order — ascending base58 pool address.
