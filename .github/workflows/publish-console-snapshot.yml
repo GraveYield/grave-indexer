@@ -846,7 +846,14 @@ jobs:
         run: |
           # Presence: exactly the three required assets, no fewer.
           names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
-          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          # FIFTEENTH ROUND (live rehearsal finding): jq's `sort` orders by
+          # codepoint, which places "console-snapshot-provenance.json"
+          # ("-" = 0x2D) BEFORE "console-snapshot.json" ("." = 0x2E) — the
+          # printf order listed .json first, so this presence check could
+          # NEVER pass (observed live: all three assets present, SAFETY
+          # FAILURE fired anyway). The expected list is now sorted with
+          # LC_ALL=C (byte order, identical to jq's codepoint sort).
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256' | LC_ALL=C sort)
           if [ "$names" != "$expected_names" ]; then
             echo "draft asset presence check FAILED — assets on the draft:"; echo "$names"; exit 1
           fi

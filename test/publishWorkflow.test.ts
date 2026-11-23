@@ -2292,7 +2292,12 @@ describe("publish-console-snapshot workflow — draft-first immutable-release re
     const beltIdx = runs.indexOf("draft asset presence check FAILED");
     const publishIdx = runs.indexOf("gh api --method PATCH \"repos/$REPO/releases/$DRAFT_RELEASE_ID\"");
     assert.ok(beltIdx > -1 && publishIdx > -1 && beltIdx < publishIdx, "the draft belt runs before the publish PATCH inside the release job");
-    assert.match(runs, /expected_names=\$\(printf 'console-snapshot\.json\\nconsole-snapshot-provenance\.json\\nconsole-snapshot\.sha256'\)/, "exactly the three required assets are required");
+    // FIFTEENTH ROUND: the expected asset list is sorted with LC_ALL=C so
+    // it matches jq's codepoint sort byte-for-byte (the live rehearsal
+    // proved the unsorted printf order could NEVER equal the sorted list:
+    // "-" 0x2D sorts before "." 0x2E, putting provenance.json first).
+    assert.match(runs, /expected_names=\$\(printf 'console-snapshot\.json\\nconsole-snapshot-provenance\.json\\nconsole-snapshot\.sha256' \| LC_ALL=C sort\)/, "exactly the three required assets are required (sorted to match jq's codepoint order)");
+    assert.match(runs, /names=\$\(gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID\/assets" --jq '\[\.\[\]\.name\] \| sort \| join\("\\n"\)'\)/, "the observed asset list is sorted");
     assert.match(runs, /Accept: application\/octet-stream" "repos\/\$REPO\/releases\/assets\/\$asset_id"/, "the assets are downloaded BACK from the draft by asset id");
     assert.match(runs, /sha256sum -c console-snapshot\.sha256/, "the checksum belt runs over the exact uploaded bytes");
     assert.match(runs, /jq -e --arg tag "\$TAG" '\.versionedTag == \$tag' dl\/console-snapshot-provenance\.json/, "the provenance must name the release tag before publishing");

@@ -261,7 +261,11 @@ jobs:
           # The draft belt (the production release job's verify step): the
           # presence check fails — only 1 of the 3 required assets exists.
           names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
-          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          # FIFTEENTH ROUND (live rehearsal finding): jq's `sort` orders by
+          # codepoint ("-" 0x2D < "." 0x2E), so the expected list is sorted
+          # with LC_ALL=C to match — the unsorted printf order could never
+          # equal the sorted asset list.
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256' | LC_ALL=C sort)
           if [ "$names" = "$expected_names" ]; then
             echo "SAFETY FAILURE: the partial draft unexpectedly carries all three assets"; exit 1
           fi
@@ -357,7 +361,10 @@ jobs:
               -H "Content-Type: application/octet-stream" --input "data/$asset" > /dev/null
           done
           names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
-          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          # Expected list sorted with LC_ALL=C to match jq's codepoint sort
+          # (fifteenth-round live rehearsal finding: the unsorted printf
+          # order could never equal the sorted asset list).
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256' | LC_ALL=C sort)
           if [ "$names" != "$expected_names" ]; then
             echo "SAFETY FAILURE: the rehearsal draft does not carry exactly the three required assets"; echo "$names"; exit 1
           fi
