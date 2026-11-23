@@ -244,7 +244,12 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_ENV"
           gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal partial upload — $TAG" --notes "Rehearsal: partial upload scenario (non-production)."
-          PARTIAL_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          PARTIAL_ID=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            PARTIAL_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$PARTIAL_ID" in [1-9]*) break ;; esac
+            echo "the partial draft is not yet visible in the release list (attempt $attempt/10); retrying"; sleep 2
+          done
           case "$PARTIAL_ID" in [1-9]*) ;; *) echo "the partial draft release could not be resolved"; exit 1 ;; esac
           echo "DRAFT_RELEASE_ID=$PARTIAL_ID" >> "$GITHUB_ENV"
           gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$PARTIAL_ID/assets?name=console-snapshot.json" \
@@ -332,7 +337,19 @@ jobs:
           gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal ConsoleSnapshot v2 — $TAG" \
             --notes "Rehearsal publication (non-production): immutable versioned release, draft-first sequence, created with --latest=false."
-          DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          # FIFTEENTH ROUND (live rehearsal finding): the releases LIST
+          # endpoint may briefly not include a just-created draft — an
+          # eventual-consistency window OBSERVED LIVE (resolution queried
+          # ~300ms after `gh release create` returned and failed). The
+          # resolution is retried with a bounded backoff BEFORE failing
+          # closed (10 attempts x 2s ceiling; the fail-closed gate below
+          # is unchanged).
+          DRAFT_RELEASE_ID=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$DRAFT_RELEASE_ID" in [1-9]*) break ;; esac
+            echo "the draft is not yet visible in the release list (attempt $attempt/10); retrying"; sleep 2
+          done
           case "$DRAFT_RELEASE_ID" in [1-9]*) ;; *) echo "the rehearsal draft could not be resolved"; exit 1 ;; esac
           echo "DRAFT_RELEASE_ID=$DRAFT_RELEASE_ID" >> "$GITHUB_ENV"
           for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
@@ -353,8 +370,16 @@ jobs:
           jq -e --arg tag "$TAG" '.versionedTag == $tag' dl/console-snapshot-provenance.json > /dev/null \
             || { echo "the staged provenance does not name the release tag $TAG"; exit 1; }
           gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" -F draft=false -f make_latest=false > /dev/null
-          still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
-          published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+          # Publish read-back with the SAME bounded retry (the by-ID read
+          # may also lag the PATCH — same consistency window class).
+          still_draft=""
+          published_tag=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+            published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+            if [ "$still_draft" = "false" ] && [ "$published_tag" = "$TAG" ]; then break; fi
+            echo "the published state read-back is not yet consistent (attempt $attempt/10); retrying"; sleep 2
+          done
           if [ "$still_draft" != "false" ] || [ "$published_tag" != "$TAG" ]; then
             echo "publish verification FAILED: draft='$still_draft' tag='$published_tag'"; exit 1
           fi

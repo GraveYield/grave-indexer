@@ -793,7 +793,19 @@ jobs:
           # serves published releases only) — resolve the draft's release
           # ID from the list endpoint. The tag is strictly shape-validated
           # two steps above, so the jq selection is over a pinned value.
-          DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          # FIFTEENTH ROUND (live rehearsal finding): the releases LIST
+          # endpoint may briefly not include a just-created draft — an
+          # eventual-consistency window OBSERVED LIVE in the rehearsal
+          # (~300ms after `gh release create` returned). The resolution is
+          # therefore retried with a bounded backoff BEFORE failing closed
+          # (10 attempts x 2s = 20s ceiling; the fail-closed gate below is
+          # unchanged and remains the only upload authority).
+          DRAFT_RELEASE_ID=0
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$DRAFT_RELEASE_ID" in [1-9]*) break ;; esac
+            echo "the draft is not yet visible in the release list (attempt $attempt/10); retrying"; sleep 2
+          done
           case "$DRAFT_RELEASE_ID" in
             0|'') echo "the draft release could not be resolved from the release list; refusing to upload"; exit 1 ;;
             [1-9]*) ;;
@@ -861,8 +873,16 @@ jobs:
           gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" \
             -F draft=false \
             -f make_latest=false > /dev/null
-          published_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
-          published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+          # Publish read-back with the SAME bounded retry (the by-ID read
+          # may also lag the PATCH — same consistency window class).
+          published_draft=""
+          published_tag=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            published_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+            published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+            if [ "$published_draft" = "false" ] && [ "$published_tag" = "$TAG" ]; then break; fi
+            echo "the published state read-back is not yet consistent (attempt $attempt/10); retrying"; sleep 2
+          done
           if [ "$published_draft" != "false" ] || [ "$published_tag" != "$TAG" ]; then
             echo "publish verification FAILED: draft='$published_draft' tag='$published_tag' (expected draft=false, tag=$TAG)"; exit 1
           fi
