@@ -103,21 +103,44 @@ Scenarios (dispatch input):
 
 | Scenario | Proves |
 | --- | --- |
-| `happy` | versioned release created `--latest=false` + full asset upload; same-release verification (digests + lengths); pointer build + strict pointer-schema validation; annotated tag object creation; dedicated-ref create-or-update (404 → `POST /git/refs`, 200 → `PATCH /git/refs/tags/console-snapshot-prod` force); read-back (sha + message equality); full identity chain via `verify-stable`; an UNRELATED release taking the repo-wide latest designation does NOT move the dedicated reference; rollback drill — restore the previous pointer (verified through the full chain) or, on a first publication, delete the reference and verify HTTP 404; state-aware re-activation (Finding 2: 404 → `POST /git/refs`, 200 → `PATCH`, read-back + `verify-stable` in both paths) |
+| `happy` | the DRAFT-FIRST sequence required before enforcement (twelfth round: versioned release created `--latest=false --draft`, assets uploaded BY RELEASE ID, draft belt over the uploaded bytes, then publish `draft=false` + `make_latest=false`); same-release verification (digests + lengths); pointer build + strict pointer-schema validation; annotated tag object creation; dedicated-ref create-or-update (404 → `POST /git/refs`, 200 → `PATCH /git/refs/tags/console-snapshot-prod` force); read-back (sha + message equality); full identity chain via `verify-stable`; an UNRELATED release taking the repo-wide latest designation does NOT move the dedicated reference; rollback drill — restore the previous pointer (verified through the full chain) or, on a first publication, delete the reference and verify HTTP 404; state-aware re-activation (Finding 2: 404 → `POST /git/refs`, 200 → `PATCH`, read-back + `verify-stable` in both paths) |
 | `post-activation-failure` | (ninth round, Finding 3) the FULL pointer architecture up to and INCLUDING a verified activation; then a deliberate, controlled failure injection (explicit `exit 1` after the ref verifiably moved); the FAILURE-TRIGGERED rollback path (`if: failure()` gating, compare-before-rollback against the live ref, refusal on an independently moved pointer, fail-closed on an unreadable ref) restores the previous pointer or the absent first-publication state; the restoration is proven by `verify-stable` or a genuine HTTP 404; the four phases are reported distinctly and the job conclusion is EXPECTED failure |
-| `partial-upload` | uploading only the snapshot asset fails same-release verification; the DEDICATED stable reference is unchanged after the failed publication; the previously active artifact remains fully retrievable and internally consistent; cleanup deletes the partial rehearsal release |
+| `partial-upload` | (twelfth round) only the snapshot asset is uploaded to a DRAFT; the draft belt's presence check fails on the DRAFT — BEFORE any publish; same-release verification also fails (an un-published draft is invisible to the by-tag endpoint — fail closed in both layers); the release must STILL be a draft (publishing an incomplete asset set is a loud SAFETY FAILURE); the DEDICATED stable reference is unchanged after the failed publication; the previously active artifact remains fully retrievable and internally consistent; cleanup deletes the un-published draft by release ID (no tag was ever materialized) |
 | `promotion-failure` | building/activating a pointer for a MISSING release fails closed; the dedicated reference is unchanged |
 | `incomplete-artifact` | an incomplete bundle (zero enriched pools) is refused by the independent `verify-snapshot` gate and never promoted (no release exists for its tag) |
 
 ## 3. Why it has not run yet, and what the owner must do
 
-Dispatching `rehearsal-publication` from this branch is NOT possible:
-GitHub registers `workflow_dispatch` workflows only from the default
-branch, and dispatching it is explicitly outside this task's
-authorization. Additionally, an earlier reconnaissance found the
-rehearsal repository `GraveYield/grave-indexer-pub-rehearsal` exists but
-the task's credential cannot write to it — provisioning that access is
-an owner decision.
+**TWELFTH-ROUND PREREQUISITE VERIFICATION (2026-11-23, read-only):**
+the rehearsal was NOT dispatched because three concrete prerequisites
+fail, verified live:
+
+1. `GraveYield/grave-indexer-pub-rehearsal` exists but is **EMPTY** —
+   no commits, no branches, no default branch, no files. GitHub
+   registers `workflow_dispatch` workflows ONLY from a repository's
+   default branch, so the rehearsal workflow cannot be dispatched there
+   at all, and there is no workflow to dispatch (PR #5 is not merged —
+   by requirement — so `grave-indexer`'s own default branch does not
+   carry the workflow either).
+2. No credential with write access to the rehearsal repository was
+   available to the task (an earlier reconnaissance found the same);
+   dispatch additionally requires such access. None was requested or
+   exposed in chat.
+3. The workflow's OWN guard properties were verified by inspection and
+   structure tests (not dispatch): the hard repository-identity guard
+   is the FIRST step, before checkout and any write; the rehearsal uses
+   only its repository-scoped `github.token`; no production secret is
+   referenced; the rehearsal exercises the §8.3 draft-first sequence
+   (twelfth round) — the production publisher itself is deliberately
+   UNCHANGED while enforcement status is UNKNOWN, with the validated
+   production patch recorded for the owner (docs/SNAPSHOT_PUBLICATION.md
+   §8.3, §16).
+
+Per the task's authorization boundary, dispatch was therefore skipped
+and the exact prerequisites are reported instead. Dispatching from this
+branch is also NOT possible: GitHub registers `workflow_dispatch`
+workflows only from the default branch, and dispatching was explicitly
+outside this task's authorization.
 
 Owner steps to run the full rehearsal (NOT performed by this change):
 
@@ -169,10 +192,19 @@ or fail the run, and both rollback paths verify their own result) — but
 the owner should run the rehearsal above before the first production
 publication.
 
-Equally important, do NOT overstate other unverified claims: GitHub-side
-immutable-release enforcement is NOT enabled (immutability is a
-workflow-level convention; enabling GitHub's immutable-releases feature
-is an owner decision — docs/SNAPSHOT_PUBLICATION.md §8), and production
-Console ingestion is NOT operational (the Console's single-GET
-`GY_SNAPSHOT_URL` contract requires the §13.2 two-step resolver, which
-is an owner-approval gate outside this task).
+Equally important, do NOT overstate other unverified claims: GitHub-
+enforced immutable-release status is **UNKNOWN** — it has never been
+verified with an authorized endpoint result (unauthenticated calls to
+`GET /repos/<owner>/<repo>/immutable-releases` return 401/403, which
+cannot distinguish "disabled" from "not visible"); immutability is a
+workflow-level convention, and the production publisher's current
+published-first sequence is compatible with the observed UNKNOWN state
+— the draft-first sequence required before enforcement is SPECIFIED
+(§8.3), REHEARSED by this workflow, and available as a validated
+production patch for the owner to adopt together with any enablement
+decision (docs/SNAPSHOT_PUBLICATION.md §8.3, §16). Enabling GitHub's
+immutable-releases feature is an owner decision, and the publish-time
+latest-designation behavior should be re-verified on the rehearsal
+target first. Production Console ingestion is NOT operational (the
+Console's single-GET `GY_SNAPSHOT_URL` contract requires the §13.2
+two-step resolver, which is an owner-approval gate outside this task).
