@@ -1054,24 +1054,100 @@ jobs:
           # release lookup after the DELETE as proof that the draft was
           # deleted — a 401/403/429/5xx response, a network failure, or a
           # malformed response was silently reinterpreted as "the draft is
-          # gone". The read-back now classifies the EXACT HTTP outcome:
-          #   HTTP 404 — deletion CONFIRMED (the ONLY success verdict);
-          #   HTTP 200 — the release STILL EXISTS: cleanup FAILED;
-          #   HTTP 401/403, 429, 5xx, transport failure, malformed
-          #            response or ANY other unexpected status — the
-          #            deletion status is UNKNOWN.
-          # Successful deletion is claimed ONLY on a genuine 404; every
-          # other outcome reports OPERATOR INTERVENTION REQUIRED and the
-          # step exits non-zero. A published release or another run's
-          # release is never deleted (the pre-deletion identity checks
-          # above are unchanged).
-          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+          # gone". The read-back classifies the EXACT HTTP outcome.
+          #
+          # EIGHTEENTH-ROUND CORRECTION (bounded response capture + body
+          # validation): the sixteenth-round read-back captured ONLY the
+          # HTTP status (`curl -o /dev/null -w '%{http_code}'`) and
+          # DISCARDED the response body — a malformed, empty, truncated,
+          # HTML or structurally invalid response carrying the same status
+          # was treated as authoritative evidence of the release's state
+          # (a malformed 404 could "confirm" a deletion; a malformed 200
+          # could claim the release still exists). The read-back now
+          # captures AND validates the actual response:
+          #   * the body is captured into a temporary file (NEVER into a
+          #     shell variable — no unbounded response can enter the
+          #     shell's memory), with curl's `--max-filesize` enforcing
+          #     the 65536-byte limit whenever a Content-Length declares a
+          #     size AND a post-download byte count enforcing the SAME
+          #     limit when none is declared — a missing or misleading
+          #     Content-Length cannot bypass the bound. curl's exit
+          #     status, the HTTP status and the body are each captured
+          #     SEPARATELY; the temporary directory is removed by an EXIT
+          #     trap on EVERY path (success and failure); no credential,
+          #     header or token material is ever echoed to the log;
+          #   * HTTP 404 claims deletion CONFIRMED (the ONLY success
+          #     verdict) only when the body is non-empty, valid JSON and
+          #     the EXACT GitHub API Not Found structure
+          #     ({"message":"Not Found","status":"404"} — the shape
+          #     verified live against api.github.com on 2026-11-24), read
+          #     with the SAME authenticated repository context the
+          #     pre-deletion identity check used;
+          #   * HTTP 200 is validated as a GitHub Release object: a JSON
+          #     object with an `id` equal to THIS run's $DRAFT_RELEASE_ID,
+          #     a `tag_name` equal to THIS run's $TAG and a boolean
+          #     `draft` field. An exact draft match means the release
+          #     STILL EXISTS — cleanup FAILED; a published or mismatched
+          #     object contradicts the expected cleanup state;
+          #   * EVERYTHING ELSE — transport/DNS/TLS failure, oversized or
+          #     empty body, truncated response, malformed or structurally
+          #     invalid JSON, an HTML error page, a missing/invalid
+          #     `id`/`tag_name`/`draft` field, a mismatched release
+          #     identity, HTTP 401/403/429/5xx and ANY unexpected status —
+          #     is classified UNKNOWN: uncertainty is NEVER converted into
+          #     a successful deletion verdict. Every UNKNOWN outcome states
+          #     OPERATOR INTERVENTION REQUIRED and exits non-zero.
+          # Successful deletion is claimed ONLY on a validated genuine
+          # 404. The pre-deletion identity checks (exact release ID,
+          # exact run tag, draft == true proven by read-back BEFORE any
+          # DELETE) and the seventeenth-round DELETE fall-through are
+          # unchanged.
+          readback_tmpdir=$(mktemp -d) || { echo "draft cleanup read-back could not create a temporary directory: the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1; }
+          trap 'rm -rf "$readback_tmpdir"' EXIT
+          readback_body="$readback_tmpdir/body.json"
+          set +e # the read-back must ALWAYS reach classification — its own failure never aborts the step unclassified (the seventeenth-round invariant)
+          code=$(curl -sS --max-filesize 65536 \
+            -o "$readback_body" \
+            -w '%{http_code}' \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID") || { echo "draft cleanup read-back FAILED (curl transport error): the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN — never claimed successful; OPERATOR INTERVENTION REQUIRED"; exit 1; }
+            "https://api.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID" 2>"$readback_tmpdir/curl.err")
+          curl_exit=$?
+          set -e
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "draft cleanup read-back FAILED (curl transport error, exit $curl_exit: $(cat "$readback_tmpdir/curl.err")): the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN — never claimed successful; OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          readback_size=$(wc -c < "$readback_body" 2>/dev/null || echo 0)
+          if [ "$readback_size" -gt 65536 ]; then
+            echo "draft cleanup read-back INCONCLUSIVE: response body exceeds the 65536-byte limit ($readback_size bytes) — oversized responses are never trusted; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          if [ "$readback_size" -eq 0 ]; then
+            echo "draft cleanup read-back INCONCLUSIVE: empty response body (HTTP $code) — a response without a body cannot classify the deletion; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          if ! jq -e 'type == "object"' "$readback_body" >/dev/null 2>&1; then
+            echo "draft cleanup read-back INCONCLUSIVE: response body (HTTP $code, $readback_size bytes) is NOT valid JSON — malformed, truncated or HTML responses are never trusted; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
           case "$code" in
-            404) echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted (read-back HTTP 404 — deletion confirmed); the stable reference and every published release were never touched" ;;
-            200) echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still EXISTS (HTTP 200) — the deletion did NOT succeed; OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+            404)
+              if ! jq -e '.message == "Not Found" and .status == "404"' "$readback_body" >/dev/null 2>&1; then
+                echo "draft cleanup read-back INCONCLUSIVE: HTTP 404 whose body is NOT the expected GitHub API Not Found structure — an invalid body can never confirm a deletion; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
+              fi
+              echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted (read-back HTTP 404 — deletion confirmed; the response body was validated as the exact GitHub API Not Found structure, $readback_size bytes); the stable reference and every published release were never touched" ;;
+            200)
+              release_class=$(jq -r --arg rid "$DRAFT_RELEASE_ID" --arg rtag "$TAG" '
+                if has("id") | not then "missing_id"
+                elif has("tag_name") | not then "missing_tag"
+                elif (.draft | type) != "boolean" then "invalid_draft"
+                elif ((.id | tostring) != $rid) then "mismatch_id"
+                elif (.tag_name != $rtag) then "mismatch_tag"
+                elif .draft == true then "exact_draft"
+                else "published"
+                end' "$readback_body") || { echo "draft cleanup read-back INCONCLUSIVE: HTTP 200 body could not be classified — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1; }
+              case "$release_class" in
+                exact_draft) echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still EXISTS (HTTP 200) — a VALIDATED GitHub Release object (id $DRAFT_RELEASE_ID, tag $TAG, draft true) proves the deletion did NOT succeed; OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+                published|missing_id|missing_tag|invalid_draft|mismatch_id|mismatch_tag) echo "draft cleanup read-back INCONCLUSIVE: HTTP 200 returned a release object that CONTRADICTS the expected cleanup state ($release_class — expected the deleted draft $DRAFT_RELEASE_ID/$TAG) — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+                *) echo "draft cleanup read-back INCONCLUSIVE: unclassifiable HTTP 200 release object — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+              esac ;;
             *) echo "draft cleanup read-back INCONCLUSIVE: unexpected HTTP $code for release $DRAFT_RELEASE_ID — the deletion status is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
           esac
     outputs:

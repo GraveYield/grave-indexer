@@ -2442,24 +2442,55 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     'exit 1',
   ].join("\n");
 
-  // Mock curl: the post-DELETE read-back classifies the EXACT HTTP status.
-  // Default behavior mirrors the stateful server above: the release exists
-  // (state file present) → 200; absent → a genuine 404. MOCK_READBACK_STATUS
-  // forces any other status (401/403/429/5xx/...); MOCK_CURL_TRANSPORT_ERROR
-  // makes curl itself fail (network failure). It cannot reach GitHub.
+  // Mock curl: the post-DELETE read-back now captures BOTH the HTTP status
+  // AND the response body (the script captures the body into a bounded
+  // temporary file). Default behavior mirrors the stateful server above:
+  // the release exists (state file present) → 200 + the state JSON as the
+  // body; absent → 404 + the EXACT GitHub API Not Found body; a FORCED 200
+  // without an explicit body still serves a plausible release object for
+  // this run's identity (the server kept the release). Overrides:
+  // MOCK_READBACK_STATUS forces a status; MOCK_READBACK_BODY (even empty)
+  // overrides the body; MOCK_CURL_BODY_BYTES writes an N-byte body
+  // (oversized); MOCK_CURL_TRANSPORT_ERROR / MOCK_CURL_TLS_ERROR /
+  // MOCK_CURL_DNS_ERROR / MOCK_CURL_OVERSIZE_EXIT make curl itself fail
+  // with exit 7 / 35 / 6 / 63. It cannot reach GitHub.
   const mockCurl = [
     "#!/usr/bin/env bash",
-    "# test-harness mock: status-only release read-back",
-    'url=""',
-    'for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done',
+    "# test-harness mock: bounded-capture release read-back (status + body)",
+    'url=""; outfile=""; prev=""',
+    'for a in "$@"; do',
+    '  case "$a" in http*) url="$a" ;; esac',
+    '  if [ "$prev" = "-o" ]; then outfile="$a"; fi',
+    '  prev="$a"',
+    'done',
     'case "$url" in',
     '  */releases/$MOCK_RELEASE_ID_URL) ;;',
     '  *) if [ -n "$MOCK_CURL_ALLOWED_PREFIX" ] && [ "${url#$MOCK_CURL_ALLOWED_PREFIX}" = "$url" ]; then echo "unexpected url: $url" >&2; exit 1; fi ;;',
     'esac',
     'if [ -n "${MOCK_CURL_TRANSPORT_ERROR:-}" ]; then echo "curl: (7) connection refused (mock)" >&2; exit 7; fi',
+    'if [ -n "${MOCK_CURL_TLS_ERROR:-}" ]; then echo "curl: (35) TLS handshake failure (mock)" >&2; exit 35; fi',
+    'if [ -n "${MOCK_CURL_DNS_ERROR:-}" ]; then echo "curl: (6) could not resolve host (mock)" >&2; exit 6; fi',
+    'if [ -n "${MOCK_CURL_OVERSIZE_EXIT:-}" ]; then echo "curl: (63) maximum response size exceeded (mock)" >&2; exit 63; fi',
     'state="$MOCK_STATE_FILE"',
-    'if [ -n "${MOCK_READBACK_STATUS:-}" ]; then printf \'%s\' "$MOCK_READBACK_STATUS"; exit 0; fi',
-    'if [ -f "$state" ]; then printf \'%s\' "200"; else printf \'%s\' "404"; fi',
+    'status="${MOCK_READBACK_STATUS:-}"',
+    'if [ -z "$status" ]; then if [ -f "$state" ]; then status="200"; else status="404"; fi; fi',
+    'if [ -n "${MOCK_CURL_BODY_BYTES:-}" ]; then',
+    '  body=$(head -c "$MOCK_CURL_BODY_BYTES" /dev/zero | tr \'\\0\' \'x\')',
+    'elif [ -n "${MOCK_READBACK_BODY+x}" ]; then',
+    '  body="$MOCK_READBACK_BODY"',
+    'else',
+    '  if [ "$status" = "404" ]; then',
+    '    body=\'{"message": "Not Found", "documentation_url": "https://docs.github.com/rest", "status": "404"}\'',
+    '  elif [ "$status" = "200" ] && [ -f "$state" ]; then',
+    '    body=$(cat "$state")',
+    '  elif [ "$status" = "200" ]; then',
+    '    body="{\\"id\\": $MOCK_RELEASE_ID_URL, \\"draft\\": true, \\"tag_name\\": \\"$MOCK_RELEASE_TAG\\"}"',
+    '  else',
+    '    body="{\\"message\\": \\"Unexpected status $status\\", \\"documentation_url\\": \\"https://docs.github.com/rest\\"}"',
+    '  fi',
+    'fi',
+    'if [ -n "$outfile" ]; then printf \'%s\' "$body" > "$outfile"; fi',
+    'printf \'%s\' "$status"',
     'exit 0',
   ].join("\n");
 
@@ -2494,6 +2525,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
           MOCK_GH_LOG: ghLogPath,
           MOCK_STATE_FILE: statePath,
           MOCK_RELEASE_ID_URL: DRAFT_ID,
+          MOCK_RELEASE_TAG: TAG,
           ...env,
         },
       });
@@ -2609,16 +2641,28 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
   // auth/permission/rate-limit/outage/transport/unexpected outcome = the
   // deletion status is UNKNOWN. All of these EXECUTE the actual cleanup
   // script against mocked HTTP responses.
-  test("STRUCTURAL: the read-back classifies the exact HTTP status and only 404 claims success", () => {
-    assert.match(cleanupRun, /curl -sS -o \/dev\/null -w '%\{http_code\}'/, "the read-back captures the EXACT HTTP status code");
+  test("STRUCTURAL: the read-back captures a BOUNDED response body and only a VALIDATED 404 claims success (eighteenth round)", () => {
+    assert.match(cleanupRun, /curl -sS --max-filesize 65536/, "the download is bounded by --max-filesize (enforced whenever a Content-Length declares a size)");
+    assert.match(cleanupRun, /-o "\$readback_body"/, "the response body is captured into a temporary FILE (never a shell variable)");
+    assert.match(cleanupRun, /-w '%\{http_code\}'/, "the HTTP status is captured separately from the body");
+    assert.match(cleanupRun, /curl_exit=\$\?/, "curl's exit status is captured separately");
+    assert.match(cleanupRun, /readback_tmpdir=\$\(mktemp -d\)/, "the capture uses a dedicated temporary directory");
+    assert.match(cleanupRun, /trap 'rm -rf "\$readback_tmpdir"' EXIT/, "the temporary files are removed on EVERY path by an EXIT trap");
+    assert.match(cleanupRun, /readback_size=\$\(wc -c < "\$readback_body"/, "the captured body's byte count is enforced post-download (a missing or misleading Content-Length cannot bypass the limit)");
+    assert.match(cleanupRun, /"\$readback_size" -gt 65536/, "oversized responses are rejected");
+    assert.match(cleanupRun, /"\$readback_size" -eq 0/, "empty responses are rejected");
+    assert.match(cleanupRun, /jq -e 'type == "object"'/, "the body must be valid JSON before ANY classification");
     assert.match(cleanupRun, /case "\$code" in/, "the status is classified explicitly");
-    const idx404 = cleanupRun.indexOf('404) echo "verified: the un-published draft');
-    const idx200 = cleanupRun.indexOf('200) echo "draft cleanup read-back FAILED');
-    const idxOther = cleanupRun.indexOf('*) echo "draft cleanup read-back INCONCLUSIVE');
+    const idx404 = cleanupRun.indexOf('jq -e \'.message == "Not Found" and .status == "404"\'');
+    const idx200 = cleanupRun.indexOf('exact_draft) echo "draft cleanup read-back FAILED');
+    const idxOther = cleanupRun.indexOf('*) echo "draft cleanup read-back INCONCLUSIVE: unexpected HTTP $code');
     assert.ok(idx404 > -1 && idx200 > -1 && idxOther > -1, "all three classification branches exist");
-    assert.ok(idx404 < idx200 && idx200 < idxOther, "404 = confirmed, 200 = still exists, everything else = UNKNOWN");
-    assert.match(cleanupRun, /the deletion status of release \$DRAFT_RELEASE_ID is UNKNOWN/, "a transport failure is classified UNKNOWN");
+    assert.ok(idx404 < idx200 && idx200 < idxOther, "404 = validated confirmation, 200 = validated still-exists, everything else = UNKNOWN");
+    assert.match(cleanupRun, /jq -e '\.message == "Not Found" and \.status == "404"'/, "a 404 is confirmed ONLY when the body is the exact GitHub API Not Found structure");
+    assert.match(cleanupRun, /has\("id"\) \| not then "missing_id"/, "the 200 branch validates the release object's id, tag_name and draft fields");
+    assert.match(cleanupRun, /the deletion status of release \$DRAFT_RELEASE_ID is UNKNOWN/, "uncertain outcomes are classified UNKNOWN");
     assert.ok(!/if gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID" > \/dev\/null 2>&1/.test(cleanupRun), "the old any-failure-means-deleted pattern is GONE");
+    assert.ok(!/curl -sS -o \/dev\/null/.test(cleanupRun), "the status-only capture (curl -sS -o /dev/null — the body discarded) is GONE");
   });
 
   test("HTTP 200 at read-back: the release still EXISTS — cleanup FAILED, operator intervention required", () => {
@@ -2652,7 +2696,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
   test("HTTP 404 at read-back is the ONLY verdict that claims the deletion succeeded", () => {
     const res = runCleanup(baseEnv({}));
     assert.equal(res.status, 0, "a genuine 404 confirms the deletion");
-    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed\)/, "the success verdict names the confirming 404");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the success verdict names the confirming 404");
   });
 
   // ── SEVENTEENTH ROUND: the DELETE call's own failure is classified ──
@@ -2672,7 +2716,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     assert.match(deleteLine!, /is NOT yet established/, "the DELETE-failure message explicitly states the deletion is NOT established");
     assert.ok(!/was deleted/.test(deleteLine!), "the DELETE-failure message NEVER claims success");
     const deleteIdx = cleanupRun.indexOf(deleteLine!);
-    const readbackIdx = cleanupRun.indexOf("curl -sS -o /dev/null -w '%{http_code}'");
+    const readbackIdx = cleanupRun.indexOf("curl -sS --max-filesize");
     assert.ok(deleteIdx > -1 && readbackIdx > deleteIdx, "the read-back classification ALWAYS follows the DELETE");
   });
 
@@ -2682,7 +2726,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     assert.equal(res.deleted, true, "the DELETE was attempted");
     assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible in the log");
     assert.match(res.stdout, /is NOT yet established/, "the un-established state is explicit before the read-back");
-    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed\)/, "ONLY the genuine 404 read-back claims the deletion");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "ONLY the genuine 404 read-back claims the deletion");
   });
 
   test("DELETE call FAILS (malformed response) + read-back 200: the release still EXISTS — cleanup FAILED, operator intervention required", () => {
@@ -2714,6 +2758,144 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
     assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
     assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+  });
+
+  // ── EIGHTEENTH ROUND: bounded response capture + body validation ──
+  // The sixteenth-round read-back captured ONLY the HTTP status
+  // (`curl -o /dev/null -w '%{http_code}'`) and DISCARDED the response
+  // body: a malformed, empty, truncated, HTML or structurally invalid
+  // response carrying the same status was treated as authoritative
+  // evidence of the release's state — a malformed 404 could "confirm" a
+  // deletion, a malformed 200 could claim the release still exists. The
+  // read-back now captures the body into a bounded temporary file and
+  // validates EVERYTHING — curl exit status, HTTP status, body size,
+  // JSON parse, the expected GitHub API structure and the release
+  // identity — before ANY verdict. Every test below EXECUTES the actual
+  // cleanup script against mocked HTTP responses (body included).
+  const nfBody = JSON.stringify({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
+  const htmlBody = "<html><head><title>Service Unavailable</title></head><body>upstream error</body></html>";
+
+  // Shared UNKNOWN-outcome assertions (work-order §5.5): non-zero exit,
+  // explicit UNKNOWN, explicit OPERATOR INTERVENTION REQUIRED, no
+  // successful-deletion claim, no unrelated deletion, no ref/tag
+  // mutation of any kind.
+  function assertUnknownOutcome(res: CleanupResult): void {
+    assert.notEqual(res.status, 0, "every UNKNOWN outcome exits non-zero");
+    assert.match(res.stdout, /UNKNOWN/, "the UNKNOWN classification is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+    assert.ok(!res.stdout.includes("deletion confirmed"), "successful deletion is NEVER claimed");
+    const deletes = res.ghCalls.filter((l) => l.includes("--method DELETE"));
+    assert.equal(deletes.length, 1, "exactly ONE deletion attempt (a failed read-back never re-deletes)");
+    assert.ok(deletes.every((l) => l.includes(`releases/${DRAFT_ID}`)), "the deletion addresses ONLY this run's draft release ID");
+    assert.equal(res.ghCalls.filter((l) => /git\/(refs|tags)/.test(l)).length, 0, "NO git ref or tag mutation is issued");
+    assert.ok(!res.ghCalls.some((l) => l.startsWith("gh release ")), "NO gh release mutation is issued");
+  }
+
+  // Shared still-exists assertions: a VALIDATED 200 with the exact draft
+  // identity is a definitive FAILED classification (not UNKNOWN) — the
+  // release demonstrably still exists and the operator must intervene.
+  function assertStillExists(res: CleanupResult): void {
+    assert.notEqual(res.status, 0, "a still-existing draft NEVER exits zero");
+    assert.match(res.stdout, /still EXISTS \(HTTP 200\)/, "the still-exists outcome is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+    assert.ok(!res.stdout.includes("deletion confirmed"), "successful deletion is NEVER claimed");
+    assert.ok(!res.stdout.includes("UNKNOWN"), "a validated 200 is a definitive FAILED outcome, not UNKNOWN");
+    const deletes = res.ghCalls.filter((l) => l.includes("--method DELETE"));
+    assert.equal(deletes.length, 1, "exactly ONE deletion attempt");
+    assert.ok(deletes.every((l) => l.includes(`releases/${DRAFT_ID}`)), "the deletion addresses ONLY this run's draft release ID");
+    assert.equal(res.ghCalls.filter((l) => /git\/(refs|tags)/.test(l)).length, 0, "NO git ref or tag mutation is issued");
+    assert.ok(!res.ghCalls.some((l) => l.startsWith("gh release ")), "NO gh release mutation is issued");
+  }
+
+  // ── valid response cases ──
+  test("DELETE succeeds + VALID 404 (body = the exact GitHub Not Found structure): deletion CONFIRMED", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBody }));
+    assert.equal(res.status, 0, "a validated 404 confirms the deletion");
+    assert.equal(res.deleted, true, "the DELETE was attempted");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the success verdict names the confirming 404");
+    assert.match(res.stdout, /response body was validated as the exact GitHub API Not Found structure/, "the body validation is recorded in the success verdict");
+  });
+
+  test("DELETE FAILS + VALID 404: deletion CONFIRMED — the validated read-back, not the DELETE call, is authoritative", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBody }));
+    assert.equal(res.status, 0, "the deletion is confirmed by the validated 404 even after the DELETE call errored");
+    assert.equal(res.deleted, true, "the DELETE was attempted");
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the success verdict is claimed ONLY by the validated read-back");
+  });
+
+  test("DELETE succeeds + VALID 200 with the EXACT draft identity: the release STILL EXISTS — cleanup FAILED", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: draftBody(true, TAG) }));
+    assertStillExists(res);
+    assert.match(res.stdout, /draft true/, "the validated release identity (id, tag, draft) is recorded");
+  });
+
+  test("DELETE FAILS + VALID 200 with the EXACT draft identity: the release STILL EXISTS — cleanup FAILED", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: draftBody(true, TAG) }));
+    assertStillExists(res);
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+  });
+
+  // ── malformed and invalid body cases (each also repeated with the
+  //    DELETE call itself failing — no failed-DELETE path may terminate
+  //    before classification) ──
+  const malformedCases: Array<[string, string, string, RegExp]> = [
+    ["HTTP 404 with MALFORMED JSON", "404", '{"message": "Not Found",', /NOT valid JSON/],
+    ["HTTP 404 with an EMPTY body", "404", "", /empty response body/],
+    ["HTTP 404 with an HTML error page", "404", htmlBody, /NOT valid JSON/],
+    ["HTTP 404 with INVALID JSON STRUCTURE", "404", '{"error": "no such release", "code": 42}', /expected GitHub API Not Found structure/],
+    ["HTTP 404 with a TRUNCATED body", "404", '{"message": "Not Found", "docu', /NOT valid JSON/],
+    ["HTTP 200 with MALFORMED JSON", "200", '{"id": 1234567, "tag_name":', /NOT valid JSON/],
+    ["HTTP 200 with an EMPTY body", "200", "", /empty response body/],
+    ["HTTP 200 with an HTML error page", "200", htmlBody, /NOT valid JSON/],
+    ["HTTP 200 with a MISSING release id", "200", JSON.stringify({ tag_name: TAG, draft: true }), /missing_id/],
+    ["HTTP 200 with a MISMATCHED release id", "200", JSON.stringify({ id: 999999, tag_name: TAG, draft: true }), /mismatch_id/],
+    ["HTTP 200 with a MISMATCHED tag", "200", JSON.stringify({ id: Number(DRAFT_ID), tag_name: FOREIGN_TAG, draft: true }), /mismatch_tag/],
+    ["HTTP 200 with a MISSING draft field", "200", JSON.stringify({ id: Number(DRAFT_ID), tag_name: TAG }), /invalid_draft/],
+    ["HTTP 200 with an INVALID draft type", "200", JSON.stringify({ id: Number(DRAFT_ID), tag_name: TAG, draft: "true" }), /invalid_draft/],
+    ["HTTP 200 with an UNEXPECTED release object (published)", "200", JSON.stringify({ id: Number(DRAFT_ID), tag_name: TAG, draft: false }), /CONTRADICTS the expected cleanup state/],
+    ["HTTP 200 with a TRUNCATED response", "200", '{"id": 1234567, "tag_n', /NOT valid JSON/],
+  ];
+  for (const [name, status, body, detail] of malformedCases) {
+    test(`${name}: UNKNOWN — never claimed successful`, () => {
+      const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: status, MOCK_READBACK_BODY: body }));
+      assertUnknownOutcome(res);
+      assert.match(res.stdout, detail, "the outcome names WHY the response could not be trusted");
+    });
+    test(`${name} + the DELETE call FAILING: the read-back is STILL reached and classifies UNKNOWN`, () => {
+      const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: status, MOCK_READBACK_BODY: body }));
+      assertUnknownOutcome(res);
+      assert.match(res.stdout, detail, "the outcome names WHY the response could not be trusted");
+      assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+    });
+  }
+
+  // ── oversized / limit-enforcement cases ──
+  test("a response body EXCEEDING the configured limit: UNKNOWN (the post-download byte count enforces the limit regardless of Content-Length)", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_CURL_BODY_BYTES: "70000" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "the oversized classification is explicit");
+  });
+  test("curl aborts on the declared size limit (--max-filesize, exit 63): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_CURL_OVERSIZE_EXIT: "1" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /curl transport error/, "a --max-filesize abort is a failed capture → UNKNOWN");
+  });
+
+  // ── remaining HTTP and transport cases (connection 7, auth/rate-limit/
+  //    outage statuses and 418 are already covered above; here: TLS and
+  //    DNS failures) ──
+  test("a TLS HANDSHAKE failure during read-back (curl exit 35): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_CURL_TLS_ERROR: "1" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+  });
+  test("a DNS failure during read-back (curl exit 6): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_CURL_DNS_ERROR: "1" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
   });
 });
 

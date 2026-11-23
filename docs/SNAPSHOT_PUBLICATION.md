@@ -333,9 +333,13 @@ owner-provided token (evidence recorded in the PR remediation report):
    verified un-published draft (by-ID read-back must prove `draft==true`
    AND this run's exact tag before the deletion — a published release or
    a foreign release is never deleted; after the deletion, an explicit
-   HTTP-status classification — 404 = deletion confirmed, 200 = still
-   exists, anything else = UNKNOWN — never claims success without a
-   genuine 404). The PAT-bearing step count is SEVEN as of the
+   read-back classification over a BOUNDED, VALIDATED HTTP response —
+   body captured to a size-limited temporary file and checked for
+   valid-JSON structure and release identity before any verdict:
+   a validated 404 = deletion confirmed, a validated 200 with the
+   exact draft identity = still exists, anything else = UNKNOWN —
+   never claims success without a genuine, body-validated 404). The
+   PAT-bearing step count is SEVEN as of the
    sixteenth round (draft create+upload; draft-byte retrieval; publish;
    failure-path draft cleanup; stable-ref activation; promote-job
    rollback; dedicated rollback-job mutation) — every one zero-custom-
@@ -1710,6 +1714,13 @@ release or a release belonging to another run is never deleted.
 Regression tests EXECUTE the actual cleanup script against mocked HTTP
 responses for every case.
 
+> **SUPERSEDED (eighteenth round, §22):** the status-only capture
+> described above (`curl -o /dev/null -w '%{http_code}'` — the response
+> body discarded) has been REPLACED by bounded response capture + body
+> validation. The classification taxonomy (404 = confirmed, 200 = still
+> exists, everything else = UNKNOWN) is unchanged, but no verdict is
+> issued from an HTTP status alone anymore: see §22.
+
 ### 20.3 P2 — audit documentation reconciled
 
 * `docs/PUBLICATION_REHEARSAL.md`: the current status is EXECUTED
@@ -1790,6 +1801,12 @@ explicitly states that the deletion is NOT yet established. The
 pre-deletion identity checks (exact release ID, exact run tag,
 `draft == true` proven by read-back BEFORE any DELETE) are unchanged.
 
+> **SUPERSEDED (eighteenth round, §22):** the read-back this section
+> describes classified an HTTP status captured with the response body
+> discarded. The DELETE fall-through behavior described here is UNCHANGED
+> and remains intact, but the read-back itself now validates the captured
+> response body before any verdict: see §22.
+
 ### 21.3 Regression tests (seventeenth round)
 
 `test/publishWorkflow.test.ts` (failure-path draft-cleanup suite) — all
@@ -1812,6 +1829,136 @@ FAILS (simulating a malformed response) and a mocked read-back status:
 * Focused `test/publishWorkflow.test.ts`: 158 tests, 0 failures
   (148 before; 10 added).
 * `pnpm run test:offline`: **481 tests, 0 failures** (471 before; 10
+  added).
+* `pnpm run typecheck`, `pnpm run build`, `pnpm run bundle:release-ops`
+  (bundle 46,025 bytes; every import a `node:` builtin — pinned by
+  test): all pass.
+* All four workflow YAMLs parse; all **105 `run:` blocks** pass
+  `bash -n`.
+* NO publication or rehearsal workflow was dispatched; NO release, tag,
+  or stable reference was created, modified, or deleted in ANY
+  repository; NO repository setting, ruleset, or immutable-release
+  configuration was changed; NO Vercel/Console/blockchain state was
+  touched.
+
+## 22. Eighteenth-round correction — the draft-cleanup read-back validates the captured response body (2026-11-24)
+
+Follow-up to the independent review of the seventeenth-round cleanup
+classification. The finding: the read-back captured the HTTP status ONLY
+(`curl -sS -o /dev/null -w '%{http_code}'` — the response body was
+discarded), so the workflow could not distinguish a valid GitHub API
+response from a malformed, empty, truncated or structurally invalid
+response carrying the same status. A malformed HTTP 404 could be
+reported as confirmed deletion; a malformed HTTP 200 could be reported
+as "the release still exists"; an invalid response could be treated as
+authoritative evidence of a release's state.
+
+### 22.1 The correction — bounded response capture
+
+The read-back now captures and evaluates the ENTIRE response before any
+verdict:
+
+* the body is captured into a temporary file (`mktemp -d` + `-o
+  "$readback_body"`), NEVER into a shell variable — no unbounded HTTP
+  response can enter the shell's memory;
+* the HTTP status (`-w '%{http_code}'`), curl's transport exit status
+  (`curl_exit=$?`) and the body are each captured SEPARATELY;
+* the download is bounded TWICE: curl's `--max-filesize 65536` enforces
+  the 65536-byte limit whenever a Content-Length declares a size, AND a
+  post-download byte count (`wc -c`) enforces the SAME limit on the
+  captured file — a missing or misleading Content-Length cannot bypass
+  the bound;
+* an EMPTY body is rejected; an OVERSIZED body is rejected; a curl
+  transport failure (DNS, connection, TLS, `--max-filesize` abort) is
+  rejected — all classified UNKNOWN;
+* the temporary directory is removed by an EXIT trap on EVERY path
+  (success and failure); no authorization header, token or credential
+  material is echoed to the log.
+
+### 22.2 Exact validation rules
+
+The response is admitted to classification only after: curl exit 0, a
+captured HTTP status, a non-empty body within the 65536-byte limit, and
+a body that parses as a JSON object (`jq -e 'type == "object"'`). Then:
+
+* **HTTP 404 — deletion CONFIRMED (the ONLY success verdict)** if and
+  only if the body matches the exact GitHub API Not Found structure:
+  `.message == "Not Found" and .status == "404"` (the shape verified
+  live against `api.github.com` on 2026-11-24:
+  `{"message":"Not Found","documentation_url":...,"status":"404"}`).
+  Malformed JSON, HTML error pages, empty bodies and unexpected JSON
+  structures NEVER confirm a deletion. The 404 is read with the SAME
+  authenticated repository context (`$GH_TOKEN`/`$REPO`) the
+  pre-deletion identity check used, and only after the release was
+  previously confirmed to exist and to be the exact intended draft
+  (unchanged pre-deletion checks).
+* **HTTP 200 — the release STILL EXISTS (cleanup FAILED)** only when
+  the body is a validated GitHub Release object with: an `id` field
+  whose value equals THIS run's `$DRAFT_RELEASE_ID`, a `tag_name`
+  equal to THIS run's `$TAG`, and a `draft` field of boolean type.
+  An exact draft match is a definitive FAILED classification (operator
+  intervention required) — NOT UNKNOWN, because the release
+  demonstrably still exists. A published object, a mismatched id, a
+  mismatched tag, a missing/invalid `draft` field or any other
+  contradicting object FAILS CLOSED as UNKNOWN (the state contradicts
+  the expected cleanup outcome; nothing about the deletion can be
+  concluded).
+* **EVERYTHING ELSE — UNKNOWN**: HTTP 401, 403, 429, any 5xx, any
+  unexpected status (e.g. 418), curl transport failure, DNS failure,
+  TLS failure, connection failure, `--max-filesize` abort, empty body,
+  oversized body, truncated response, malformed JSON, invalid JSON
+  structure, HTML error response, missing/invalid release fields,
+  mismatched release identity — every response that cannot be
+  authoritatively interpreted. Every UNKNOWN outcome states
+  "OPERATOR INTERVENTION REQUIRED" explicitly and exits non-zero. The
+  workflow NEVER converts uncertainty into a successful deletion
+  verdict.
+
+### 22.3 The seventeenth-round DELETE correction is preserved
+
+The DELETE still falls through on its own failure (`|| echo "draft
+cleanup DELETE reported an error ... is NOT yet established ..."`);
+the validated read-back ALWAYS runs afterwards and is the authoritative
+outcome check. A failed DELETE request is not evidence of successful
+deletion; a successful DELETE response does not replace the read-back.
+A failure of the read-back capture itself (the `set +e` window around
+the curl call) also always reaches classification.
+
+### 22.4 Regression tests (eighteenth round)
+
+`test/publishWorkflow.test.ts` — 38 tests added, all EXECUTING the
+actual cleanup script extracted from the workflow (mock `gh` + mock
+`curl` that now serves status AND body; mocks cannot reach GitHub):
+
+* valid responses: DELETE succeeds + validated 404 → confirmed; DELETE
+  fails + validated 404 → confirmed; DELETE succeeds + validated 200
+  with the exact draft identity → still exists, cleanup FAILED; DELETE
+  fails + validated 200 with the exact draft identity → still exists,
+  cleanup FAILED;
+* 15 malformed/invalid-body cases (404: malformed JSON, empty, HTML,
+  invalid structure, truncated; 200: malformed JSON, empty, HTML,
+  missing id, mismatched id, mismatched tag, missing `draft`, invalid
+  `draft` type, unexpected/published object, truncated) — each
+  classified UNKNOWN, each ALSO repeated with the DELETE call itself
+  failing (30 tests) so no failed-DELETE path terminates before
+  classification;
+* oversized body (70000 bytes > the 65536-byte limit, post-download
+  byte-count enforcement) and a `--max-filesize` abort (exit 63) →
+  UNKNOWN;
+* TLS handshake failure (exit 35) and DNS failure (exit 6) → UNKNOWN
+  (connection failure exit 7, the 401/403/429/500/503/418 statuses and
+  the DELETE-failure combinations were already covered and remain);
+* every UNKNOWN assertion set verifies: non-zero exit, explicit UNKNOWN
+  classification, explicit OPERATOR INTERVENTION REQUIRED, NO
+  successful-deletion message, exactly ONE deletion attempt addressed
+  ONLY to this run's draft release ID, and NO git ref/tag mutation or
+  `gh release` mutation of any kind.
+
+### 22.5 Validation (eighteenth round)
+
+* Focused `test/publishWorkflow.test.ts`: **196 tests, 0 failures**
+  (158 before; 38 added).
+* `pnpm run test:offline`: **519 tests, 0 failures** (481 before; 38
   added).
 * `pnpm run typecheck`, `pnpm run build`, `pnpm run bundle:release-ops`
   (bundle 46,025 bytes; every import a `node:` builtin — pinned by
