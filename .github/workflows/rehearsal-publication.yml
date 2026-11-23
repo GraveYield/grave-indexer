@@ -241,7 +241,12 @@ jobs:
         if: env.SCENARIO == 'partial-upload'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
-          echo "tag=$TAG" >> "$GITHUB_ENV"
+          # FIFTEENTH ROUND (live rehearsal finding): the env var must be
+          # UPPERCASE TAG — later steps reference $TAG, and GITHUB_ENV is
+          # case-sensitive (a lowercase "tag=" write left every
+          # cross-step $TAG reference empty, failing the verification
+          # gate with a usage error on the first live dispatch).
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal partial upload — $TAG" --notes "Rehearsal: partial upload scenario (non-production)."
           PARTIAL_ID=0
@@ -337,7 +342,9 @@ jobs:
         if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
-          echo "tag=$TAG" >> "$GITHUB_ENV"
+          # FIFTEENTH ROUND (live rehearsal finding): uppercase TAG — later
+          # steps reference $TAG; GITHUB_ENV is case-sensitive.
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal ConsoleSnapshot v2 — $TAG" \
             --notes "Rehearsal publication (non-production): immutable versioned release, draft-first sequence, created with --latest=false."
