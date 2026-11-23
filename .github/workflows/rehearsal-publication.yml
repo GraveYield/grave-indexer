@@ -232,23 +232,50 @@ jobs:
       - name: Build a COMPLETE fixture bundle
         if: env.SCENARIO == 'partial-upload' || env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: node --import tsx/esm test/fixturePublicationBundle.ts --out data
-      - name: Create the versioned release and upload ONLY the snapshot asset (partial upload)
+      - name: Create the versioned release as a DRAFT and upload ONLY the snapshot asset (partial upload)
+        # TWELFTH ROUND: the rehearsal mirrors the §8.3 draft-first
+        # sequence. A partial upload is created as a DRAFT — under
+        # GitHub-enforced immutable releases an incomplete asset set
+        # must NEVER reach the immutable published state. The draft belt
+        # below proves the incomplete draft is refused BEFORE publish.
         if: env.SCENARIO == 'partial-upload'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
           echo "tag=$TAG" >> "$GITHUB_ENV"
-          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false \
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal partial upload — $TAG" --notes "Rehearsal: partial upload scenario (non-production)."
-          gh release upload "$TAG" --repo "$REPO" data/console-snapshot.json
-          echo "partial release created: $TAG (snapshot asset only)"
-      - name: Same-release verification MUST FAIL on the partial release
+          PARTIAL_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          case "$PARTIAL_ID" in [1-9]*) ;; *) echo "the partial draft release could not be resolved"; exit 1 ;; esac
+          echo "DRAFT_RELEASE_ID=$PARTIAL_ID" >> "$GITHUB_ENV"
+          gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$PARTIAL_ID/assets?name=console-snapshot.json" \
+            -H "Content-Type: application/octet-stream" --input data/console-snapshot.json > /dev/null
+          echo "partial DRAFT created: $TAG (release id $PARTIAL_ID, snapshot asset only — never published)"
+      - name: The partial DRAFT must FAIL verification and must NEVER be published
         if: env.SCENARIO == 'partial-upload'
         run: |
+          # The draft belt (the production release job's verify step): the
+          # presence check fails — only 1 of the 3 required assets exists.
+          names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          if [ "$names" = "$expected_names" ]; then
+            echo "SAFETY FAILURE: the partial draft unexpectedly carries all three assets"; exit 1
+          fi
+          echo "verified: the draft belt rejects the partial upload (presence check failed on the DRAFT — before any publish)"
+          # Same-release verification ALSO fails on the un-published draft:
+          # the by-tag release endpoint serves published releases only, so
+          # an un-published draft is invisible to the verification path
+          # (fail closed in both layers).
           if node --import tsx/esm src/cli.ts verify-release-assets \
               "$REPO" --tag "$TAG" --scope versioned --expected-tag "$TAG"; then
             echo "SAFETY FAILURE: verification PASSED on a partial release (missing sidecars)"; exit 1
           fi
-          echo "verified: same-release verification rejects the partial release (missing provenance/checksum → non-zero)"
+          echo "verified: same-release verification rejects the partial release (un-published draft: missing provenance/checksum → non-zero)"
+          # And the release must STILL be a draft — never published.
+          still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+          if [ "$still_draft" != "true" ]; then
+            echo "SAFETY FAILURE: the incomplete release was PUBLISHED (draft='$still_draft') — immutable residue created"; exit 1
+          fi
+          echo "verified: the incomplete release remains an un-published DRAFT — no immutable residue exists"
       - name: The dedicated stable reference must be UNCHANGED after the failed publication
         if: env.SCENARIO == 'partial-upload'
         run: |
@@ -266,30 +293,72 @@ jobs:
           node --import tsx/esm src/cli.ts verify-release-assets \
             "$REPO" --tag "$PRIOR" --scope versioned --expected-tag "$PRIOR"
           echo "verified: the previously active release ($PRIOR) is fully retrievable and internally consistent"
-      - name: Cleanup the partial rehearsal release
+      - name: Cleanup the partial rehearsal DRAFT (never published — no tag to clean)
         if: env.SCENARIO == 'partial-upload' && always()
         run: |
-          TAG=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)}catch{console.log('')}")
-          if [ -n "$TAG" ] && gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
-            echo "cleanup: partial rehearsal release $TAG deleted"
+          # The partial release is an un-published DRAFT addressed by ID
+          # (the by-tag endpoint serves published releases only). Deleting
+          # the draft removes its assets; no versioned tag was ever
+          # materialized, so there is nothing to clean up there.
+          if [ -n "${DRAFT_RELEASE_ID:-}" ]; then
+            gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID" && echo "cleanup: partial rehearsal DRAFT $DRAFT_RELEASE_ID deleted"
+          else
+            TAG=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)}catch{console.log('')}")
+            if [ -n "$TAG" ] && gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+              gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+              echo "cleanup: partial rehearsal release $TAG deleted"
+            fi
           fi
           {
-            echo "- outcome: partial upload rejected; the dedicated stable reference is unchanged; the previous artifact remains retrievable"
+            echo "- outcome: partial upload rejected on the DRAFT (never published); the dedicated stable reference is unchanged; the previous artifact remains retrievable"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ── Scenario: happy path — the FULL pointer architecture + rollback drill ─
-      - name: Publish the immutable versioned release (created explicitly NOT latest)
+      - name: Publish the immutable versioned release (DRAFT-FIRST sequence, created explicitly NOT latest)
+        # TWELFTH ROUND: the rehearsal rehearses the DRAFT-FIRST sequence
+        # that docs/SNAPSHOT_PUBLICATION.md §8.3 requires the production
+        # publisher to adopt BEFORE GitHub-enforced immutable releases are
+        # ever enabled — create as a DRAFT, upload all three assets BY
+        # RELEASE ID, verify the draft assets (presence + download-back
+        # digest belt + provenance tag), then publish with draft=false +
+        # make_latest=false. Drafts are addressed by ID because the by-tag
+        # endpoint serves published releases only. Proving this sequence
+        # live here is the pre-enablement evidence §8.3 demands; the
+        # production patch that adopts it is prepared separately.
         if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")
           echo "tag=$TAG" >> "$GITHUB_ENV"
-          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false \
+          gh release create "$TAG" --repo "$REPO" --target "$CHECKOUT_SHA" --latest=false --draft \
             --title "Rehearsal ConsoleSnapshot v2 — $TAG" \
-            --notes "Rehearsal publication (non-production): immutable versioned release, created with --latest=false."
-          gh release upload "$TAG" --repo "$REPO" \
-            data/console-snapshot.json data/console-snapshot-provenance.json data/console-snapshot.sha256
-          echo "versioned release published: $TAG"
+            --notes "Rehearsal publication (non-production): immutable versioned release, draft-first sequence, created with --latest=false."
+          DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          case "$DRAFT_RELEASE_ID" in [1-9]*) ;; *) echo "the rehearsal draft could not be resolved"; exit 1 ;; esac
+          echo "DRAFT_RELEASE_ID=$DRAFT_RELEASE_ID" >> "$GITHUB_ENV"
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID/assets?name=$asset" \
+              -H "Content-Type: application/octet-stream" --input "data/$asset" > /dev/null
+          done
+          names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          if [ "$names" != "$expected_names" ]; then
+            echo "SAFETY FAILURE: the rehearsal draft does not carry exactly the three required assets"; echo "$names"; exit 1
+          fi
+          rm -rf dl && mkdir dl
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            asset_id=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" | jq -r --arg a "$asset" '[.[] | select(.name == $a)][0].id // 0')
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$asset_id" > "dl/$asset"
+          done
+          ( cd dl && sha256sum -c console-snapshot.sha256 )
+          jq -e --arg tag "$TAG" '.versionedTag == $tag' dl/console-snapshot-provenance.json > /dev/null \
+            || { echo "the staged provenance does not name the release tag $TAG"; exit 1; }
+          gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" -F draft=false -f make_latest=false > /dev/null
+          still_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+          published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+          if [ "$still_draft" != "false" ] || [ "$published_tag" != "$TAG" ]; then
+            echo "publish verification FAILED: draft='$still_draft' tag='$published_tag'"; exit 1
+          fi
+          echo "versioned release published (draft-first, --latest=false): $TAG"
       - name: Verify the versioned release's own assets (lengths + SHA-256 digests, same-release cross-check)
         if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |

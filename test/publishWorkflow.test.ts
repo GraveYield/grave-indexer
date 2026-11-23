@@ -484,7 +484,20 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     // delete the ref on first publication).
     const expectedMutations: Array<[string, RegExp]> = [
       ["release", /gh release create "\$TAG"/],
-      ["release", /gh release upload "\$TAG"/],
+      // TWELFTH ROUND (draft-first): the draft upload addresses the release
+      // BY ID through the uploads.github.com asset endpoint (the by-tag
+      // endpoint serves published releases only — drafts are unaddressable
+      // by tag), and the verify-then-publish step runs the draft belt and
+      // PATCHes draft=false + make_latest=false. Both are PAT-bearing
+      // release-mutation steps and are pinned here.
+      ["release", /uploads\.github\.com[\s\S]*draft release created and uploaded/s],
+      ["release", /PATCH "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"[\s\S]*draft assets verified and release published/s],
+      // THIRTEENTH ROUND (draft-first residue bound): the failure-path
+      // draft-cleanup step deletes ONLY this run's verified un-published
+      // draft — a by-ID DELETE, authorized by a read-back that proves
+      // draft==true AND this run's exact tag; published and foreign
+      // releases are never deleted.
+      ["release", /--method DELETE "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"[\s\S]*the un-published draft \$DRAFT_RELEASE_ID \(tag \$TAG\) was deleted/s],
       // SEVENTH ROUND: the activation's ref update is the repository-qualified
       // PATCH; the pattern is anchored on the activation's own completion
       // echo so it cannot also match the rollback step (which now contains
@@ -538,7 +551,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       assert.ok(!("GH_TOKEN" in (job.env ?? {})) && !("GITHUB_TOKEN" in (job.env ?? {})), `${name} must not declare GH_TOKEN/GITHUB_TOKEN at JOB level (it would leak to every step)`);
       assert.ok(!("GY_RELEASE_PAT" in (job.env ?? {})), `${name} must not declare GY_RELEASE_PAT at JOB level (it would leak to every step)`);
     }
-    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release", "rollback"], "exactly five privileged mutation COMMANDS use the PAT: release create, release upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation");
+    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release", "release", "release", "rollback"], "exactly SEVEN privileged PAT-bearing STEP matches (SIX steps; the release create+upload step matches twice): release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation");
   });
 
   test("no workflow-level or job-level env exposes the release credential anywhere", () => {
@@ -559,7 +572,13 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       const value = stepEnv(step)["GH_TOKEN"];
       const run = (step["run"] as string) ?? "";
       if (value === "${{ secrets.GY_RELEASE_PAT }}") {
-        assert.ok(/gh release (create|upload|edit)|git\/(tags|refs)/.test(run), `a GY_RELEASE_PAT step must be a pinned mutation (found: ${run.slice(0, 80)})`);
+        // TWELFTH ROUND: the pinned PAT-bearing step set covers the release
+        // mutations (gh release create, the uploads.github.com draft upload,
+        // the draft-verify + PATCH publish) and the git-data mutations.
+        assert.ok(
+          /gh release (create|upload|edit)|uploads\.github\.com|releases\/\$DRAFT_RELEASE_ID|git\/(tags|refs)/.test(run),
+          `a GY_RELEASE_PAT step must be a pinned mutation (found: ${run.slice(0, 80)})`,
+        );
         patStepCount += 1;
       } else if (value === "${{ github.token }}") {
         assert.ok(!/^\s*gh release (create|upload|edit|delete) /m.test(run), `the automatic token must never drive a release mutation (found: ${run.slice(0, 80)})`);
@@ -568,7 +587,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         assert.fail(`GH_TOKEN env references an unsanctioned credential source: ${String(value)}`);
       }
     }
-    assert.equal(patStepCount, 4, "exactly FOUR steps carry the release-write PAT (release create+upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
+    assert.equal(patStepCount, 6, "exactly SIX steps carry the release-write PAT (release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     assert.ok(automaticTokenStepCount >= 4, "every authenticated query step uses the READ-ONLY automatic token");
   });
 
@@ -581,6 +600,19 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         }
         const run = (step["run"] as string) ?? "";
         const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("verify-stable") || run.includes("verify-snapshot") || run.includes("stable-pointer-build");
+        // TWELFTH ROUND: the release job's DRAFT belt (verify the uploaded
+        // draft assets BEFORE the immutable publish) is the one sanctioned
+        // PAT-bearing verification step — under enforced immutable releases
+        // the byte-level verification MUST happen pre-publish, and a draft
+        // is only readable with push access (the PAT). It is pinned
+        // separately: the belt must run BEFORE the PATCH publish in the
+        // same step, and every OTHER verification step stays PAT-free.
+        const isDraftBelt = isVerification && run.includes("releases/$DRAFT_RELEASE_ID/assets") && run.includes("gh api --method PATCH");
+        if (isDraftBelt) {
+          assert.ok(run.indexOf("sha256sum -c") < run.indexOf("gh api --method PATCH"), "the draft belt runs BEFORE the publish PATCH (verify-before-publish ordering)");
+          assert.ok(stepEnv(step)["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}", "the draft belt is the release job's PAT step (a draft is only readable with push access)");
+          continue;
+        }
         if (isVerification) {
           // No job is write-capable anymore; the check pins that custom
           // verification code never runs where a write grant exists AND
@@ -628,9 +660,12 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
   const allJobs = Object.entries(wf.jobs);
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
-  test("the PAT appears ONLY inside the step-level env of the four mutation steps", () => {
+  test("the PAT appears ONLY inside the step-level env of the six draft-first mutation steps", () => {
     // Every literal occurrence of the secret reference in the file must be
-    // either a comment mention or one of the four sanctioned step env values.
+    // either a comment mention or one of the six sanctioned step env values
+    // (TWELFTH ROUND: the draft-first sequence splits the former single
+    // create+upload step into create+upload and verify+publish; THIRTEENTH
+    // ROUND: the failure-path draft-cleanup step is the sixth).
     let envOccurrences = 0;
     for (const [, job] of allJobs) {
       for (const step of job.steps) {
@@ -638,10 +673,10 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         if (env["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}") envOccurrences += 1;
       }
     }
-    assert.equal(envOccurrences, 4, "exactly FOUR step env blocks reference the PAT (release create+upload, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
+    assert.equal(envOccurrences, 6, "exactly SIX step env blocks reference the PAT (release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     // The remaining occurrences must be comments only.
     const stripped = raw.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
-    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 4, "outside comments, the PAT reference appears ONLY in the four sanctioned step env values");
+    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 6, "outside comments, the PAT reference appears ONLY in the six sanctioned step env values");
   });
 
   test("no build, test, generation, verification, artifact, checkout or dependency step receives the PAT in any form", () => {
@@ -654,7 +689,7 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         if (!carriesPat) continue;
         // The ONLY PAT-bearing steps are the pinned mutations: the gh
         // release mutations and the dedicated-ref gh api mutations.
-        assert.ok(/gh release (create|upload|edit)|git\/(tags|refs)/.test(run), `${name}: a PAT-bearing step must be a pinned mutation`);
+        assert.ok(/gh release (create|upload|edit)|uploads\.github\.com|releases\/\$DRAFT_RELEASE_ID|git\/(tags|refs)/.test(run), `${name}: a PAT-bearing step must be a pinned mutation`);
         assert.ok(!uses, `a PAT-bearing step must not be an action (${uses})`);
         assert.ok(!/node|pnpm|npm|npx|\.mjs|checkout|tsx/.test(run), `a PAT-bearing step must not execute custom code or dependencies`);
       }
@@ -759,8 +794,11 @@ describe("publish-console-snapshot workflow — same-release verification (revie
 
   test("verification and promotion run in the required order ACROSS JOBS", () => {
     const relRuns = runBlocks(release);
-    const uploadIdx = relRuns.findIndex((r) => r.includes("gh release upload"));
-    assert.ok(uploadIdx > -1, "the release job uploads the assets");
+    const uploadIdx = relRuns.findIndex((r) => r.includes("uploads.github.com"));
+    assert.ok(uploadIdx > -1, "the release job uploads the assets (draft-first: uploads.github.com asset endpoint by release ID)");
+    const publishIdx = relRuns.findIndex((r) => r.includes("draft assets verified and release published"));
+    assert.ok(publishIdx > -1, "the release job publishes the verified draft");
+    assert.ok(publishIdx > uploadIdx, "publish follows upload (draft-first ordering)");
     // The roundtrip verification is a SEPARATE job that needs `release`,
     // and promotion is a job that needs the roundtrip verification.
     assert.equal(verifyVersioned.needs?.includes("release"), true, "same-release verification follows upload (job boundary)");
@@ -956,8 +994,13 @@ describe("publish-console-snapshot workflow — dedicated stable reference (owne
   test("the workflow NEVER depends on the repo-wide latest designation anywhere in its execution path", () => {
     assert.ok(!stripped.includes("releases/latest"), "no releases/latest URL appears outside comments");
     assert.ok(!stripped.includes("gh release edit"), "no latest-release promotion command exists");
-    assert.ok(!stripped.includes("make_latest"), "no make_latest designation operation exists");
-    assert.ok(!stripped.includes("--latest ") && !/\--latest$/.test(stripped), "--latest appears only as --latest=false");
+    // TWELFTH ROUND: the draft-first publish pins the designation OFF with
+    // an explicit make_latest=false — the ONLY permitted form. Any
+    // promotion form (true / legacy / a gh release edit --latest) stays
+    // forbidden.
+    assert.ok(!stripped.includes("make_latest=true") && !stripped.includes("make_latest=legacy") && !stripped.includes("--latest\n"), "no make_latest promotion exists (only make_latest=false pins the designation off)");
+    assert.ok(!stripped.includes("gh release edit"), "no latest-release promotion command exists (re-check after draft-first)");
+    assert.ok(!/--latest(?!-latest=)/.test(stripped.replace(/--latest=false/g, "")), "--latest appears only as --latest=false");
     assert.match(stripped, /--latest=false/, "versioned releases are still explicitly NOT latest");
   });
 
@@ -1133,7 +1176,12 @@ describe("publish-console-snapshot workflow — repository-qualified endpoints a
     for (const line of mutationLines) {
       const endpoint = line.match(/gh api\s+(?:--method|-X)\s+(?:POST|PATCH|DELETE)\s+"([^"]+)"/)?.[1];
       assert.ok(endpoint, `every mutation command quotes its endpoint: ${line.trim()}`);
-      assert.match(endpoint!, /^repos\//, `every mutation endpoint is repository-qualified (got "${endpoint}"): ${line.trim()}`);
+      // TWELFTH ROUND: endpoints must be HOST-qualified — either the
+      // repository-qualified repos/ path (git data, release records) or a
+      // full https:// api.github.com / uploads.github.com URL (the
+      // draft-first asset upload). A BARE ref or bare path remains
+      // forbidden — that is the original defect this test pins.
+      assert.match(endpoint!, /^(repos\/|https:\/\/(api|uploads)\.github\.com\/)/, `every mutation endpoint is repository- or host-qualified (got "${endpoint}"): ${line.trim()}`);
     }
     assert.ok(!allRuns.includes('gh api --method PATCH "$STABLE_REF"'), "no bare-$STABLE_REF PATCH endpoint anywhere");
     assert.ok(!allRuns.includes('gh api --method DELETE "$STABLE_REF"'), "no bare-$STABLE_REF DELETE endpoint anywhere");
@@ -2200,5 +2248,273 @@ describe("publish-console-snapshot workflow — downstream rollback SHA-format v
     assert.deepEqual(res.ghCalls, [], "NO mutation is invoked from an unreadable remote state");
     assert.match(res.stdout, /unexpected HTTP/, "the failed lookup is reported as an unexpected state");
     assert.match(res.summary, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+});
+
+// ─── Twelfth round — draft-first immutable-release readiness ─────────────────
+//
+// The GitHub-enforced immutable-release status of the production repository
+// is UNKNOWN (the authorized endpoint requires authentication; unauthorized
+// calls return 401/403, which cannot distinguish "disabled" from "not
+// visible"). The publication sequence must therefore be compatible with the
+// feature ENABLED: assets can never be added to an already PUBLISHED release
+// under enforcement, so the publisher now creates the versioned release as a
+// DRAFT, uploads the assets BY RELEASE ID (the by-tag endpoint serves
+// published releases only — GitHub REST, verified 2026-11-23), verifies the
+// draft assets (presence + byte lengths + download-back digest belt +
+// provenance tag), and only then publishes (PATCH draft=false,
+// make_latest=false) — after which the read-only verify-versioned job still
+// gates the pointer activation (needs: chain). These pins hold the sequence
+// in place; they are workflow-text pins, NOT a substitute for the live
+// rehearsal (docs/PUBLICATION_REHEARSAL.md).
+describe("publish-console-snapshot workflow — draft-first immutable-release readiness (twelfth round)", () => {
+  const wf = loadWorkflow();
+  const release = wf.jobs["release"]!;
+  const runs = runBlocks(release).join("\n");
+  const steps = release.steps.filter((s) => typeof s["run"] === "string") as Array<Record<string, string>>;
+
+  test("the versioned release is created as a DRAFT with --latest=false and --target pinned to the asserted commit", () => {
+    assert.match(runs, /gh release create "\$TAG"/, "the release job creates the release");
+    assert.match(runs, /--draft/, "the release is created as a DRAFT");
+    assert.match(runs, /--latest=false/, "explicitly NOT latest");
+    assert.match(runs, /--target "\$CHECKOUT_SHA"/, "at the pinned commit");
+  });
+
+  test("draft assets are uploaded BY RELEASE ID through the uploads.github.com endpoint (never by tag)", () => {
+    assert.match(runs, /DRAFT_RELEASE_ID=\$\(gh api "repos\/\$REPO\/releases"/, "the draft's release id is resolved from the release LIST endpoint");
+    assert.match(runs, /jq -r --arg tag "\$TAG" '\[\.\[\] \| select\(\.tag_name == \$tag and \.draft == true\)\]\[0\]\.id \/\/ 0'/, "the id resolution requires the release to be a DRAFT matching the tag");
+    assert.match(runs, /case "\$DRAFT_RELEASE_ID" in[\s\S]*refusing to upload/, "an unresolvable draft id fails closed before any upload");
+    assert.match(runs, /uploads\.github\.com\/repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID\/assets\?name=/, "assets are uploaded by release id, not by tag");
+    assert.ok(!runs.includes("gh release upload"), "the by-tag upload command is gone (it cannot address a draft)");
+  });
+
+  test("the draft belt verifies presence, byte lengths, digests and provenance BEFORE publishing", () => {
+    const beltIdx = runs.indexOf("draft asset presence check FAILED");
+    const publishIdx = runs.indexOf("gh api --method PATCH \"repos/$REPO/releases/$DRAFT_RELEASE_ID\"");
+    assert.ok(beltIdx > -1 && publishIdx > -1 && beltIdx < publishIdx, "the draft belt runs before the publish PATCH inside the release job");
+    assert.match(runs, /expected_names=\$\(printf 'console-snapshot\.json\\nconsole-snapshot-provenance\.json\\nconsole-snapshot\.sha256'\)/, "exactly the three required assets are required");
+    assert.match(runs, /Accept: application\/octet-stream" "repos\/\$REPO\/releases\/assets\/\$asset_id"/, "the assets are downloaded BACK from the draft by asset id");
+    assert.match(runs, /sha256sum -c console-snapshot\.sha256/, "the checksum belt runs over the exact uploaded bytes");
+    assert.match(runs, /jq -e --arg tag "\$TAG" '\.versionedTag == \$tag' dl\/console-snapshot-provenance\.json/, "the provenance must name the release tag before publishing");
+    assert.match(runs, /uploaded_size.*vs local/, "recorded asset sizes must match the local bytes");
+  });
+
+  test("the publish step is explicit: PATCH draft=false + make_latest=false, then verified by read-back", () => {
+    assert.match(runs, /-F draft=false[\s\S]*-f make_latest=false/s, "publish is draft=false with the latest designation explicitly pinned OFF");
+    assert.match(runs, /publish verification FAILED/, "the published state is read back (draft flag + tag identity) and a mismatch fails the run");
+    assert.ok(!runs.includes("make_latest=true") && !runs.includes("make_latest=legacy"), "the publish never promotes the repo-wide latest designation");
+  });
+
+  test("the downstream verification and activation ordering is unchanged: release → verify-versioned → promote", () => {
+    const verifyVersioned = wf.jobs["verify-versioned"]!;
+    const promote = wf.jobs["promote"]!;
+    assert.equal(verifyVersioned.needs?.includes("release"), true, "the read-only same-release verification still follows the release job");
+    assert.equal(promote.needs?.includes("verify-versioned"), true, "pointer activation is still gated on the published-release verification");
+    assert.match(runBlocks(promote).join("\n"), /git\/tags[\s\S]*git\/refs/s, "the activation still creates the annotated pointer tag object and moves the ref");
+  });
+
+  test("the rehearsal mirrors the draft-first sequence (parity with production)", () => {
+    const rawRehearsal = readFileSync(".github/workflows/rehearsal-publication.yml", "utf8");
+    const strippedRehearsal = rawRehearsal.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
+    assert.match(strippedRehearsal, /--draft/, "the rehearsal creates versioned releases as DRAFTS like production");
+    assert.match(strippedRehearsal, /uploads\.github\.com\/repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID\/assets/, "the rehearsal uploads assets by release id like production");
+    assert.match(strippedRehearsal, /-F draft=false -f make_latest=false/, "the rehearsal publishes with draft=false + make_latest=false like production");
+    assert.match(strippedRehearsal, /the incomplete release remains an un-published DRAFT/, "the partial-upload scenario proves an incomplete draft is NEVER published");
+    assert.match(strippedRehearsal, /SAFETY FAILURE: the incomplete release was PUBLISHED/, "publishing an incomplete asset set fails the rehearsal loudly");
+  });
+});
+
+// ─── Thirteenth round — failure-path draft cleanup ───────────────────────────
+//
+// The task-required residue bound: a failed publication run must not leave
+// an orphaned draft behind. The failure-path cleanup step deletes ONLY the
+// draft of THIS run, and ONLY after a release-by-ID read-back proves BOTH
+// that the release is still a draft AND that it carries this run's exact
+// tag. These tests EXECUTE the actual cleanup script extracted from the
+// workflow against a stateful mock `gh` binary — so the deletion
+// authorization logic (and every refusal path) is proven against the real
+// workflow script, not against a transcription of it.
+describe("publish-console-snapshot workflow — failure-path draft cleanup (thirteenth round)", () => {
+  const TAG = "console-snapshot-prod-20260101T000000Z-" + "c".repeat(40);
+  const FOREIGN_TAG = "console-snapshot-prod-20251231T000000Z-" + "d".repeat(40);
+  const DRAFT_ID = "1234567";
+
+  const wf = loadWorkflow();
+  const release = wf.jobs["release"]!;
+  const cleanupStep = release.steps.find((s) => s["id"] === "draft-cleanup")!;
+  const cleanupRun = cleanupStep["run"] as string;
+
+  // Mock gh: stateful — a state file represents the draft's existence on
+  // the server. `--method DELETE` removes it (and is recorded); a GET
+  // against an existing state serves the canned JSON (through real jq when
+  // --jq is passed); a GET against a missing state fails with "Not Found"
+  // exactly like gh api does for an absent release. It cannot reach GitHub.
+  const mockGh = [
+    "#!/usr/bin/env bash",
+    "# test-harness mock: stateful gh api against a canned draft",
+    'log="$MOCK_GH_LOG"; state="$MOCK_STATE_FILE"',
+    'printf \'%s\\n\' "gh $*" >> "$log"',
+    '[ "$1" = "api" ] || exit 0',
+    'method=""; prev=""',
+    'for a in "$@"; do if [ "$prev" = "--method" ]; then method="$a"; fi; prev="$a"; done',
+    'if [ "$method" = "DELETE" ]; then rm -f "$state"; exit 0; fi',
+    'prev=""',
+    'list=""',
+    'for a in "$@"; do',
+    '  case "$a" in */releases) list="$a" ;; esac',
+    '  prev="$a"',
+    'done',
+    'url=""',
+    'for a in "$@"; do case "$a" in repos/*) url="$a" ;; esac; done',
+    'if [ -n "$url" ] && [ "${url##*/}" = "releases" ]; then',
+    '  printf \'%s\\n\' "${MOCK_LIST_BODY:-[]}"',
+    '  exit 0',
+    'fi',
+    'if [ -f "$state" ]; then',
+    '  body=$(cat "$state")',
+    '  jqexpr=""; prev=""',
+    '  for a in "$@"; do if [ "$prev" = "--jq" ]; then jqexpr="$a"; fi; prev="$a"; done',
+    '  if [ -n "$jqexpr" ]; then printf \'%s\' "$body" | jq -r "$jqexpr"; else printf \'%s\\n\' "$body"; fi',
+    '  exit 0',
+    'fi',
+    'printf \'Not Found\\n\' >&2',
+    'exit 1',
+  ].join("\n");
+
+  interface CleanupResult {
+    status: number;
+    stdout: string;
+    ghCalls: string[];
+    deleted: boolean; // whether a --method DELETE was invoked at all
+  }
+
+  function runCleanup(env: Record<string, string>): CleanupResult {
+    const dir = mkdtempSync(join(tmpdir(), "wf-draftcleanup-sim-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "gh"), mockGh, { mode: 0o755 });
+    const ghLogPath = join(dir, "gh.log");
+    const statePath = join(dir, "draft-state.json");
+    writeFileSync(ghLogPath, "");
+    if (env.MOCK_DRAFT_BODY) writeFileSync(statePath, env.MOCK_DRAFT_BODY);
+    const scriptPath = join(dir, "step.sh");
+    writeFileSync(scriptPath, cleanupRun);
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", scriptPath], {
+        encoding: "utf8",
+        cwd: dir,
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          HOME: process.env.HOME ?? dir,
+          MOCK_GH_LOG: ghLogPath,
+          MOCK_STATE_FILE: statePath,
+          ...env,
+        },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stdout?: string };
+      status = e.status ?? 1;
+      stdout = String(e.stdout ?? "");
+    }
+    const ghCalls = readFileSync(ghLogPath, "utf8").split("\n").filter((l) => l.startsWith("gh "));
+    const result: CleanupResult = {
+      status,
+      stdout,
+      ghCalls,
+      deleted: ghCalls.some((l) => l.includes("--method DELETE")),
+    };
+    rmSync(dir, { recursive: true, force: true });
+    return result;
+  }
+
+  const draftBody = (draft: boolean, tag: string) => JSON.stringify({ id: Number(DRAFT_ID), draft, tag_name: tag });
+
+  function baseEnv(overrides: Record<string, string>): Record<string, string> {
+    return {
+      REPO: "GraveYield/grave-indexer",
+      TAG,
+      DRAFT_RELEASE_ID: DRAFT_ID,
+      MOCK_DRAFT_BODY: draftBody(true, TAG),
+      ...overrides,
+    };
+  }
+
+  // ── structural pins ──
+  test("the cleanup step exists behind `if: failure()`, carries the step-scoped PAT, and runs AFTER the verify+publish step", () => {
+    assert.ok(cleanupStep, "the draft-cleanup step exists in the release job");
+    assert.equal(cleanupStep["if"], "failure()", "the cleanup runs ONLY on job failure");
+    assert.equal(((cleanupStep["env"] ?? {}) as Record<string, string>)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the cleanup carries the PAT as step-level env (deleting a draft requires push access)");
+    const stepsWithRun = release.steps.filter((s) => typeof s["run"] === "string");
+    const publishIdx = stepsWithRun.findIndex((s) => (s["run"] as string).includes("draft assets verified and release published"));
+    const cleanupIdx = stepsWithRun.indexOf(cleanupStep as unknown as Record<string, string>);
+    assert.ok(publishIdx > -1 && cleanupIdx > publishIdx, "the cleanup step is positioned after the publish step");
+  });
+
+  test("the cleanup deletes ONLY after a by-ID read-back proves draft==true AND this run's exact tag", () => {
+    assert.match(cleanupRun, /draft_state=\$\(gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"/, "the draft state is read back BY ID before any deletion");
+    assert.match(cleanupRun, /is_draft=\$\(printf '%s' "\$draft_state" \| jq -r '\.draft'\)/, "the draft flag is checked from the read-back");
+    assert.match(cleanupRun, /draft_tag=\$\(printf '%s' "\$draft_state" \| jq -r '\.tag'\)/, "the tag is checked from the read-back");
+    const verifyIdx = cleanupRun.indexOf('if [ "$is_draft" != "true" ]');
+    const deleteIdx = cleanupRun.indexOf("--method DELETE");
+    assert.ok(verifyIdx > -1 && deleteIdx > -1 && verifyIdx < deleteIdx, "the draft-flag verification precedes the DELETE");
+    assert.match(cleanupRun, /refusing to delete a foreign release/, "a tag mismatch refuses the deletion");
+    assert.match(cleanupRun, /a published release is NEVER deleted/, "a published release is never deleted");
+  });
+
+  // ── executed behavior ──
+  test("happy cleanup: the verified draft of this run is deleted and the deletion is proven by read-back", () => {
+    const res = runCleanup(baseEnv({}));
+    assert.equal(res.status, 0, "the cleanup succeeds");
+    assert.equal(res.deleted, true, "the DELETE is invoked");
+    const deletes = res.ghCalls.filter((l) => l.includes("--method DELETE"));
+    assert.equal(deletes.length, 1, "exactly ONE deletion is issued (against the mock, never GitHub)");
+    assert.match(deletes[0]!, /releases\/1234567/, "the deletion addresses the release BY ID");
+    assert.match(res.stdout, /verified: the un-published draft 1234567/, "the deletion is proven by read-back (the mock now serves 404)");
+  });
+
+  test("a PUBLISHED release (draft=false at read-back) is NEVER deleted — operator intervention is required", () => {
+    const res = runCleanup(baseEnv({ MOCK_DRAFT_BODY: draftBody(false, TAG) }));
+    assert.notEqual(res.status, 0, "the cleanup refuses");
+    assert.equal(res.deleted, false, "NO deletion is invoked against a published release");
+    assert.match(res.stdout, /a published release is NEVER deleted/, "the refusal is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  test("a FOREIGN tag at read-back refuses the deletion", () => {
+    const res = runCleanup(baseEnv({ MOCK_DRAFT_BODY: draftBody(true, FOREIGN_TAG) }));
+    assert.notEqual(res.status, 0, "the cleanup refuses a foreign tag");
+    assert.equal(res.deleted, false, "NO deletion is invoked against a foreign release");
+    assert.match(res.stdout, /refusing to delete a foreign release/, "the refusal is explicit");
+  });
+
+  test("an UNREADABLE release at read-back refuses the deletion (nothing unverifiable is deleted)", () => {
+    const res = runCleanup(baseEnv({ MOCK_DRAFT_BODY: "" })); // no state file → the by-ID GET fails
+    assert.notEqual(res.status, 0, "the cleanup refuses an unreadable release");
+    assert.equal(res.deleted, false, "NO deletion is invoked when the release cannot be verified");
+    assert.match(res.stdout, /refusing to delete an unverifiable release/, "the refusal is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+  });
+
+  test("no captured draft id AND no matching draft in the list → exit 0, zero deletions (failure happened before the draft existed)", () => {
+    const res = runCleanup(baseEnv({ DRAFT_RELEASE_ID: "", MOCK_DRAFT_BODY: "", MOCK_LIST_BODY: "[]" }));
+    assert.equal(res.status, 0, "nothing to clean up is a clean outcome");
+    assert.equal(res.deleted, false, "NO deletion is issued");
+    assert.match(res.stdout, /nothing to clean up/, "the outcome is explicit");
+  });
+
+  test("no captured draft id BUT the list holds this run's draft → the fallback resolves, verifies and deletes it", () => {
+    const res = runCleanup(baseEnv({ DRAFT_RELEASE_ID: "", MOCK_DRAFT_BODY: draftBody(true, TAG), MOCK_LIST_BODY: `[{"id": ${DRAFT_ID}, "draft": true, "tag_name": "${TAG}"}]` }));
+    assert.equal(res.status, 0, "the fallback completes the cleanup");
+    assert.equal(res.deleted, true, "the resolved draft is deleted");
+    assert.match(res.stdout, /verified: the un-published draft 1234567/, "the deletion is proven by read-back");
+  });
+
+  test("an unusable captured draft id fails closed without deletion", () => {
+    const res = runCleanup(baseEnv({ DRAFT_RELEASE_ID: "not-a-number" }));
+    assert.notEqual(res.status, 0, "an unusable id refuses");
+    assert.equal(res.deleted, false, "NO deletion is issued");
+    assert.match(res.stdout, /refusing to delete anything/, "the refusal is explicit");
   });
 });

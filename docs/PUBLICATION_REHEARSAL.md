@@ -131,10 +131,13 @@ fail, verified live:
    is the FIRST step, before checkout and any write; the rehearsal uses
    only its repository-scoped `github.token`; no production secret is
    referenced; the rehearsal exercises the §8.3 draft-first sequence
-   (twelfth round) — the production publisher itself is deliberately
-   UNCHANGED while enforcement status is UNKNOWN, with the validated
-   production patch recorded for the owner (docs/SNAPSHOT_PUBLICATION.md
-   §8.3, §16).
+   (twelfth round) — which as of the thirteenth round is ALSO the
+   production publisher's implemented sequence on this branch
+   (docs/SNAPSHOT_PUBLICATION.md §8.3, §17): the rehearsal and
+   production now both create the versioned release as a DRAFT, verify
+   the assets on the DRAFT, publish by release ID with
+   `make_latest=false`, and gate the pointer activation on the
+   read-only verification.
 
 Per the task's authorization boundary, dispatch was therefore skipped
 and the exact prerequisites are reported instead. Dispatching from this

@@ -283,21 +283,32 @@ name: publish-console-snapshot
 # EXPLICITLY at job level: the automatic GITHUB_TOKEN is READ-ONLY in
 # every job of this workflow, and no job-level grant can elevate it.
 # The ONLY write-capable credential is the `GY_RELEASE_PAT` secret on
-# the two trusted release-mutation steps (step-level env only). An
+# the six trusted release-mutation steps (step-level env only): the
+# release job's draft create+upload step, its draft verify+publish step,
+# its failure-path draft-cleanup step, the promote job's stable-ref
+# activation step, the promote job's failure-path rollback step, and the
+# dedicated rollback job's single ref-mutation step. An
 # untrusted pull_request context cannot reach any step:
 # workflow_dispatch is the only trigger, all eight jobs are gated to
 # refs/heads/main, and the workflow-level default is read-only.
 #
-# RELEASE PROTECTION MODEL (review Task 3): VERIFIED repository
-# settings show NO tag-protection ruleset and no verifiable
-# GitHub-enforced immutable-releases configuration (as of 2026-11-21).
-# Immutability is therefore a WORKFLOW-LEVEL convention here, honestly
-# documented: releases are created with --latest=false, assets are
-# never re-uploaded or deleted, `--clobber` is never used, and any tag
-# or release collision fails closed. Enabling GitHub's immutable
-# releases feature is an owner decision that would additionally require
-# a draft-first sequence change (documented in
-# docs/SNAPSHOT_PUBLICATION.md §8) BEFORE it is switched on.
+# RELEASE PROTECTION MODEL (review Task 3; TWELFTH-ROUND CORRECTION):
+# GitHub-enforced immutable-release status is UNKNOWN — the authorized
+# endpoint (GET /repos/<owner>/<repo>/immutable-releases) requires
+# authentication (unauthenticated calls return 401/403), and no
+# authorized endpoint result has been obtained; an unauthenticated or
+# under-privileged observation CANNOT distinguish "disabled" from "not
+# visible". Immutability is therefore a WORKFLOW-LEVEL convention here,
+# honestly documented: releases are created with --latest=false, assets
+# are never re-uploaded or deleted, `--clobber` is never used, and any
+# tag or release collision fails closed. The publisher is nonetheless
+# PREPARED for enforcement: the release job now runs the DRAFT-FIRST
+# sequence (create draft → upload → verify draft assets → publish with
+# make_latest=false → read-only verification → pointer activation), which
+# is compatible with the feature enabled AND disabled. Enabling it
+# remains an owner decision (docs/SNAPSHOT_PUBLICATION.md §8); the
+# publish-time latest-designation behavior should still be re-verified on
+# the rehearsal target first.
 
 on:
   workflow_dispatch:
@@ -722,19 +733,51 @@ jobs:
             200) echo "versioned tag $TAG already exists — historical versioned releases are immutable; aborting (stable reference untouched)"; exit 1 ;;
             *) echo "tag-collision gate FAILED (unexpected HTTP $code); refusing to treat this as 'tag absent'"; exit 1 ;;
           esac
-      - name: Publish the immutable versioned release (explicitly NOT latest)
-        # `--latest=false` pins the stable pointer: the release must NOT
-        # become the stable reference on creation. Assets are uploaded in
-        # a separate command (required for --latest=false to hold).
-        # Release creation (422 on any collision) and upload failures
-        # abort the run BEFORE activation — the previous release keeps
-        # serving the stable URL throughout.
+      - name: Create the versioned release as a DRAFT and upload all three assets (immutable-release-compatible draft-first sequence)
+        # TWELFTH-ROUND CORRECTION (immutable-release readiness): the
+        # former sequence created a PUBLISHED empty release and then
+        # uploaded assets to it. That is incompatible with GitHub-enforced
+        # immutable releases — under that feature, assets cannot be added
+        # to an already published release, so the upload step would fail
+        # and strand the run AFTER a release already exists. The sequence
+        # is therefore DRAFT-FIRST (the exact order docs/SNAPSHOT_PUBLICATION.md
+        # §8.3 requires before the feature is ever enabled):
+        #   1. create the versioned release as a DRAFT (--latest=false —
+        #      drafts are excluded from the repo-wide latest designation
+        #      anyway, and the flag pins the intent for the publish step);
+        #   2. upload ALL THREE assets to the draft;
+        #   3. verify the draft assets (presence, byte lengths, SHA-256
+        #     digests, provenance tag) — the next step;
+        #   4. publish (PATCH draft=false, make_latest=false — explicit,
+        #     never the repo-wide latest designation);
+        #   5. the read-only verify-versioned job then re-verifies the
+        #     PUBLISHED release end-to-end (schema + completeness over the
+        #     fetched bytes) BEFORE the pointer may activate (needs: gate);
+        #   6. only then the promote job activates the dedicated stable
+        #     reference (unchanged), followed by read-back verification.
+        #   7. if any step of this job FAILED, the failure-path cleanup
+        #     step deletes ONLY the verified un-published draft of THIS
+        #     run (draft==true AND tag match proven by read-back before
+        #     deletion) — a published release or a foreign release is
+        #     never deleted.
+        #
+        # DRAFT ADDRESSING FACT (GitHub REST, verified 2026-11-23):
+        # "Get a release by tag name" serves PUBLISHED releases only, and
+        # draft listings are visible only to push-access users — so every
+        # draft operation here addresses the release BY ID (captured from
+        # the list endpoint), never by tag. The read-only verify-versioned
+        # job intentionally runs AFTER publish for this reason.
+        #
+        # `--latest=false` still pins the stable pointer: the release must
+        # NOT become the stable reference. Failures at ANY step abort the
+        # run BEFORE activation — the previous release keeps serving, and
+        # an orphaned DRAFT (never published) is the maximum residue.
         # THE write-capable credential exists ONLY here: the dedicated
         # fine-grained `GY_RELEASE_PAT` repository secret, scoped to
         # THIS step's env. The automatic GITHUB_TOKEN is read-only and
-        # is NOT used for the mutation. The PAT reaches only this pinned
-        # gh CLI invocation — never node, never a script, never an
-        # action, never a downloaded artifact.
+        # is NOT used for the mutation. The PAT reaches only these pinned
+        # gh invocations — never node, never a script, never an action,
+        # never a downloaded artifact.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
           GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # dedicated release-write credential, scoped to this step only
@@ -743,13 +786,139 @@ jobs:
             --repo "$REPO" \
             --target "$CHECKOUT_SHA" \
             --latest=false \
+            --draft \
             --title "ConsoleSnapshot v2 — $TAG" \
             --notes "Schema-v2 console snapshot (M1 WSOL quote-side sourcing). Immutable versioned publication: generation timestamp + source commit are encoded in the tag. Assets: console-snapshot.json, console-snapshot-provenance.json, console-snapshot.sha256. This release becomes the stable production artifact only after its assets are verified through the authenticated path and the dedicated console-snapshot-prod stable reference is atomically moved to its pointer."
-          gh release upload "$TAG" \
-            --repo "$REPO" \
-            bundle/console-snapshot.json \
-            bundle/console-snapshot-provenance.json \
-            bundle/console-snapshot.sha256
+          # Drafts are NOT addressable through the by-tag endpoint (it
+          # serves published releases only) — resolve the draft's release
+          # ID from the list endpoint. The tag is strictly shape-validated
+          # two steps above, so the jq selection is over a pinned value.
+          DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+          case "$DRAFT_RELEASE_ID" in
+            0|'') echo "the draft release could not be resolved from the release list; refusing to upload"; exit 1 ;;
+            [1-9]*) ;;
+            *) echo "unexpected release id: $DRAFT_RELEASE_ID"; exit 1 ;;
+          esac
+          draft_flag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+          if [ "$draft_flag" != "true" ]; then echo "release $DRAFT_RELEASE_ID is not a draft (got: $draft_flag); aborting"; exit 1; fi
+          echo "DRAFT_RELEASE_ID=$DRAFT_RELEASE_ID" >> "$GITHUB_ENV"
+          # Upload each asset to the DRAFT through the uploads.github.com
+          # asset endpoint (by release ID). The recorded `size` metadata of
+          # each uploaded asset must equal the local file's byte length.
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            gh api --method POST "https://uploads.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID/assets?name=$asset" -H "Content-Type: application/octet-stream" --input "bundle/$asset" > /dev/null
+            uploaded_size=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" | jq -r --arg a "$asset" '[.[] | select(.name == $a)][0].size // 0')
+            local_size=$(stat -c%s "bundle/$asset")
+            if [ "$uploaded_size" != "$local_size" ] || [ "$local_size" = "0" ]; then
+              echo "asset '$asset' upload verification FAILED: recorded size '$uploaded_size' vs local '$local_size'"; exit 1
+            fi
+          done
+          echo "draft release created and uploaded: $TAG (release id $DRAFT_RELEASE_ID)"
+
+      - name: Verify the DRAFT assets (digests + provenance), then publish the release
+        # The reviewer-required verify-BEFORE-publish gate: under GitHub-
+        # enforced immutable releases, a published release's assets are
+        # locked — so the byte-level verification must happen on the DRAFT,
+        # before the publish makes the asset set immutable. The FULL
+        # schema-v2 + completeness verification over fetched bytes remains
+        # with the read-only verify-versioned job AFTER publish (a
+        # read-only token cannot see drafts) and BEFORE pointer activation
+        # (needs: gate) — the safety property is unchanged: the stable
+        # reference can never move until the published release verified.
+        # Failures here abort BEFORE publish: the release stays an
+        # un-published draft (no immutable residue), the stable reference
+        # is untouched, and the previous artifact keeps serving.
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # required to READ the draft (draft listings are push-access-only)
+        run: |
+          # Presence: exactly the three required assets, no fewer.
+          names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
+          expected_names=$(printf 'console-snapshot.json\nconsole-snapshot-provenance.json\nconsole-snapshot.sha256')
+          if [ "$names" != "$expected_names" ]; then
+            echo "draft asset presence check FAILED — assets on the draft:"; echo "$names"; exit 1
+          fi
+          # Download the three assets BACK from the draft (by asset ID,
+          # octet-stream) and re-run the checksum belt over the exact
+          # uploaded bytes — the same belt the release job already ran
+          # over its staged bundle, now over what GitHub actually holds.
+          rm -rf dl && mkdir dl
+          for asset in console-snapshot.json console-snapshot-provenance.json console-snapshot.sha256; do
+            asset_id=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" | jq -r --arg a "$asset" '[.[] | select(.name == $a)][0].id // 0')
+            case "$asset_id" in [1-9]*) ;; *) echo "asset '$asset' has no usable id on the draft"; exit 1 ;; esac
+            gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$asset_id" > "dl/$asset"
+          done
+          ( cd dl && sha256sum -c console-snapshot.sha256 )
+          # Provenance must name THIS exact release tag (a cross-release or
+          # foreign sidecar can never pass).
+          if ! jq -e --arg tag "$TAG" '.versionedTag == $tag' dl/console-snapshot-provenance.json > /dev/null; then
+            echo "the staged provenance does not name the release tag $TAG — refusing to publish"; exit 1
+          fi
+          # Publish: draft=false + make_latest=false (explicit STRING — the
+          # API models make_latest as true/false/legacy). The publish
+          # materializes the versioned tag at $CHECKOUT_SHA; a racing
+          # duplicate tag fails closed here (422), before activation.
+          gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" \
+            -F draft=false \
+            -f make_latest=false > /dev/null
+          published_draft=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.draft')
+          published_tag=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '.tag_name')
+          if [ "$published_draft" != "false" ] || [ "$published_tag" != "$TAG" ]; then
+            echo "publish verification FAILED: draft='$published_draft' tag='$published_tag' (expected draft=false, tag=$TAG)"; exit 1
+          fi
+          echo "draft assets verified and release published: $TAG (release id $DRAFT_RELEASE_ID, latest designation untouched)"
+
+      - name: On failure — clean up ONLY this run's un-published draft (safe and verifiable)
+        # DRAFT RESIDUE BOUND: if any step of this job failed while an
+        # un-published draft exists, the draft is deleted so the run leaves
+        # NO release residue at all (the versioned tag is never materialized
+        # by a draft, so there is nothing else to remove). The deletion is
+        # authorized ONLY after a release-by-ID read-back proves BOTH that
+        # the release is STILL a draft AND that it carries THIS run's exact
+        # tag — a PUBLISHED release, a foreign tag, or an unreadable release
+        # is NEVER deleted (OPERATOR INTERVENTION REQUIRED is reported
+        # instead). The stable reference and every published release are
+        # never touched by this step, and the previous artifact keeps
+        # serving.
+        if: failure()
+        id: draft-cleanup
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # deleting a draft requires push access; scoped to this step only
+        run: |
+          if [ -z "${DRAFT_RELEASE_ID:-}" ]; then
+            # The failure may have happened after `gh release create`
+            # succeeded but before the id was captured. Resolve THIS run's
+            # own draft by the exact tag (draft == true AND tag_name ==
+            # $TAG — the versioned tag encodes the generation timestamp and
+            # source commit, so it can only identify this run's release).
+            DRAFT_RELEASE_ID=$(gh api "repos/$REPO/releases" | jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag and .draft == true)][0].id // 0')
+            case "$DRAFT_RELEASE_ID" in
+              0|'') echo "no un-published draft for tag $TAG exists — nothing to clean up"; exit 0 ;;
+              [1-9]*) ;;
+              *) echo "unexpected release id '$DRAFT_RELEASE_ID'; refusing to delete anything"; exit 1 ;;
+            esac
+          fi
+          case "$DRAFT_RELEASE_ID" in
+            [1-9]*) ;;
+            *) echo "unusable draft release id '$DRAFT_RELEASE_ID'; refusing to delete anything"; exit 1 ;;
+          esac
+          # Verify BEFORE deleting: the release must STILL be a draft and
+          # must carry THIS run's exact tag.
+          draft_state=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" --jq '{"draft": .draft, "tag": .tag_name}') || { echo "release $DRAFT_RELEASE_ID could not be read; refusing to delete an unverifiable release — OPERATOR INTERVENTION REQUIRED"; exit 1; }
+          is_draft=$(printf '%s' "$draft_state" | jq -r '.draft')
+          draft_tag=$(printf '%s' "$draft_state" | jq -r '.tag')
+          if [ "$is_draft" != "true" ]; then
+            echo "release $DRAFT_RELEASE_ID is NOT a draft (draft='$is_draft') — a published release is NEVER deleted; OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          if [ "$draft_tag" != "$TAG" ]; then
+            echo "release $DRAFT_RELEASE_ID carries tag '$draft_tag', not this run's tag '$TAG' — refusing to delete a foreign release; OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID"
+          if gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" > /dev/null 2>&1; then
+            echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still exists — OPERATOR INTERVENTION REQUIRED"; exit 1
+          fi
+          echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted; the stable reference and every published release were never touched"
     outputs:
       versioned_tag: ${{ needs.publish.outputs.versioned_tag }}
 
