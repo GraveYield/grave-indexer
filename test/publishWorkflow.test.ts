@@ -2413,7 +2413,12 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     '[ "$1" = "api" ] || exit 0',
     'method=""; prev=""',
     'for a in "$@"; do if [ "$prev" = "--method" ]; then method="$a"; fi; prev="$a"; done',
-    'if [ "$method" = "DELETE" ]; then rm -f "$state"; exit 0; fi',
+    'if [ "$method" = "DELETE" ]; then',
+    '  if [ -n "${MOCK_DELETE_FAILS:-}" ]; then',
+    '    printf \'%s\\n\' "gh: server returned a malformed response (mock)" >&2',
+    '    exit 1',
+    '  fi',
+    '  rm -f "$state"; exit 0; fi',
     'prev=""',
     'list=""',
     'for a in "$@"; do',
@@ -2648,6 +2653,67 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     const res = runCleanup(baseEnv({}));
     assert.equal(res.status, 0, "a genuine 404 confirms the deletion");
     assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed\)/, "the success verdict names the confirming 404");
+  });
+
+  // ── SEVENTEENTH ROUND: the DELETE call's own failure is classified ──
+  // The former bare DELETE aborted the step under `set -e` BEFORE the
+  // read-back ran: a malformed DELETE response, an HTTP auth/rate-limit/
+  // outage status or a transport failure on the DELETE call left the
+  // deletion status genuinely UNKNOWN but never CLASSIFIED — the
+  // sixteenth-round taxonomy below was bypassed exactly when it mattered
+  // most. The DELETE now falls through (errors stay visible in the log)
+  // and the READ-BACK decides the EXACT outcome. Every test here EXECUTES
+  // the actual cleanup script with a mock gh whose DELETE call FAILS
+  // (simulating a malformed response) and a mocked read-back status.
+  test("STRUCTURAL: the DELETE falls through to the read-back — its failure never aborts the step unclassified", () => {
+    const deleteLine = cleanupRun.split("\n").find((l) => l.includes('gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID"'));
+    assert.ok(deleteLine, "the DELETE command exists");
+    assert.match(deleteLine!, /\|\| echo "draft cleanup DELETE reported an error/, "the DELETE falls through on failure (errors stay visible in the log; the read-back decides)");
+    assert.match(deleteLine!, /is NOT yet established/, "the DELETE-failure message explicitly states the deletion is NOT established");
+    assert.ok(!/was deleted/.test(deleteLine!), "the DELETE-failure message NEVER claims success");
+    const deleteIdx = cleanupRun.indexOf(deleteLine!);
+    const readbackIdx = cleanupRun.indexOf("curl -sS -o /dev/null -w '%{http_code}'");
+    assert.ok(deleteIdx > -1 && readbackIdx > deleteIdx, "the read-back classification ALWAYS follows the DELETE");
+  });
+
+  test("DELETE call FAILS (malformed response) + read-back 404: the deletion is CONFIRMED by the genuine 404 — the only success verdict", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "404" }));
+    assert.equal(res.status, 0, "a genuine 404 read-back confirms the deletion even after the DELETE call errored");
+    assert.equal(res.deleted, true, "the DELETE was attempted");
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible in the log");
+    assert.match(res.stdout, /is NOT yet established/, "the un-established state is explicit before the read-back");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed\)/, "ONLY the genuine 404 read-back claims the deletion");
+  });
+
+  test("DELETE call FAILS (malformed response) + read-back 200: the release still EXISTS — cleanup FAILED, operator intervention required", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1" })); // state intact → the mock serves 200
+    assert.notEqual(res.status, 0, "the cleanup does NOT claim success");
+    assert.equal(res.deleted, true, "the DELETE was attempted (it failed)");
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure is visible");
+    assert.match(res.stdout, /still EXISTS \(HTTP 200\)/, "the still-exists outcome is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+  });
+
+  for (const status of ["401", "403", "429", "500", "503", "418"]) {
+    test(`DELETE call FAILS (malformed response) + read-back HTTP ${status}: the deletion status is UNKNOWN — never claimed successful`, () => {
+      const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: status }));
+      assert.notEqual(res.status, 0, "an inconclusive read-back never exits zero");
+      assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure is visible");
+      assert.match(res.stdout, /the deletion status is UNKNOWN/, "the UNKNOWN classification is explicit");
+      assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+      assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+    });
+  }
+
+  test("DELETE call FAILS + read-back curl TRANSPORT failure: the deletion status is UNKNOWN — never claimed successful", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_CURL_TRANSPORT_ERROR: "1" }));
+    assert.notEqual(res.status, 0, "a transport failure never exits zero");
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure is visible");
+    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
   });
 });
 

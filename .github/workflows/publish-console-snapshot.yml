@@ -1031,7 +1031,24 @@ jobs:
           if [ "$draft_tag" != "$TAG" ]; then
             echo "release $DRAFT_RELEASE_ID carries tag '$draft_tag', not this run's tag '$TAG' — refusing to delete a foreign release; OPERATOR INTERVENTION REQUIRED"; exit 1
           fi
-          gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID"
+          # SEVENTEENTH-ROUND CORRECTION (malformed-response
+          # classification): the DELETE call itself can fail — a malformed
+          # response, an HTTP 401/403/429/5xx status, or a transport
+          # failure. The former bare command aborted this step under
+          # `set -e` BEFORE the read-back ever ran: the deletion status
+          # was genuinely UNKNOWN (the release may or may not have been
+          # deleted server-side) but was never CLASSIFIED — the
+          # sixteenth-round taxonomy below was bypassed exactly when it
+          # mattered most, and no OPERATOR INTERVENTION REQUIRED evidence
+          # was emitted. The DELETE therefore keeps running (the
+          # established pattern of the first-publication rollback: its
+          # errors stay visible in the log above) and the READ-BACK below
+          # decides the EXACT deletion outcome — a genuine 404 still
+          # confirms the deletion (the ONLY success verdict, even after a
+          # failed DELETE call), a 200 proves the release still exists,
+          # and every other outcome is classified UNKNOWN. A failed
+          # DELETE call NEVER claims success by itself.
+          gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID" || echo "draft cleanup DELETE reported an error (possibly a malformed response, an HTTP auth/rate-limit/outage status, or a transport failure — details above): the deletion of release $DRAFT_RELEASE_ID is NOT yet established; the read-back below classifies the exact outcome"
           # SIXTEENTH-ROUND CORRECTION (P2 — explicit read-back
           # classification): the former read-back treated ANY failed
           # release lookup after the DELETE as proof that the draft was

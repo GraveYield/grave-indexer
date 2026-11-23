@@ -1746,3 +1746,80 @@ responses for every case.
   repository; NO repository setting, ruleset, or immutable-release
   configuration was changed; NO Vercel/Console/blockchain state was
   touched.
+
+## 21. Seventeenth-round correction — the draft-cleanup DELETE's own failure is now classified (2026-11-23)
+
+Follow-up to the independent review of the sixteenth-round cleanup
+read-back classification. The finding: the sixteenth-round taxonomy
+(404 = confirmed, 200 = still exists, everything else = UNKNOWN) was
+implemented over the POST-DELETE READ-BACK only — the DELETE call
+itself was a bare command, so its OWN failure bypassed the taxonomy.
+
+### 21.1 The defect
+
+The failure-path draft-cleanup step deleted the draft with a bare
+`gh api --method DELETE ...`. Under the runner's `set -e` shell, a
+failed DELETE call — a malformed response, an HTTP 401/403/429/5xx
+status, or a transport failure — aborted the step BEFORE the read-back
+ever ran. The deletion status was genuinely UNKNOWN (the release may or
+may not have been deleted server-side), yet it was never CLASSIFIED: no
+UNKNOWN verdict, no OPERATOR INTERVENTION REQUIRED evidence, and — when
+the DELETE failed after server-side processing — a genuinely completed
+deletion could never be confirmed either. The taxonomy was bypassed
+exactly when it mattered most.
+
+### 21.2 The correction
+
+The DELETE now falls through on failure (`|| echo "draft cleanup DELETE
+reported an error ..."` — the same pattern the first-publication
+rollback has always used: its errors stay visible in the log, and the
+READ-BACK decides the outcome). The sixteenth-round classification then
+runs unconditionally:
+
+* a genuine HTTP 404 confirms the deletion (the ONLY success verdict —
+  even after a failed DELETE call, which is now provably correct when
+  the release was in fact deleted server-side);
+* HTTP 200 proves the release still exists — cleanup FAILED, operator
+  intervention required;
+* every other outcome (auth/rate-limit/outage status, transport
+  failure, malformed response, unexpected status) is classified UNKNOWN
+  with OPERATOR INTERVENTION REQUIRED.
+
+A failed DELETE call never claims success by itself; its error message
+explicitly states that the deletion is NOT yet established. The
+pre-deletion identity checks (exact release ID, exact run tag,
+`draft == true` proven by read-back BEFORE any DELETE) are unchanged.
+
+### 21.3 Regression tests (seventeenth round)
+
+`test/publishWorkflow.test.ts` (failure-path draft-cleanup suite) — all
+EXECUTE the actual cleanup script with a mock `gh` whose DELETE call
+FAILS (simulating a malformed response) and a mocked read-back status:
+
+* structural pin: the DELETE falls through to the read-back, its
+  failure message states the deletion is NOT established, never claims
+  success, and the read-back classification always follows the DELETE;
+* DELETE fails + read-back 404 → deletion CONFIRMED by the genuine 404;
+* DELETE fails + read-back 200 → still EXISTS, cleanup FAILED, operator
+  intervention required, successful deletion never claimed;
+* DELETE fails + read-back 401/403/429/500/503/418 → UNKNOWN, operator
+  intervention required;
+* DELETE fails + read-back curl transport failure → UNKNOWN, operator
+  intervention required.
+
+### 21.4 Validation (seventeenth round)
+
+* Focused `test/publishWorkflow.test.ts`: 158 tests, 0 failures
+  (148 before; 10 added).
+* `pnpm run test:offline`: **481 tests, 0 failures** (471 before; 10
+  added).
+* `pnpm run typecheck`, `pnpm run build`, `pnpm run bundle:release-ops`
+  (bundle 46,025 bytes; every import a `node:` builtin — pinned by
+  test): all pass.
+* All four workflow YAMLs parse; all **105 `run:` blocks** pass
+  `bash -n`.
+* NO publication or rehearsal workflow was dispatched; NO release, tag,
+  or stable reference was created, modified, or deleted in ANY
+  repository; NO repository setting, ruleset, or immutable-release
+  configuration was changed; NO Vercel/Console/blockchain state was
+  touched.
