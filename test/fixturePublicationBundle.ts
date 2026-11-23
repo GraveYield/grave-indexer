@@ -90,10 +90,18 @@ function main(): void {
   const out = args.includes("--out") ? (args[args.indexOf("--out") + 1] ?? "data") : "data";
   const incomplete = args.includes("--incomplete");
 
+  // FIFTEENTH ROUND (live rehearsal finding): the producer is FAIL-CLOSED
+  // at construction — buildConsoleSnapshot refuses a missing enrichment
+  // ("missing enrichment for ordered pool ..."), so an incomplete bundle
+  // can never be constructed directly with an empty enrichment map (the
+  // first live dispatch crashed here instead of producing the bundle).
+  // The real producer emits an incomplete artifact by pushing the
+  // enrichment-completeness failure MARKER post-construction and
+  // re-persisting (src/cli.ts). The rehearsal fixture reproduces exactly
+  // that: a complete construction over ONE record, then the marker —
+  // which the independent verify-snapshot gate MUST refuse.
   const records = incomplete ? [discoveredRecord(0x71)] : [discoveredRecord(0x61), discoveredRecord(0x62)];
-  const enrichments = incomplete
-    ? new Map<string, PoolEnrichment>() // NO enrichment: completeness gate must fail
-    : new Map(records.map((r) => [r.poolAddress.toBase58(), enrichment(0)]));
+  const enrichments = new Map(records.map((r) => [r.poolAddress.toBase58(), enrichment(0)]));
 
   const snapshot = buildConsoleSnapshot(records, enrichments, {
     generatedAtUnixMs: NOW_MS,
@@ -113,14 +121,23 @@ function main(): void {
     slotUpperBound: 5_000_002,
   });
 
-  // Gate parity with the real pipeline: an incomplete bundle must fail
-  // the strict parser's completeness expectations (no enriched pools).
+  // Gate parity with the real pipeline: the incomplete bundle must carry
+  // the enrichment-completeness marker — the same signal the independent
+  // verify-snapshot gate refuses (eighth round, Finding 3).
   if (incomplete) {
+    snapshot.failures.push({
+      stage: "enrichment-completeness",
+      reason:
+        "enrichment incomplete: rehearsal fixture marker — this artifact must NOT be treated as a complete production snapshot",
+    });
     const parsed = parseConsoleSnapshot(JSON.parse(JSON.stringify(snapshot)) as unknown);
-    if (parsed.pools.length !== 0) {
-      throw new Error("internal: incomplete fixture unexpectedly parsed with pools");
+    if (parsed.pools.length !== 1) {
+      throw new Error(`internal: incomplete fixture unexpectedly parsed with ${parsed.pools.length} pools`);
     }
-    console.log(`fixture: INCOMPLETE bundle built (zero enriched pools — verify-snapshot MUST refuse it)`);
+    if (!parsed.failures.some((f) => f.stage === "enrichment-completeness")) {
+      throw new Error("internal: incomplete fixture lost its enrichment-completeness marker");
+    }
+    console.log(`fixture: INCOMPLETE bundle built (enrichment-completeness marker — verify-snapshot MUST refuse it)`);
   } else {
     parseConsoleSnapshot(JSON.parse(JSON.stringify(snapshot)) as unknown);
   }
