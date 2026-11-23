@@ -1169,6 +1169,40 @@ jobs:
           # DELETE) and the seventeenth-round DELETE fall-through are
           # unchanged. The credential is used ONLY for the Authorization
           # header and is never printed or logged.
+          #
+          # TWENTY-FIRST-ROUND CORRECTION (socket lifecycle): closing the
+          # HTTP response must release the reader's file reference and
+          # ACTUALLY close the underlying socket. The former
+          # _DeadlineReader.close() called socket.close() directly — but
+          # _DeadlineSocket.makefile() had incremented the socket's
+          # _io_refs (the stdlib-paired contract that defers the real
+          # close while a makefile stream is open, needed for
+          # getresponse()'s will-close handoff) and NOTHING ever released
+          # that reference: the reader that replaces the SocketIO stream
+          # has no stdlib close to do it. _io_refs therefore stayed
+          # inflated forever and socket.close() only DEFERRED the real
+          # close — the descriptor outlived the cleanup on every path.
+          # makefile() now counts every reference it hands out on the
+          # reader, and close() releases EXACTLY those references via
+          # socket._decref_socketios() (the stdlib-paired counterpart of
+          # makefile's increment, the release socket.SocketIO.close()
+          # would perform) before closing the socket — the real close
+          # fires as soon as the last file reference is released, while
+          # the will-close handoff still works (the real close stays
+          # deferred while the reader is open). The step's finally now
+          # also closes the HTTP response BEFORE conn.close(): for a
+          # will_close response getresponse() passes the connection to
+          # the response object WITHOUT recording it on the connection, so
+          # HTTPConnection.close() alone never closes it — the explicit
+          # close guarantees the descriptor is released on EVERY path,
+          # including timeout, deadline expiry and interrupted transfer.
+          # The body loop's between-reads settimeout is skipped once the
+          # descriptor is -1 (the response completed and the reader's
+          # close really-closed the socket) — a settimeout on a closed
+          # descriptor would otherwise misclassify a complete response as
+          # an interrupted transfer. The deadline, the 65,536-byte
+          # response bound, the timeout handling and the UNKNOWN
+          # classification are unchanged.
           set +e # the read-back must ALWAYS reach classification — its own failure never aborts the step unclassified (the seventeenth-round invariant)
           python3 - "$REPO" "$DRAFT_RELEASE_ID" "$TAG" <<'GY_READBACK_PY'
           import http.client, json, os, socket, ssl, sys, time
@@ -1220,6 +1254,15 @@ jobs:
                   self._sock = sock
                   self._deadline = deadline
                   self._closed = False
+                  # TWENTY-FIRST ROUND (socket-lifecycle correction): how many
+                  # references _DeadlineSocket.makefile() handed out. makefile
+                  # is the stdlib-paired counterpart of socket.makefile's
+                  # _io_refs increment, and close() releases EXACTLY this
+                  # many (the same contract socket.SocketIO.close() fulfils
+                  # for a real makefile stream) — so closing the HTTP
+                  # response releases the file reference and actually closes
+                  # the underlying socket.
+                  self._makefile_refs = 0
 
               def _recv_bounded(self, n, flags=0):
                   while True:
@@ -1311,14 +1354,33 @@ jobs:
               def close(self):
                   if not self._closed:
                       self._closed = True
-                      # Mirror socket.makefile's reference contract: the real
-                      # close happens only when the last makefile() reference
-                      # is released (getresponse() hands a will-close
-                      # connection to the response BEFORE the body is read —
-                      # a premature real close would break every later read).
-                      # socket.close() itself defers the real close while
-                      # _io_refs > 0 — exactly the contract needed here.
-                      self._sock.close()
+                      # TWENTY-FIRST ROUND (socket-lifecycle correction):
+                      # release EVERY reference _DeadlineSocket.makefile()
+                      # handed out, exactly the way socket.SocketIO.close()
+                      # releases socket.makefile()'s reference:
+                      # _decref_socketios() is the stdlib-paired counterpart
+                      # of makefile's _io_refs increment (this reader REPLACES
+                      # the SocketIO stream http.client would otherwise get,
+                      # so the release that SocketIO.close() performs happens
+                      # HERE — without it, _io_refs stays inflated forever and
+                      # socket.close() below only DEFERS the real close, never
+                      # performing it). Then close the socket: with every file
+                      # reference released, socket.close() performs the REAL
+                      # close — the descriptor is released when the HTTP
+                      # response is closed, on every path (normal cleanup,
+                      # timeout, deadline expiry, interrupted transfer).
+                      # getresponse()'s will-close handoff still works: while
+                      # the reader is OPEN, _io_refs keeps the real close
+                      # deferred (the connection may be passed to the response
+                      # object before the body is read); the real close fires
+                      # exactly when the last file reference is released.
+                      sock = self._sock
+                      decref = getattr(sock, "_decref_socketios", None)
+                      for _ in range(self._makefile_refs):
+                          if decref is not None:
+                              decref()
+                      self._makefile_refs = 0
+                      sock.close()
 
           class _DeadlineSocket:
               # Presents the connected socket to http.client while routing
@@ -1334,7 +1396,14 @@ jobs:
                   # the real socket close stays DEFERRED until this reader is
                   # closed, so a will-close response can hand the connection
                   # to the response object before the body is consumed.
+                  # TWENTY-FIRST ROUND (socket-lifecycle correction): every
+                  # reference taken here is counted on the reader and RELEASED
+                  # by _DeadlineReader.close() (the release counterpart
+                  # socket.SocketIO.close() performs for a real makefile
+                  # stream) — closing the HTTP response releases the file
+                  # reference and actually closes the underlying socket.
                   self._sock._io_refs += 1
+                  self._reader._makefile_refs += 1
                   return self._reader
 
               def __getattr__(self, name):
@@ -1367,6 +1436,7 @@ jobs:
               unknown("the expected release id is not an integer (" + RELEASE_ID + ") — refusing to compare release identities")
 
           conn = None
+          resp = None  # set by getresponse(); closed in the finally on EVERY path (see below)
           parts = urlsplit(API_BASE)
           if parts.scheme == "https":
               conn = http.client.HTTPSConnection(parts.hostname, port=parts.port or 443, timeout=CONNECT_TIMEOUT_SECS, context=ssl.create_default_context())
@@ -1416,7 +1486,15 @@ jobs:
                   remaining = deadline - time.monotonic()
                   if remaining <= 0:
                       unknown("the overall request deadline (" + str(OVERALL_DEADLINE_SECS) + "s, monotonic clock) expired while consuming the response body — the response is INCOMPLETE and unclassifiable; the deadline never resets when another byte arrives (a slow-drip response cannot keep this request alive)")
-                  if conn.sock is not None:
+                  if conn.sock is not None and conn.sock.fileno() != -1:
+                      # TWENTY-FIRST ROUND: the descriptor is -1 once the
+                      # response completed and _close_conn() → the reader's
+                      # close → the socket's REAL close fired (the fix's
+                      # eager completion close). Nothing is left to bound:
+                      # resp.read1() then returns b"" immediately. Without
+                      # this guard, settimeout() on a closed descriptor would
+                      # raise EBADF and misclassify a COMPLETE response as an
+                      # interrupted transfer.
                       conn.sock.settimeout(remaining)  # no single blocking read can exceed the remaining time to the absolute deadline
                   try:
                       # Bounded streaming read: never more than the remaining
@@ -1486,6 +1564,21 @@ jobs:
                   unknown("HTTP 200 returned a release object that CONTRADICTS the expected cleanup state (published — expected the deleted draft " + RELEASE_ID + "/" + EXPECTED_TAG + ") — the deletion status cannot be established from a contradicting object")
               unknown("unexpected HTTP " + str(status) + " for release " + RELEASE_ID + " — an authentication failure, authorization failure, rate limit, server error or ANY other unexpected status leaves the deletion status unestablished")
           finally:
+              # TWENTY-FIRST ROUND (socket-lifecycle correction): closing the
+              # HTTP response releases the reader's file reference and really
+              # closes the underlying socket (the reader's close releases
+              # every makefile() reference, so socket.close() performs the
+              # deferred real close). The explicit response close matters on
+              # the paths where nothing else closes it: for a will_close
+              # response getresponse() passes the connection to the response
+              # object WITHOUT recording it on the connection
+              # (HTTPConnection.close() only closes its own recorded response),
+              # so without this close the descriptor would survive the
+              # cleanup — including on the timeout, deadline-expiry and
+              # interrupted-transfer paths below. conn.close() then completes
+              # the connection-side cleanup (both closes are idempotent).
+              if resp is not None:
+                  resp.close()
               if conn is not None:
                   conn.close()  # the connection is closed on EVERY path — timeout, deadline expiry, interruption, classification
           GY_READBACK_PY

@@ -32,7 +32,7 @@
 
 import { before, after, describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2460,11 +2460,12 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     body?: string;
     bodyBytes?: number; // N-byte filler body (overrides body)
     chunked?: boolean; // no Content-Length — Transfer-Encoding: chunked
-    mode?: "immediate" | "refuse" | "stall-headers" | "stall-mid-body" | "hangup-mid-body" | "close-after-partial" | "drip-forever";
+    mode?: "immediate" | "refuse" | "stall-headers" | "stall-mid-body" | "hangup-mid-body" | "close-after-partial" | "drip-forever" | "drip-headers" | "drip-framing";
     stallAfterBytes?: number; // for stall-mid-body / hangup-mid-body
-    dripDelayMs?: number; // for drip-forever
-    dripChunkBytes?: number; // for drip-forever
-    dripMaxChunks?: number; // for drip-forever (safety bound)
+    connectionClose?: boolean; // immediate mode: send "Connection: close" (http.client will_close → getresponse's handoff)
+    dripDelayMs?: number; // for drip-forever / drip-headers / drip-framing
+    dripChunkBytes?: number; // for drip-forever / drip-headers / drip-framing
+    dripMaxChunks?: number; // for drip-forever / drip-headers / drip-framing (safety bound)
     statePath?: string; // state-driven default: consults the draft's server-side state AT REQUEST TIME
   }
 
@@ -2614,7 +2615,9 @@ const server = createServer((req, res) => {
     };
     writeNext();
   } else {
-    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": String(body.length) });
+    const headers = { "Content-Type": "application/json", "Content-Length": String(body.length) };
+    if (behavior.connectionClose === true) headers["Connection"] = "close";
+    res.writeHead(status, headers);
     res.end(body);
     info.finished = true;
     writeInfo();
@@ -2627,12 +2630,119 @@ server.listen(0, "127.0.0.1", () => {
 process.on("SIGTERM", () => { server.closeAllConnections?.(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 500).unref(); });
 `;
 
+  // TWENTY-FIRST ROUND (socket lifecycle): the FD-verification driver. It
+  // executes the ACTUAL reader implementation — _DeadlineReader and
+  // _DeadlineSocket are extracted VERBATIM from the workflow's draft-cleanup
+  // read-back heredoc (no re-implementation) — drives one request against
+  // the local read-back server exactly the way the read-back does (bounded
+  // streaming read1 loop), then performs the workflow's finally cleanup and
+  // inspects the underlying socket object in-process: after the cleanup the
+  // descriptor must be REALLY closed (a really-closed socket object reports
+  // fileno() == -1) and every makefile() reference must be released
+  // (_io_refs == 0). One scenario per invocation.
+  const readbackFdDriverSource = `
+import http.client, json, os, re, socket, sys, textwrap, time
+
+SCENARIO = sys.argv[1]
+API_BASE = sys.argv[2]
+WORKFLOW_PATH = sys.argv[3]
+
+src = open(WORKFLOW_PATH, encoding="utf-8").read()
+m = re.search(r"<<'GY_READBACK_PY'\\n(.*?)\\n\\s*GY_READBACK_PY\\n", src, re.S)
+assert m, "the read-back heredoc was not found in the workflow"
+py = textwrap.dedent(m.group(1))
+ns = {}
+sys.argv = ["readback", "GraveYield/grave-indexer", "1234567", "console-snapshot-prod-20260101T000000Z-" + ("c" * 40)]
+exec(py[py.index("import http.client"):py.index("def unknown(reason):")], ns)
+_DeadlineReader = ns["_DeadlineReader"]
+_DeadlineSocket = ns["_DeadlineSocket"]
+_DeadlineExceeded = ns["_DeadlineExceeded"]
+
+parts = ns["urlsplit"](API_BASE)
+deadline = time.monotonic() + float(os.environ.get("GY_READBACK_OVERALL_DEADLINE_SECS", "30"))
+connect_timeout = float(os.environ.get("GY_READBACK_CONNECT_TIMEOUT_SECS", "10"))
+path = (parts.path or "") + "/repos/GraveYield/grave-indexer/releases/1234567"
+
+conn = http.client.HTTPConnection(parts.hostname, port=parts.port or 80, timeout=connect_timeout)
+resp = None
+body = bytearray()
+outcome = "unclassified"
+real = None
+fd_open_during = -1
+io_refs_during = -1
+try:
+    conn.request("GET", path, headers={"Accept": "application/json", "User-Agent": "fdcheck"})
+    remaining = deadline - time.monotonic()
+    if conn.sock is not None:
+        conn.sock.settimeout(min(remaining, connect_timeout))
+    real = conn.sock
+    conn.sock = _DeadlineSocket(real, _DeadlineReader(real, deadline))
+    fd_open_during = real.fileno()
+    io_refs_during = real._io_refs
+    resp = conn.getresponse()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            outcome = "deadline-expired-mid-body"
+            break
+        if conn.sock is not None and conn.sock.fileno() != -1:  # -1 once the completed response's real close fired — nothing left to bound
+            conn.sock.settimeout(remaining)
+        chunk = resp.read1(min(8192, 65536 - len(body) + 1))
+        if not chunk:
+            outcome = "complete"
+            break
+        body += chunk
+except _DeadlineExceeded:
+    outcome = "deadline-expired"
+except (socket.timeout, TimeoutError, InterruptedError):
+    outcome = "timeout"
+except (http.client.IncompleteRead, http.client.HTTPException, ConnectionError, OSError) as exc:
+    outcome = "transport-error:" + type(exc).__name__
+
+# The workflow's finally block, in its exact shape:
+try:
+    if resp is not None:
+        resp.close()
+    if conn is not None:
+        conn.close()
+except Exception:
+    pass
+
+fd_after = real.fileno() if real is not None else -1
+io_refs_after = real._io_refs if real is not None else -1
+
+json_ok = False
+try:
+    parsed = json.loads(bytes(body).decode("utf-8"))
+    json_ok = isinstance(parsed, dict) and parsed.get("message") == "Not Found"
+except Exception:
+    json_ok = False
+
+verdict = {
+    "scenario": SCENARIO,
+    "outcome": outcome,
+    "fd_open_during": fd_open_during,
+    "io_refs_during": io_refs_during,
+    "fd_after": fd_after,
+    "io_refs_after": io_refs_after,
+    "body_bytes": len(body),
+    "json_ok": json_ok,
+    "fd_really_closed": (fd_open_during >= 0 and fd_after == -1 and io_refs_after == 0),
+}
+print("FDVERDICT " + json.dumps(verdict))
+sys.exit(0 if verdict["fd_really_closed"] else 1)
+`;
+
+  let readbackFdDriverPath = "";
+
   before(async () => {
     readbackDir = mkdtempSync(join(tmpdir(), "wf-readback-server-"));
     readbackBehaviorPath = join(readbackDir, "behavior.json");
     readbackInfoPath = join(readbackDir, "info.json");
     writeFileSync(readbackBehaviorPath, "{}");
     writeFileSync(readbackInfoPath, "{}");
+    readbackFdDriverPath = join(readbackDir, "readback-fd-driver.py");
+    writeFileSync(readbackFdDriverPath, readbackFdDriverSource, { mode: 0o644 });
     const serverScript = join(readbackDir, "readback-server.mjs");
     writeFileSync(serverScript, readbackServerSource, { mode: 0o644 });
     const { spawn } = await import("node:child_process");
@@ -3393,6 +3503,17 @@ process.on("SIGTERM", () => { server.closeAllConnections?.(); server.close(() =>
     const deadlineCatches = py.split("\n").filter((l) => l.trim().startsWith("except _DeadlineExceeded")).length;
     assert.ok(deadlineCatches >= 2, "deadline expiry is classified in BOTH phases (status line/headers AND body/framing)");
     assert.match(py, /self\._sock\._io_refs \+= 1/, "the reader mirrors socket.makefile's reference bookkeeping (a will-close response hands the connection to the response object BEFORE the body is read — a premature real close would break every later read)");
+    // TWENTY-FIRST ROUND (socket lifecycle): the reference makefile() takes is
+    // RELEASED by the reader's close — closing the HTTP response really
+    // closes the underlying socket.
+    assert.match(py, /self\._reader\._makefile_refs \+= 1/, "makefile() counts every reference it hands out on the reader (the reader owns the release)");
+    assert.match(py, /_decref_socketios/, "close() releases the references via socket._decref_socketios — the stdlib-paired counterpart of makefile's increment, never a manual refcount hack");
+    assert.match(py, /for _ in range\(self\._makefile_refs\):/, "EVERY reference makefile() took is released, and the socket is closed only after that");
+    assert.match(py, /if resp is not None:\n\s*resp\.close\(\)/, "the finally closes the HTTP response BEFORE the connection — a will_close response is passed to the response object by getresponse() WITHOUT being recorded on the connection, so only the explicit response close can release its file reference on the timeout/error paths");
+    // The body loop tolerates the fix's eager completion close: once the
+    // descriptor is -1 the settimeout is skipped (a settimeout on a closed
+    // descriptor would misclassify a COMPLETE response as interrupted).
+    assert.match(py, /conn\.sock is not None and conn\.sock\.fileno\(\) != -1/, "the body loop's between-reads settimeout is skipped once the completed response's real close fired (fileno() == -1) — otherwise settimeout() would raise EBADF and misclassify a complete response as INTERRUPTED");
     // The connection is closed on EVERY path (timeout included).
     assert.match(py, /if conn is not None:\n\s*conn\.close\(\)/, "the connection is closed on EVERY exit path — timeout, deadline expiry, interruption, classification");
     // ── strict release-ID type ──
@@ -3465,6 +3586,75 @@ process.on("SIGTERM", () => { server.closeAllConnections?.(); server.close(() =>
     assert.equal(res.status, 2, "the definitive still-exists verdict is preserved for a genuine integer id");
     assert.match(res.stdout, /still EXISTS \(HTTP 200\)/, "the still-exists classification is explicit");
     assert.ok(!res.stdout.includes("invalid_id"), "a genuine integer id is NOT rejected by the type check");
+  });
+
+  // ── TWENTY-FIRST ROUND: socket lifecycle. Closing the HTTP response must
+  //    release the reader's file reference and REALLY close the underlying
+  //    socket (a really-closed socket object reports fileno() == -1 and the
+  //    socket's _io_refs must be 0 — an inflated refcount defers the real
+  //    close forever). Every case below executes the ACTUAL reader
+  //    implementation extracted verbatim from the workflow heredoc against
+  //    the deterministic local read-back server, performs the workflow's
+  //    finally cleanup (resp.close() when the response exists, then
+  //    conn.close()), and inspects the descriptor state in-process —
+  //    covering normal cleanup, the will-close handoff, deadline expiry
+  //    (timeout path) and interrupted transfer (error path). ──
+  function fdVerdictOf(scenario: string, behavior: ReadbackBehavior, env: Record<string, string> = {}): Record<string, unknown> {
+    writeFileSync(readbackBehaviorPath, JSON.stringify(behavior));
+    writeFileSync(readbackInfoPath, JSON.stringify({ requests: 0, earlyClientClose: false, finished: false }));
+    const res = spawnSync("python3", [readbackFdDriverPath, scenario, readbackServerUrl, ".github/workflows/publish-console-snapshot.yml"], {
+      encoding: "utf8",
+      timeout: 45000,
+      killSignal: "SIGKILL",
+      env: { ...process.env, GY_READBACK_API_BASE: readbackServerUrl, ...env },
+    });
+    const line = (res.stdout + "\n" + res.stderr).split("\n").find((l) => l.startsWith("FDVERDICT "));
+    assert.ok(line, `the FD driver produced a verdict (exit ${res.status})\n${res.stdout}\n${res.stderr}`);
+    return JSON.parse(line.slice("FDVERDICT ".length)) as Record<string, unknown>;
+  }
+
+  function assertReallyClosed(v: Record<string, unknown>): void {
+    assert.equal(v.fd_really_closed, true, `the FD must be REALLY closed after the response cleanup — verdict: ${JSON.stringify(v)}`);
+    assert.equal(v.fd_after, -1, "the underlying socket object reports fileno() == -1 after cleanup — the deferred real close fired (the former implementation left the descriptor open on every path)");
+    assert.equal(v.io_refs_after, 0, "every makefile() reference was released (socket._decref_socketios) — the former implementation inflated _io_refs forever");
+    assert.ok((v.fd_open_during as number) >= 0, "the FD was genuinely open while the response was in flight (the check is meaningful)");
+  }
+
+  test("socket FD — a COMPLETE response: the FD is closed after response cleanup and the read still parses", () => {
+    const v = fdVerdictOf("complete", { status: 404, body: nfBase });
+    assertReallyClosed(v);
+    assert.equal(v.outcome, "complete", "the bounded streaming read completed");
+    assert.equal(v.json_ok, true, "the body read through the actual reader still parses (the fix breaks no read path)");
+  });
+
+  test("socket FD — a WILL_CLOSE response (getresponse() hands the connection to the response object): the handoff still reads, and the FD is closed after response cleanup", () => {
+    const v = fdVerdictOf("will-close", { status: 404, body: nfBase, connectionClose: true });
+    assertReallyClosed(v);
+    assert.equal(v.outcome, "complete", "the body was fully read after the will-close handoff");
+    assert.equal(v.json_ok, true, "the will-close handoff (real close deferred while the reader is open) still delivers the body — dropping the _io_refs increment without a paired release would break this read");
+  });
+
+  test("socket FD — DEADLINE EXPIRY during chunk framing (timeout path): the FD is closed by the cleanup", () => {
+    const v = fdVerdictOf("deadline-framing", { mode: "drip-framing", dripDelayMs: 30, dripMaxChunks: 2000 }, { GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2" });
+    assertReallyClosed(v);
+    // The exact deadline classification depends on WHERE it expired (between
+    // receives → _DeadlineExceeded; while a receive was blocked — its wait
+    // bounded by the remaining time — → socket.timeout), the same nuance the
+    // twentieth-round test documents. Both are bounded by the absolute
+    // deadline; neither is ever a deletion verdict.
+    assert.match(v.outcome as string, /deadline-expired|^timeout$/, "the absolute deadline ended the request (the classification is unchanged)");
+  });
+
+  test("socket FD — INTERRUPTED transfer (mid-body hangup, error path): the FD is closed by the cleanup despite the partial body", () => {
+    const nfLen = nfBase.length;
+    const v = fdVerdictOf("hangup-mid-body", { status: 404, body: nfBase, mode: "hangup-mid-body", stallAfterBytes: 10 });
+    assertReallyClosed(v);
+    // RST → transport-error; a clean FIN before the declared Content-Length →
+    // EOF ("complete") — the workflow classifies the SAME server behavior as
+    // INCOMPLETE (the twentieth-round declared-length check). Either way the
+    // body was partial and the FD was released by the cleanup.
+    assert.match(v.outcome as string, /transport-error|complete/, "the interrupted transfer was classified (the classification is unchanged)");
+    assert.ok((v.body_bytes as number) > 0 && (v.body_bytes as number) < nfLen, "the body was PARTIAL (this is exactly the path where only the explicit response close can release the still-open reader's reference)");
   });
 });
 
