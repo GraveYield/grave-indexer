@@ -1,19 +1,26 @@
 # Publication rehearsal — record and manual plan (PR #5 remediation, review Task 6; eighth-round correction — review Finding 2; ninth-round correction — review Findings 2 and 3)
 
-Status: **PREPARED — NOT EXECUTED.** The rehearsal workflow now rehearses
-the SAME dedicated stable-reference architecture as production
+Status: **EXECUTED (2026-11-23).** All five scenarios ran live in the
+isolated rehearsal repository `GraveYield/grave-indexer-pub-rehearsal`
+with the owner-provided authorized credential, exercising the SAME
+dedicated stable-reference architecture as production
 (`refs/tags/console-snapshot-prod` → annotated pointer tag object →
-versioned release assets). It has NOT been dispatched as part of this
-correction: no authorized dispatch exists, `workflow_dispatch` is only
-registrable from a default branch, and no rehearsal result may be
-claimed until an authorized run has completed and been independently
-verified.
+versioned release assets) and the draft-first publication sequence.
+Actual outcomes (run IDs; §5 holds the full record):
+
+| Scenario | Run ID | Actual outcome |
+| --- | --- | --- |
+| `happy` | 45178513528 | success — full draft-first pointer architecture end-to-end, unrelated-release probe, rollback drill, state-aware re-activation |
+| `partial-upload` | 45178674124 | success — the draft belt refused the partial draft BEFORE publish; stable reference unchanged; draft cleaned up by ID |
+| `promotion-failure` | 45179021062 | success — pointer for a MISSING release refused; stable reference unchanged |
+| `post-activation-failure` | 45178728162 | failure (EXPECTED) — verified activation → deliberate injection → failure-triggered rollback and restored-state verification SUCCEEDED |
+| `incomplete-artifact` | 45179687002 | success — marker-carrying bundle refused by `verify-snapshot`; no release created |
 
 Nothing in this remediation triggered a production publication, created
 or modified a production release, moved a production stable reference,
 changed Vercel configuration, deployed the Console, or touched
-Mainnet/protocol state. No rehearsal release, tag, or reference was
-created either.
+Mainnet/protocol state. Rehearsal artifacts exist ONLY in the rehearsal
+repository.
 
 ## 1. What was executed (read-only verification, no writes)
 
@@ -79,8 +86,11 @@ Ninth-round corrections, stated precisely:
   HTTP 404 (first publication). The run summary reports the four phases
   distinctly, and the job conclusion for this scenario is EXPECTED to be
   failure — it is never reported as a successful publication.
-- **Status: NOT DISPATCHED.** Neither scenario has run on an authorized
-  target as part of this correction; no rehearsal result is claimed.
+- **Status (SUPERSEDED — see §5): the scenarios HAVE run.** The
+  twelfth-to-fourteenth-round "NOT DISPATCHED" record below was true at
+  the time; both the state-aware reactivation (Finding 2) and the
+  post-activation failure injection (Finding 3) have since been executed
+  live and verified in the rehearsal repository (§5).
 
 ## 2. The rehearsal workflow (current architecture)
 
@@ -109,11 +119,17 @@ Scenarios (dispatch input):
 | `promotion-failure` | building/activating a pointer for a MISSING release fails closed; the dedicated reference is unchanged |
 | `incomplete-artifact` | an incomplete bundle (zero enriched pools) is refused by the independent `verify-snapshot` gate and never promoted (no release exists for its tag) |
 
-## 3. Why it has not run yet, and what the owner must do
+## 3. SUPERSEDED HISTORY — why it had not run then, and what the owner did
+
+> **SUPERSEDED (fifteenth round, 2026-11-23):** every blocker recorded in
+> this section was subsequently resolved — the rehearsal repository was
+> initialized, the credential gap was closed, and all five scenarios ran
+> live (§5). The text below is preserved as superseded history; it no
+> longer describes the current state.
 
 **TWELFTH-ROUND PREREQUISITE VERIFICATION (2026-11-23, read-only):**
-the rehearsal was NOT dispatched because three concrete prerequisites
-fail, verified live:
+the rehearsal was NOT dispatched at that time because three concrete
+prerequisites failed, verified live:
 
 1. `GraveYield/grave-indexer-pub-rehearsal` exists but is **EMPTY** —
    no commits, no branches, no default branch, no files. GitHub
@@ -194,9 +210,13 @@ With `gh` authenticated to the rehearsal repository, in order:
 12. Incomplete artifact: `node --import tsx/esm test/fixturePublicationBundle.ts --out data-incomplete --incomplete`; `verify-snapshot` must exit non-zero and no release may be created for its tag.
 13. Post-activation failure injection (Finding 3, manual equivalent): after step 7, inject a deliberate failure (e.g. `false` in the operator shell), then compare the live reference against the activated tag object (`gh api repos/<REHEARSAL_REPO>/git/ref/tags/console-snapshot-prod`); restore the previous pointer (or delete the ref for a first publication), and re-verify via `verify-stable --expected-tag <PREVIOUS_TAG>` (or a genuine HTTP 404). An independently moved reference must be left untouched.
 
-## 4. Residual rehearsal gap (honest)
+## 4. CLOSED — residual rehearsal gap (superseded record)
 
-Until the rehearsal runs on an authorized target, the following are
+> **CLOSED (fifteenth round, 2026-11-23):** the gap described below no
+> longer exists — the rehearsal ran live and covered every behavior listed
+> here (§5). Preserved as superseded history.
+
+Until the rehearsal ran on an authorized target, the following were
 proven by tests + offline batteries but NOT yet by a live write-path
 rehearsal: the exact `gh api` git-data mutation behavior on a real
 release/tag set (pointer tag object creation, ref create/update/delete,
@@ -208,9 +228,9 @@ failure. The design does
 not depend on any UNVERIFIED GitHub behavior for last-known-good
 preservation (the pointer only moves through the atomic ref update,
 after which the read-back and the post-activation gate either confirm
-or fail the run, and both rollback paths verify their own result) — but
-the owner should run the rehearsal above before the first production
-publication.
+or fail the run, and both rollback paths verify their own result) —
+and the rehearsal has now been run before the first production
+publication, closing this gap (§5).
 
 Equally important, do NOT overstate other claims. GitHub-enforced
 immutable-release status is now SETTLED, not UNKNOWN (fourteenth round,

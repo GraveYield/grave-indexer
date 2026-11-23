@@ -274,23 +274,21 @@ owner-provided token (evidence recorded in the PR remediation report):
    failed (abort — never interpreted as "absent"). An existing RELEASE
    for the tag also aborts via `gh release view`.
 3. **Compatibility with GitHub's immutable-releases feature (TWELFTH
-   ROUND — status, rehearsal, and the exact required change):** the
-   current production sequence (create a published, empty release →
-   upload assets to it) is compatible with the observed state — the
-   immutable-release status is UNKNOWN and no enforcement is verified —
-   but is INCOMPATIBLE with GitHub-enforced immutable releases: under
-   that feature, assets cannot be added to an already published release,
-   so the upload step would fail AFTER a release already existed. The
-   required draft-first sequence is therefore REHEARSED end-to-end by the
-   rehearsal workflow (create draft → upload BY RELEASE ID → verify draft
-   assets → publish `draft=false` + `make_latest=false` → verify →
-   promote — see docs/PUBLICATION_REHEARSAL.md §2) and — as of the
-   THIRTEENTH round (§17) — IMPLEMENTED in the production workflow on
-   this branch: the `release` job creates the versioned release as a
-   DRAFT, uploads the assets BY RELEASE ID, runs the draft belt, and
-   only then publishes, with a failure-path step that deletes ONLY this
-   run's verified un-published draft. The sequence the production
-   publisher implements:
+   ROUND, status reconciled through the fourteenth round):** the
+   immutable-release status is SETTLED, not unknown — the authorized
+   endpoint returned HTTP 200 with `{"enabled": false,
+   "enforced_by_owner": false}` on 2026-11-23 (§18): the feature is NOT
+   enabled and NOT owner-enforced. The production publisher is
+   meanwhile not the old published-first sequence but the DRAFT-FIRST
+   sequence itself (IMPLEMENTED in the production workflow as of the
+   THIRTEENTH round, §17; the former published-first text below is
+   superseded history): the `release` job creates the versioned release
+   as a DRAFT, uploads the assets BY RELEASE ID, retrieves the exact
+   draft bytes, runs the FULL schema-v2 + provenance + integrity +
+   completeness verification over those bytes BEFORE publishing
+   (sixteenth round), and only then publishes, with a failure-path step
+   that deletes ONLY this run's verified un-published draft. The
+   sequence the production publisher implements:
 
    1. create the versioned release as a DRAFT (`--latest=false --draft`,
       `--target` pinned to the asserted commit);
@@ -299,10 +297,23 @@ owner-provided token (evidence recorded in the PR remediation report):
       releases only, and draft listings are visible only to push-access
       users — every draft operation addresses the release by ID, never
       by tag);
-   3. verify the draft assets: exact asset presence, recorded byte
-      lengths vs local bytes, download-back `sha256sum -c` digest belt,
-      and the provenance sidecar must name the release tag — all BEFORE
-      the immutable publish;
+   3. retrieve the EXACT draft bytes: the release-by-ID identity is
+      re-proven (still a draft, THIS run's exact tag), exact asset
+      presence, recorded byte lengths vs local bytes, download-back
+      `sha256sum -c` digest belt — all BEFORE any verification or
+      publish (this retrieval is the ONLY thing that needs the PAT: a
+      draft is only readable with push access);
+   3b. FULL verification of the exact downloaded bytes BEFORE the
+      publish (sixteenth round): the credential-free
+      `verify-local-release-assets` command runs the SAME release-ops
+      core `verify-release-assets` applies to its own fetched bytes —
+      checksum over the exact snapshot bytes, provenance parse + tag
+      identity + SHA-256/byte-length integrity, and the schema-v2
+      completeness contract (incomplete discovery/enrichment evidence,
+      malformed completeness evidence, mismatched counts, empty
+      artifacts and invalid checksums all fail closed) — in a step that
+      carries NO credential, so the write credential never coexists
+      with repository-built code;
    4. publish: `PATCH /releases/<id>` with `draft=false` and an explicit
       `make_latest=false` (string — the API models true/false/legacy),
       then read back the published state (draft flag + tag identity);
@@ -321,12 +332,19 @@ owner-provided token (evidence recorded in the PR remediation report):
    failure-path cleanup step additionally deletes ONLY this run's
    verified un-published draft (by-ID read-back must prove `draft==true`
    AND this run's exact tag before the deletion — a published release or
-   a foreign release is never deleted). The PAT-bearing step count
-   becomes SIX (the draft belt needs the PAT: a draft is only readable
-   with push access; the cleanup needs it to delete the draft).
-   **Do not enable immutable releases before this change lands on the
-   production workflow and is rehearsed.** This is an owner decision,
-   not something this PR does.
+   a foreign release is never deleted; after the deletion, an explicit
+   HTTP-status classification — 404 = deletion confirmed, 200 = still
+   exists, anything else = UNKNOWN — never claims success without a
+   genuine 404). The PAT-bearing step count is SEVEN as of the
+   sixteenth round (draft create+upload; draft-byte retrieval; publish;
+   failure-path draft cleanup; stable-ref activation; promote-job
+   rollback; dedicated rollback-job mutation) — every one zero-custom-
+   code, and the full verification runs credential-free between the
+   retrieval and the publish.
+   **The enablement precondition is satisfied: the draft-first sequence
+   is implemented in the production workflow (thirteenth round) and was
+   rehearsed live (fifteenth round, §19).** Enabling the feature is an
+   owner decision, not something this PR does.
 4. **A failed or partial upload cannot leave an unusable promoted
    release:** the partial release is never designated latest (the
    roundtrip verification precedes promotion), so the previous
@@ -593,7 +611,7 @@ never accessed while preparing this change.
 | Credential | Where it exists | What it can do |
 | --- | --- | --- |
 | `github.token` (automatic) | ALL EIGHT jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, stable-ref and tag-object reads, authenticated asset fetches during verification, post-activation read-back, the rollback job's compare-before-rollback and read-back) |
-| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly SIX steps: the `release` job's draft create+upload step; the `release` job's draft verify+publish step (the PAT is required there to READ the draft — draft listings are visible only to push-access users); the `release` job's failure-path draft-cleanup step (`if: failure()`; deletes ONLY this run's verified un-published draft — a published release or a foreign release is never deleted); the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication); the dedicated `rollback` job's single ref-mutation step (same two rollback cases, after a failed post-activation verification) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
+| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly SEVEN steps (sixteenth round; the thirteenth-round count was six): the `release` job's draft create+upload step; the `release` job's draft-byte RETRIEVAL step (SIXTEENTH ROUND P1 — authenticated retrieval ONLY: reads the draft and downloads the three exact uploaded bytes BY RELEASE ID; zero custom code; a draft is readable only with push-access credentials); the `release` job's publish step (PATCH draft=false + make_latest=false + read-back); the `release` job's failure-path draft-cleanup step (`if: failure()`; deletes ONLY this run's verified un-published draft — a published release or a foreign release is never deleted); the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication); the dedicated `rollback` job's single ref-mutation step (same two rollback cases, after a failed post-activation verification) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else. The FULL draft-byte verification runs in a step that carries NO credential (the release-ops bundle executes with the PAT absent) |
 | `ACTIONS_RUNTIME_TOKEN` | Managed by GitHub for `actions/upload-artifact` / `actions/download-artifact` inside one workflow run | Run-scoped artifact transport only; not a `github.token` input |
 | `MAINNET_RPC_URL` / `DEVNET_RPC_URL` | `generate` job env (RPC access for snapshot generation) | RPC endpoints; no GitHub capability |
 
@@ -1163,13 +1181,27 @@ mechanism:
 
 ## 16. Twelfth-round correction — immutable-release status UNKNOWN, draft-first readiness (specified + rehearsed + prepared patch), and rehearsal prerequisites
 
+> **SUPERSEDED HISTORY (fourteenth/fifteenth-round reconciliation):**
+> the UNKNOWN status below was SETTLED by the authorized endpoint result
+> in §18 (HTTP 200, `enabled: false`, `enforced_by_owner: false` — the
+> feature is NOT enabled, never "unknown" as a current-state claim); the
+> prepared production patch was superseded when §17 IMPLEMENTED
+> draft-first in the production workflow; and the rehearsal
+> prerequisites were resolved when the five scenarios ran live (§19).
+> This section is preserved as clearly-labeled history; the current
+> status is stated in §8 and §18.
+
 Follow-up to the independent review requiring (a) the immutable-release
 status claim to be reconciled with the authorized endpoint semantics,
 and (b) the publisher to be prepared for GitHub-enforced immutable
 releases, plus an isolated rehearsal attempt. The approved architecture
 and every existing safeguard are unchanged; no validation was weakened.
 
-### 16.1 Immutable-release status: UNKNOWN (never "disabled")
+### 16.1 Immutable-release status: UNKNOWN at the time (never "disabled" — superseded by §18)
+
+> **SUPERSEDED by §18:** the authorized endpoint result settles this as
+> NOT enabled (HTTP 200, `enabled: false`, `enforced_by_owner: false`,
+> 2026-11-23). The twelfth-round UNKNOWN record below is history.
 
 The former wording — "GitHub-enforced immutable releases are NOT
 enabled (verified: no tag-protection ruleset / immutable-release
@@ -1203,7 +1235,11 @@ settle it (§8, owner actions). The reconciliation comment on the PR
 > the twelfth-round reasoning are preserved as the historical record;
 > §18 records the evidence, and §17.3 is superseded by this result.
 
-### 16.2 The publisher is PREPARED for enforcement: sequence specified, rehearsed, and a validated production patch recorded
+### 16.2 SUPERSEDED — the publisher was PREPARED for enforcement (implemented in §17)
+
+> **SUPERSEDED by §17:** the prepared production patch described here
+> was subsequently APPLIED to the production workflow on this branch
+> (thirteenth round). This subsection is history.
 
 > **THIRTEENTH-ROUND UPDATE:** the draft-first sequence described here is
 > now IMPLEMENTED in the production workflow on this branch (with a
@@ -1243,10 +1279,13 @@ PUBLISHED releases only, and draft listings are visible only to
 push-access users — therefore every draft operation addresses the
 release BY ID, and the draft belt necessarily carries the PAT (the only
 push-access credential in the workflow). The PAT-bearing step count
-would become SIX (§11 note; the sixth is the failure-path draft-cleanup
+would become SIX then (§11 note; the sixth is the failure-path draft-cleanup
 step, which needs the PAT to delete this run's verified un-published
-draft); no other credential boundary moves, no
-job grants write, and the belt step remains zero-custom-code (pinned
+draft) — and is SEVEN as of the sixteenth round, which splits the
+draft verify+publish step into the PAT-bearing draft-byte retrieval
+step and the credential-free full-verification step (§20.1); no other
+credential boundary moves, no
+job grants write, and the retrieval step remains zero-custom-code (pinned
 `gh api`, `jq`, `sha256sum` invocations only).
 
 Safety properties of the prepared change: a partial upload fails on the
@@ -1275,7 +1314,10 @@ draft-first rehearsal scenarios exist in the validated working state
 only. The production publisher is UNAFFECTED: it is deliberately
 unchanged in both the local working state and the remote branch.
 
-### 16.3 The rehearsal was NOT dispatched — exact prerequisites
+### 16.3 SUPERSEDED — the rehearsal had not been dispatched then (executed in §19)
+
+> **SUPERSEDED by §19:** the five scenarios have since run live in the
+> rehearsal repository (2026-11-23). This subsection is history.
 
 Per the authorization boundary (do not dispatch unless the
 rehearsal-repository access, credential scope, and workflow target
@@ -1373,18 +1415,29 @@ patch to the branch and completes it with the previously missing piece
   existed). The stable reference and every published release are never
   touched by this step.
 * `test/publishWorkflow.test.ts` — the draft-first readiness pins are
-  extended: the PAT-bearing step count is pinned at SIX (draft
-  create+upload; draft verify+publish; failure-path draft-cleanup;
-  stable-ref activation; promote-job rollback; downstream rollback-job
-  mutation), and a NEW suite EXECUTES the actual cleanup script
-  extracted from the workflow against a stateful mock `gh` binary,
-  covering: happy cleanup (exactly one by-ID DELETE, proven by
-  read-back), refusal on a published release, refusal on a foreign
-  tag, refusal on an unreadable release, clean exit with zero
+  extended: the PAT-bearing step count was pinned at SIX in the
+  thirteenth round (draft create+upload; draft verify+publish;
+  failure-path draft-cleanup; stable-ref activation; promote-job
+  rollback; downstream rollback-job mutation) and is pinned at SEVEN
+  as of the sixteenth round (the draft verify+publish step split into
+  the PAT-bearing draft-byte retrieval step and the credential-free
+  full-verification step; §20.1), and a NEW suite EXECUTES the actual
+  cleanup script extracted from the workflow against a stateful mock
+  `gh` binary, covering: happy cleanup (exactly one by-ID DELETE,
+  proven by read-back), refusal on a published release, refusal on a
+  foreign tag, refusal on an unreadable release, clean exit with zero
   deletions when no draft exists, the fallback list-resolution path,
-  and fail-closed on an unusable captured ID.
+  and fail-closed on an unusable captured ID. The sixteenth round adds
+  the explicit read-back classification tests (404 = confirmed, 200 =
+  still exists, 401/403/429/5xx/transport = UNKNOWN) executing the
+  same actual script against mocked HTTP responses.
 
 ### 17.2 Credential posture (updated)
+
+> **SUPERSEDED, sixteenth round:** the count below was six at the
+> thirteenth round; it is SEVEN as of §20.1 (the draft verify+publish
+> step was split into the PAT-bearing draft-byte retrieval step and the
+> credential-free full-verification step). All other properties hold.
 
 Six PAT-bearing steps, all step-level env, zero job-level grants, zero
 custom code in any PAT step (pinned `gh api`/`jq`/`stat`/`sha256sum`
@@ -1454,7 +1507,11 @@ blocked" claim reconciled in place (§8 table, §8 item 1, owner actions,
   (c) the twelfth-round UNKNOWN record in §16.1/§17.3 is preserved as
   history, superseded in place.
 
-### 18.2 Rehearsal: push prerequisite RESOLVED, new exact prerequisite recorded
+### 18.2 SUPERSEDED — rehearsal prerequisites at the fourteenth round (executed in §19)
+
+> **SUPERSEDED by §19:** the blockers recorded below were resolved and
+> the five scenarios ran live on 2026-11-23. This subsection is
+> history.
 
 * RESOLVED: the twelfth-round workflow-push blocker (GitHub App without
   the `workflows` permission → HTTP 403) is gone. The owner provided a
@@ -1464,27 +1521,21 @@ blocked" claim reconciled in place (§8 table, §8 item 1, owner actions,
   branch successfully — GitHub accepted workflow-file changes through
   that credential, proving the `workflows` permission is held. The
   branch's rehearsal workflow is now the current draft-first version.
-* Still blocking, now with the exact cause verified live: the
-  rehearsal repository `GraveYield/grave-indexer-pub-rehearsal` remains
+* Still blocking AT THAT TIME (exact cause verified live): the
+  rehearsal repository `GraveYield/grave-indexer-pub-rehearsal` remained
   EMPTY (size 0, no default branch content), and the owner-provided
-  fine-grained PAT does NOT cover it:
+  fine-grained PAT did NOT cover it:
   - `PUT /repos/GraveYield/grave-indexer-pub-rehearsal/contents/probe.txt`
     → HTTP 403 "Resource not accessible by personal access token"
     (probe write REFUSED, nothing created — repo still size 0);
   - `git push` over HTTPS → 403 "Permission to
     GraveYield/grave-indexer-pub-rehearsal.git denied to sethoshi18".
   The same PAT DOES hold admin/push on `grave-indexer` (proven by the
-  successful branch push). This is a token repository-selection /
+  successful branch push). This was a token repository-selection /
   permission-scope gap, NOT a repository-state problem.
-* Exact owner fix (owner settings, not this task's authority): edit the
-  fine-grained token (Settings → Developer settings → Fine-grained
-  tokens) to add `grave-indexer-pub-rehearsal` to its repository access
-  with Contents: read/write, Workflows: read/write, and Actions:
-  read/write; then initialize the rehearsal repository (one commit
-  carrying `rehearsal-publication.yml` + `docs/PUBLICATION_REHEARSAL.md`
-  + a README on `main`) and dispatch the five scenarios per
-  docs/PUBLICATION_REHEARSAL.md §3. NO rehearsal result is claimed;
-  the rehearsal remains PREPARED — NOT EXECUTED.
+* Resolution (fifteenth round): the credential gap and repository
+  initialization were completed, and the five scenarios were dispatched
+  and completed live — see §19 and docs/PUBLICATION_REHEARSAL.md §5.
 
 ### 18.3 Validation (fourteenth round)
 
@@ -1584,3 +1635,114 @@ progressed past the fixed point.
   production, and no production release, tag, or stable reference exists
   or was created. The first production publication remains the owner's
   explicit action.
+
+---
+
+## 20. Sixteenth-round correction — complete draft verification BEFORE publication; explicit draft-cleanup read-back classification; audit-documentation reconciliation
+
+Follow-up to the independent-review findings (P1 draft-verification
+sequence, P2 cleanup read-back semantics, P2 documentation
+reconciliation). The dedicated stable-reference architecture, the
+publication authorization boundaries, and production behavior outside
+the corrections below are unchanged.
+
+### 20.1 P1 — the FULL verification now runs on the exact draft bytes BEFORE the publish
+
+The former draft belt checked only asset presence, byte lengths, the
+download-back digest belt and the provenance tag on the DRAFT; the full
+schema-v2 + completeness verification ran only AFTER publication
+(verify-versioned). The corrected sequence in the release job:
+
+1. **Retrieve the exact DRAFT bytes** (PAT-bearing, retrieval ONLY —
+   zero custom code): the release-by-ID identity is re-proven first
+   (still a draft, THIS run's exact tag), then the three assets are
+   downloaded BY RELEASE ID (by asset ID) exactly as GitHub holds them,
+   and the checksum belt runs over the downloaded bytes.
+2. **FULL verification, credential-free** (`verify-local-release-assets`,
+   a new command in the prebuilt release-ops bundle): the exact
+   downloaded bytes undergo the SAME verification core
+   `verify-release-assets` applies to its own fetched bytes — the new
+   exported `verifyArtifactTriple` (checksum file over the exact
+   snapshot bytes; provenance parse + tag identity + SHA-256/byte-length
+   integrity; the independent schema-v2 completeness contract: failure
+   markers, malformed count evidence, count mismatch, empty artifacts
+   and invalid checksums all rejected). NOT a parallel validator — the
+   function is shared with `verifyReleaseAssetSet` (pinned by test).
+   The step carries NO credential of any kind: the write credential's
+   step-level env ended with the retrieval step, so repository-built
+   code NEVER executes while the PAT is available.
+3. **Publish the VERIFIED draft** (`draft=false` + explicit
+   `make_latest=false` + bounded-retry read-back) — reached only after
+   the full verification passed. Any verification failure aborts BEFORE
+   the publish: the release REMAINS an un-published draft, the stable
+   reference is untouched, and the previous artifact keeps serving.
+   The read-only `verify-versioned` job still re-verifies the PUBLISHED
+   release afterwards and remains the gate before pointer activation.
+
+Credential boundary: the PAT-bearing step count is now SEVEN (draft
+create+upload; draft-byte retrieval; publish; failure-path draft
+cleanup; stable-ref activation; promote-job rollback; dedicated
+rollback-job mutation) — all step-level env, all zero-custom-code. The
+retrieval step is a read-only retrieval operation added by the
+separation the finding requires; no job grants write, and the
+automatic token stays read-only everywhere.
+
+### 20.2 P2 — draft-cleanup read-back classifies the EXACT HTTP outcome
+
+The failure-path cleanup step's post-DELETE read-back previously
+treated ANY failed release lookup as proof that the draft was deleted —
+a 401/403/429/5xx response, a network failure or a malformed response
+was silently reinterpreted as "the draft is gone". The read-back now
+captures the exact HTTP status (curl `-w '%{http_code}'`) and
+classifies it:
+
+* **HTTP 404** — deletion CONFIRMED (the ONLY success verdict);
+* **HTTP 200** — the release still exists: cleanup FAILED; operator
+  intervention required;
+* **HTTP 401/403, 429, 5xx, transport failure, malformed response or
+  any unexpected status** — deletion status UNKNOWN; operator
+  intervention required.
+
+Successful deletion is claimed only on a genuine 404. The pre-deletion
+checks are unchanged: exact release ID, exact run tag, and
+`draft == true` proven by read-back BEFORE any DELETE; a published
+release or a release belonging to another run is never deleted.
+Regression tests EXECUTE the actual cleanup script against mocked HTTP
+responses for every case.
+
+### 20.3 P2 — audit documentation reconciled
+
+* `docs/PUBLICATION_REHEARSAL.md`: the current status is EXECUTED
+  (2026-11-23) with the five live run IDs and actual outcomes — happy
+  45178513528, partial upload 45178674124, promotion failure
+  45179021062, post-activation failure 45178728162 (expected workflow
+  failure; rollback and restored-state verification succeeded),
+  incomplete artifact 45179687002. The contradictory current-status
+  claims (not executed / repository empty / scenarios outstanding) are
+  removed or clearly labeled SUPERSEDED/CLOSED history.
+* Stale comments reconciled in both workflow files (the production
+  header now states the settled immutable-release status and the
+  seven-step PAT boundary; the rehearsal's "prepared separately"
+  wording is labeled superseded) and in §8 of this document (the
+  former published-first description replaced by the implemented
+  draft-first sequence).
+* Immutable-release status is stated consistently: the authorized
+  endpoint returned HTTP 200 with `{"enabled": false,
+  "enforced_by_owner": false}` on 2026-11-23 — the feature is NOT
+  enabled; the twelfth-round UNKNOWN wording is preserved only as
+  clearly-labeled superseded history (§16).
+
+### 20.4 Validation (sixteenth round)
+
+* Focused: `test/releaseOps.test.ts` local-verification suite (11 tests)
+  and `test/publishWorkflow.test.ts` sixteenth-round suite (9 tests) +
+  cleanup read-back classification (10 tests, all executing the actual
+  script); `pnpm run test:offline` full battery green.
+* `pnpm run typecheck`, `pnpm run build`, `pnpm run bundle:release-ops`
+  pass; all four workflow YAMLs parse; every `run:` block passes
+  `bash -n`.
+* NO publication or rehearsal workflow was dispatched; NO release, tag,
+  or stable reference was created, modified, or deleted in ANY
+  repository; NO repository setting, ruleset, or immutable-release
+  configuration was changed; NO Vercel/Console/blockchain state was
+  touched.

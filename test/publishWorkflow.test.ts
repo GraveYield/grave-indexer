@@ -33,7 +33,8 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -428,11 +429,29 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
     }
   });
 
-  test("PRIVILEGED JOBS CONTAIN ZERO CUSTOM CODE: no node, no repository script, no pnpm/npm, no build, no compilation", () => {
+  test("PRIVILEGED JOBS CONTAIN ZERO CUSTOM CODE IN CREDENTIAL-BEARING STEPS: no node, no repository script, no pnpm/npm, no build, no compilation where any token exists", () => {
+    // SIXTEENTH-ROUND REFINEMENT (P1): the credential is STEP-level, so
+    // the exact invariant is per-step: a step that carries ANY token
+    // (the PAT step env or the automatic-token read gates) executes
+    // zero custom code; repository-built code may run ONLY in steps
+    // whose env carries no token at all. promote and rollback remain
+    // fully code-free jobs.
     for (const [name, job] of privilegedJobs) {
-      const runs = runBlocks(job).join("\n");
-      for (const banned of ["node ", "pnpm ", "npm ", "npx ", "src/cli.ts", ".mjs", "tsc ", "build:sdk", "tsx"]) {
-        assert.ok(!runs.includes(banned), `${name} (the PAT-privileged job) must not contain '${banned}' — no custom or repository-built code may execute in the job that carries the release-write credential`);
+      if (name !== "release") {
+        const runs = runBlocks(job).join("\n");
+        for (const banned of ["node ", "pnpm ", "npm ", "npx ", "src/cli.ts", ".mjs", "tsc ", "build:sdk", "tsx"]) {
+          assert.ok(!runs.includes(banned), `${name} (the PAT-privileged job) must not contain '${banned}' — no custom or repository-built code may execute in the job that carries the release-write credential`);
+        }
+      }
+      for (const step of job.steps) {
+        const env = stepEnv(step);
+        const run = (step["run"] as string) ?? "";
+        const carriesAnyToken = "GH_TOKEN" in env || "GITHUB_TOKEN" in env || "GY_RELEASE_PAT" in env;
+        if (carriesAnyToken) {
+          for (const banned of ["node ", "pnpm ", "npm ", "npx ", "src/cli.ts", ".mjs", "tsc ", "build:sdk", "tsx"]) {
+            assert.ok(!run.includes(banned), `${name}: a token-bearing step must not execute '${banned}' — repository-built code NEVER coexists with a credential`);
+          }
+        }
       }
       assert.ok(!job.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/checkout")), `${name} NEVER checks out the repository`);
       assert.ok(!job.steps.some((s) => (s["uses"] as string | undefined)?.startsWith("actions/setup-node")), `${name} NEVER runs setup-node (its token input defaults to github.token)`);
@@ -441,6 +460,14 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         assert.match(uses, /^actions\/download-artifact@/, `${name}'s only allowed action is download-artifact (found: ${uses})`);
       }
     }
+    // The release job's ONLY node invocation is the credential-free full
+    // verification of the exact draft bytes (sixteenth round, P1).
+    const release = wf.jobs["release"]!;
+    const nodeSteps = release.steps.filter((s) => typeof s["run"] === "string" && /\bnode\b/.test(s["run"] as string));
+    assert.equal(nodeSteps.length, 1, "the release job runs repository-built code in EXACTLY ONE step");
+    const nodeRun = (nodeSteps[0]!["run"] as string) ?? "";
+    assert.match(nodeRun, /verify-local-release-assets/, "the single node step is the full draft verification");
+    assert.ok(!("GH_TOKEN" in stepEnv(nodeSteps[0]!)) && !("GY_RELEASE_PAT" in stepEnv(nodeSteps[0]!)), "that node step carries NO credential of any kind");
   });
 
   test("GLOBAL INVARIANT: NO job grants contents:write — the automatic GITHUB_TOKEN is read-only in every job", () => {
@@ -487,10 +514,18 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       // TWELFTH ROUND (draft-first): the draft upload addresses the release
       // BY ID through the uploads.github.com asset endpoint (the by-tag
       // endpoint serves published releases only — drafts are unaddressable
-      // by tag), and the verify-then-publish step runs the draft belt and
-      // PATCHes draft=false + make_latest=false. Both are PAT-bearing
-      // release-mutation steps and are pinned here.
+      // by tag), and the publish step PATCHes draft=false +
+      // make_latest=false. Both are PAT-bearing release-mutation steps and
+      // are pinned here.
       ["release", /uploads\.github\.com[\s\S]*draft release created and uploaded/s],
+      // SIXTEENTH ROUND (P1): the draft-byte retrieval step is the one
+      // PAT-bearing NON-mutation operation — a draft is only readable
+      // with push access, so the exact uploaded bytes must be fetched
+      // with the PAT (pinned gh api + jq + shell only, zero custom
+      // code). The FULL verification over those bytes runs in the
+      // SEPARATE credential-free step (pinned in the sixteenth-round
+      // suite below), so the PAT never coexists with node.
+      ["release", /refusing to retrieve a foreign release[\s\S]*the exact draft bytes are retrieved/s],
       ["release", /PATCH "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"[\s\S]*draft assets verified and release published/s],
       // THIRTEENTH ROUND (draft-first residue bound): the failure-path
       // draft-cleanup step deletes ONLY this run's verified un-published
@@ -551,7 +586,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       assert.ok(!("GH_TOKEN" in (job.env ?? {})) && !("GITHUB_TOKEN" in (job.env ?? {})), `${name} must not declare GH_TOKEN/GITHUB_TOKEN at JOB level (it would leak to every step)`);
       assert.ok(!("GY_RELEASE_PAT" in (job.env ?? {})), `${name} must not declare GY_RELEASE_PAT at JOB level (it would leak to every step)`);
     }
-    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release", "release", "release", "rollback"], "exactly SEVEN privileged PAT-bearing STEP matches (SIX steps; the release create+upload step matches twice): release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation");
+    assert.deepEqual(mutationsFound.sort(), ["promote", "promote", "release", "release", "release", "release", "release", "rollback"], "exactly EIGHT privileged PAT-bearing STEP matches (SEVEN steps; the release create+upload step matches twice): release draft-create+upload, release draft-byte retrieval, release publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation");
   });
 
   test("no workflow-level or job-level env exposes the release credential anywhere", () => {
@@ -572,9 +607,9 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       const value = stepEnv(step)["GH_TOKEN"];
       const run = (step["run"] as string) ?? "";
       if (value === "${{ secrets.GY_RELEASE_PAT }}") {
-        // TWELFTH ROUND: the pinned PAT-bearing step set covers the release
+        // SIXTEENTH ROUND: the pinned PAT-bearing step set covers the release
         // mutations (gh release create, the uploads.github.com draft upload,
-        // the draft-verify + PATCH publish) and the git-data mutations.
+        // the draft-byte retrieval, the PATCH publish) and the git-data mutations.
         assert.ok(
           /gh release (create|upload|edit)|uploads\.github\.com|releases\/\$DRAFT_RELEASE_ID|git\/(tags|refs)/.test(run),
           `a GY_RELEASE_PAT step must be a pinned mutation (found: ${run.slice(0, 80)})`,
@@ -587,7 +622,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
         assert.fail(`GH_TOKEN env references an unsanctioned credential source: ${String(value)}`);
       }
     }
-    assert.equal(patStepCount, 6, "exactly SIX steps carry the release-write PAT (release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
+    assert.equal(patStepCount, 7, "exactly SEVEN steps carry the release-write PAT (release draft-create+upload, release draft-byte retrieval, release publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     assert.ok(automaticTokenStepCount >= 4, "every authenticated query step uses the READ-ONLY automatic token");
   });
 
@@ -599,18 +634,24 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
           assert.ok(!hasTokenEnv(step), `${uses} in ${job.name ?? "(unnamed)"} must not receive a GitHub token (it authenticates with the artifact-scoped runtime token)`);
         }
         const run = (step["run"] as string) ?? "";
-        const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("verify-stable") || run.includes("verify-snapshot") || run.includes("stable-pointer-build");
-        // TWELFTH ROUND: the release job's DRAFT belt (verify the uploaded
-        // draft assets BEFORE the immutable publish) is the one sanctioned
-        // PAT-bearing verification step — under enforced immutable releases
-        // the byte-level verification MUST happen pre-publish, and a draft
-        // is only readable with push access (the PAT). It is pinned
-        // separately: the belt must run BEFORE the PATCH publish in the
-        // same step, and every OTHER verification step stays PAT-free.
-        const isDraftBelt = isVerification && run.includes("releases/$DRAFT_RELEASE_ID/assets") && run.includes("gh api --method PATCH");
-        if (isDraftBelt) {
-          assert.ok(run.indexOf("sha256sum -c") < run.indexOf("gh api --method PATCH"), "the draft belt runs BEFORE the publish PATCH (verify-before-publish ordering)");
-          assert.ok(stepEnv(step)["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}", "the draft belt is the release job's PAT step (a draft is only readable with push access)");
+        const isVerification = run.includes("sha256sum -c") || run.includes("--scope versioned") || run.includes("verify-stable") || run.includes("verify-snapshot") || run.includes("stable-pointer-build") || run.includes("verify-local-release-assets");
+        // SIXTEENTH ROUND: the release job's draft-byte steps are the
+        // sanctioned pair — the PAT-bearing RETRIEVAL step (the draft is
+        // only readable with push access; pinned gh api + jq + shell,
+        // zero custom code) and the credential-free FULL verification
+        // step (node over the exact downloaded bytes). Every OTHER
+        // verification step stays PAT-free.
+        const isDraftByteRetrieval = isVerification && run.includes("releases/$DRAFT_RELEASE_ID/assets") && run.includes("sha256sum -c");
+        if (isDraftByteRetrieval) {
+          assert.ok(stepEnv(step)["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}", "the draft-byte retrieval step is the release job's PAT step (a draft is only readable with push access)");
+          assert.ok(!/\bnode\b|\.mjs|pnpm|npm|checkout|tsx/.test(run), "the PAT-bearing retrieval step executes ZERO custom code (pinned gh api + jq + shell only)");
+          assert.ok(run.indexOf("sha256sum -c") < run.indexOf("the exact draft bytes are retrieved"), "the checksum belt runs over the downloaded bytes BEFORE the retrieval completes");
+          continue;
+        }
+        const isDraftLocalVerify = run.includes("verify-local-release-assets");
+        if (isDraftLocalVerify) {
+          assert.ok(!("GH_TOKEN" in stepEnv(step)) && !("GY_RELEASE_PAT" in stepEnv(step)), "the FULL draft verification step carries NO credential of any kind");
+          assert.ok(/\bnode\b.*release-ops\.mjs verify-local-release-assets/.test(run), "the full draft verification runs the prebuilt release-ops bundle");
           continue;
         }
         if (isVerification) {
@@ -660,12 +701,17 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
   const allJobs = Object.entries(wf.jobs);
   const raw = readFileSync(".github/workflows/publish-console-snapshot.yml", "utf8");
 
-  test("the PAT appears ONLY inside the step-level env of the six draft-first mutation steps", () => {
+  test("the PAT appears ONLY inside the step-level env of the seven draft-first mutation/retrieval steps", () => {
     // Every literal occurrence of the secret reference in the file must be
-    // either a comment mention or one of the six sanctioned step env values
+    // either a comment mention or one of the sanctioned step env values
     // (TWELFTH ROUND: the draft-first sequence splits the former single
     // create+upload step into create+upload and verify+publish; THIRTEENTH
-    // ROUND: the failure-path draft-cleanup step is the sixth).
+    // ROUND: the failure-path draft-cleanup step is the sixth; SIXTEENTH
+    // ROUND: the draft-verify step is SPLIT into the PAT-bearing
+    // draft-byte retrieval step (zero custom code) and the credential-
+    // free full-verification step (node) plus the publish step — the
+    // retrieval step is the SEVENTH PAT operation, and the PAT still
+    // never reaches repository-built code).
     let envOccurrences = 0;
     for (const [, job] of allJobs) {
       for (const step of job.steps) {
@@ -673,10 +719,10 @@ describe("publish-console-snapshot workflow — GY_RELEASE_PAT isolation (final 
         if (env["GH_TOKEN"] === "${{ secrets.GY_RELEASE_PAT }}") envOccurrences += 1;
       }
     }
-    assert.equal(envOccurrences, 6, "exactly SIX step env blocks reference the PAT (release draft-create+upload, release draft-verify+publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
+    assert.equal(envOccurrences, 7, "exactly SEVEN step env blocks reference the PAT (release draft-create+upload, release draft-byte retrieval, release publish, release failure-path draft-cleanup, stable-ref activation, promote-job rollback, downstream rollback-job mutation)");
     // The remaining occurrences must be comments only.
     const stripped = raw.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
-    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 6, "outside comments, the PAT reference appears ONLY in the six sanctioned step env values");
+    assert.equal(stripped.split("secrets.GY_RELEASE_PAT").length - 1, 7, "outside comments, the PAT reference appears ONLY in the seven sanctioned step env values");
   });
 
   test("no build, test, generation, verification, artifact, checkout or dependency step receives the PAT in any form", () => {
@@ -2300,7 +2346,12 @@ describe("publish-console-snapshot workflow — draft-first immutable-release re
     assert.match(runs, /names=\$\(gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID\/assets" --jq '\[\.\[\]\.name\] \| sort \| join\("\\n"\)'\)/, "the observed asset list is sorted");
     assert.match(runs, /Accept: application\/octet-stream" "repos\/\$REPO\/releases\/assets\/\$asset_id"/, "the assets are downloaded BACK from the draft by asset id");
     assert.match(runs, /sha256sum -c console-snapshot\.sha256/, "the checksum belt runs over the exact uploaded bytes");
-    assert.match(runs, /jq -e --arg tag "\$TAG" '\.versionedTag == \$tag' dl\/console-snapshot-provenance\.json/, "the provenance must name the release tag before publishing");
+    // SIXTEENTH ROUND: the provenance-tag identity check is enforced by
+    // the FULL local verification (verify-local-release-assets → the
+    // verifyArtifactTriple core: versionedTag === expectedTag), which
+    // replaces the former single jq probe and adds integrity +
+    // completeness — no weaker parallel validator exists.
+    assert.match(runs, /verify-local-release-assets --dir dl --expected-tag "\$TAG"/, "the full verification of the downloaded bytes names this run's expected tag");
     assert.match(runs, /uploaded_size.*vs local/, "recorded asset sizes must match the local bytes");
   });
 
@@ -2386,6 +2437,27 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     'exit 1',
   ].join("\n");
 
+  // Mock curl: the post-DELETE read-back classifies the EXACT HTTP status.
+  // Default behavior mirrors the stateful server above: the release exists
+  // (state file present) → 200; absent → a genuine 404. MOCK_READBACK_STATUS
+  // forces any other status (401/403/429/5xx/...); MOCK_CURL_TRANSPORT_ERROR
+  // makes curl itself fail (network failure). It cannot reach GitHub.
+  const mockCurl = [
+    "#!/usr/bin/env bash",
+    "# test-harness mock: status-only release read-back",
+    'url=""',
+    'for a in "$@"; do case "$a" in http*) url="$a" ;; esac; done',
+    'case "$url" in',
+    '  */releases/$MOCK_RELEASE_ID_URL) ;;',
+    '  *) if [ -n "$MOCK_CURL_ALLOWED_PREFIX" ] && [ "${url#$MOCK_CURL_ALLOWED_PREFIX}" = "$url" ]; then echo "unexpected url: $url" >&2; exit 1; fi ;;',
+    'esac',
+    'if [ -n "${MOCK_CURL_TRANSPORT_ERROR:-}" ]; then echo "curl: (7) connection refused (mock)" >&2; exit 7; fi',
+    'state="$MOCK_STATE_FILE"',
+    'if [ -n "${MOCK_READBACK_STATUS:-}" ]; then printf \'%s\' "$MOCK_READBACK_STATUS"; exit 0; fi',
+    'if [ -f "$state" ]; then printf \'%s\' "200"; else printf \'%s\' "404"; fi',
+    'exit 0',
+  ].join("\n");
+
   interface CleanupResult {
     status: number;
     stdout: string;
@@ -2398,6 +2470,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     const bin = join(dir, "bin");
     mkdirSync(bin);
     writeFileSync(join(bin, "gh"), mockGh, { mode: 0o755 });
+    writeFileSync(join(bin, "curl"), mockCurl, { mode: 0o755 });
     const ghLogPath = join(dir, "gh.log");
     const statePath = join(dir, "draft-state.json");
     writeFileSync(ghLogPath, "");
@@ -2415,6 +2488,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
           HOME: process.env.HOME ?? dir,
           MOCK_GH_LOG: ghLogPath,
           MOCK_STATE_FILE: statePath,
+          MOCK_RELEASE_ID_URL: DRAFT_ID,
           ...env,
         },
       });
@@ -2521,5 +2595,285 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     assert.notEqual(res.status, 0, "an unusable id refuses");
     assert.equal(res.deleted, false, "NO deletion is issued");
     assert.match(res.stdout, /refusing to delete anything/, "the refusal is explicit");
+  });
+
+  // ── SIXTEENTH ROUND (P2): explicit post-DELETE read-back classification ──
+  // The former read-back treated ANY failed release lookup after the DELETE
+  // as proof of deletion. The script now classifies the exact HTTP outcome:
+  // 404 = deletion confirmed; 200 = still exists (cleanup FAILED); every
+  // auth/permission/rate-limit/outage/transport/unexpected outcome = the
+  // deletion status is UNKNOWN. All of these EXECUTE the actual cleanup
+  // script against mocked HTTP responses.
+  test("STRUCTURAL: the read-back classifies the exact HTTP status and only 404 claims success", () => {
+    assert.match(cleanupRun, /curl -sS -o \/dev\/null -w '%\{http_code\}'/, "the read-back captures the EXACT HTTP status code");
+    assert.match(cleanupRun, /case "\$code" in/, "the status is classified explicitly");
+    const idx404 = cleanupRun.indexOf('404) echo "verified: the un-published draft');
+    const idx200 = cleanupRun.indexOf('200) echo "draft cleanup read-back FAILED');
+    const idxOther = cleanupRun.indexOf('*) echo "draft cleanup read-back INCONCLUSIVE');
+    assert.ok(idx404 > -1 && idx200 > -1 && idxOther > -1, "all three classification branches exist");
+    assert.ok(idx404 < idx200 && idx200 < idxOther, "404 = confirmed, 200 = still exists, everything else = UNKNOWN");
+    assert.match(cleanupRun, /the deletion status of release \$DRAFT_RELEASE_ID is UNKNOWN/, "a transport failure is classified UNKNOWN");
+    assert.ok(!/if gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID" > \/dev\/null 2>&1/.test(cleanupRun), "the old any-failure-means-deleted pattern is GONE");
+  });
+
+  test("HTTP 200 at read-back: the release still EXISTS — cleanup FAILED, operator intervention required", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200" }));
+    assert.notEqual(res.status, 0, "the cleanup does NOT claim success");
+    assert.equal(res.deleted, true, "the DELETE was attempted (the failure is at read-back)");
+    assert.match(res.stdout, /still EXISTS \(HTTP 200\)/, "the still-exists outcome is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+  });
+
+  for (const status of ["401", "403", "429", "500", "503", "418"]) {
+    test(`HTTP ${status} at read-back: the deletion status is UNKNOWN — never claimed successful`, () => {
+      const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: status }));
+      assert.notEqual(res.status, 0, "an inconclusive read-back never exits zero");
+      assert.match(res.stdout, /the deletion status is UNKNOWN/, "the UNKNOWN classification is explicit");
+      assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+      assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+    });
+  }
+
+  test("a curl TRANSPORT failure at read-back: the deletion status is UNKNOWN — never claimed successful", () => {
+    const res = runCleanup(baseEnv({ MOCK_CURL_TRANSPORT_ERROR: "1" }));
+    assert.notEqual(res.status, 0, "a transport failure never exits zero");
+    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
+    assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+    assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+  });
+
+  test("HTTP 404 at read-back is the ONLY verdict that claims the deletion succeeded", () => {
+    const res = runCleanup(baseEnv({}));
+    assert.equal(res.status, 0, "a genuine 404 confirms the deletion");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed\)/, "the success verdict names the confirming 404");
+  });
+});
+
+// ─── Sixteenth round (P1) — complete draft verification before publication ──
+//
+// The former draft belt checked only presence, byte lengths, digests and the
+// provenance tag on the DRAFT; the FULL schema-v2 + completeness verification
+// happened only AFTER publication (verify-versioned). The corrected sequence
+// retrieves the exact draft bytes with the PAT (retrieval ONLY — zero custom
+// code), then runs the FULL existing release-ops verification core
+// (`verify-local-release-assets` → `verifyArtifactTriple`) over those exact
+// bytes in a step that carries NO credential, and only then publishes. These
+// tests pin the structure AND execute the actual retrieval script against a
+// stateful mock `gh` (the mock cannot reach GitHub; no mutation command can
+// be issued against a real release).
+describe("publish-console-snapshot workflow — complete draft verification before publication (sixteenth round, P1)", () => {
+  const TAG = "console-snapshot-prod-20260101T000000Z-" + "c".repeat(40);
+  const FOREIGN_TAG = "console-snapshot-prod-20251231T000000Z-" + "d".repeat(40);
+  const DRAFT_ID = "1234567";
+
+  const wf = loadWorkflow();
+  const release = wf.jobs["release"]!;
+  const stepsWithRun = release.steps.filter((s) => typeof s["run"] === "string") as Array<Record<string, string>>;
+
+  const retrievalStep = stepsWithRun.find((s) => (s["run"] as string).includes("the exact draft bytes are retrieved"))!;
+  const retrievalRun = retrievalStep["run"] as string;
+  const fullVerifyStep = stepsWithRun.find((s) => (s["run"] as string).includes("verify-local-release-assets"))!;
+  const fullVerifyRun = fullVerifyStep["run"] as string;
+  const publishStep = stepsWithRun.find((s) => (s["run"] as string).includes("draft assets verified and release published"))!;
+
+  // ── structural pins ──
+  test("STRUCTURAL: the release sequence is create → retrieve → verify(full, credential-free) → publish → cleanup", () => {
+    const order = stepsWithRun.map((s) => s["run"] as string);
+    const createIdx = order.findIndex((r) => r.includes("draft release created and uploaded"));
+    const retrieveIdx = order.indexOf(retrievalRun);
+    const verifyIdx = order.indexOf(fullVerifyRun);
+    const publishIdx = order.indexOf(publishStep["run"] as string);
+    const cleanupIdx = order.findIndex((r) => r.includes("--method DELETE \"repos/$REPO/releases/$DRAFT_RELEASE_ID\""));
+    assert.ok(createIdx > -1 && retrieveIdx > -1 && verifyIdx > -1 && publishIdx > -1 && cleanupIdx > -1, "all five steps exist");
+    assert.ok(createIdx < retrieveIdx && retrieveIdx < verifyIdx && verifyIdx < publishIdx && publishIdx < cleanupIdx, "retrieve → FULL verify → publish ordering (the full verification gates the publish)");
+  });
+
+  test("STRUCTURAL: the full verification step carries NO credential and performs zero API calls (pure local verification)", () => {
+    const env = stepEnv(fullVerifyStep);
+    assert.ok(!("GH_TOKEN" in env) && !("GITHUB_TOKEN" in env) && !("GY_RELEASE_PAT" in env), "the verification step has NO token in its env — the write credential never coexists with repository-built code");
+    assert.match(fullVerifyRun, /node ops\/release-ops\.mjs verify-local-release-assets --dir dl --expected-tag "\$TAG"/, "the FULL existing release-ops verification core runs over the exact downloaded bytes");
+    assert.ok(!fullVerifyRun.includes("gh api") && !fullVerifyRun.includes("gh release") && !fullVerifyRun.includes("curl"), "the verification performs ZERO network/API calls (it verifies the bytes already retrieved)");
+    assert.ok(!fullVerifyRun.includes("Authorization: Bearer"), "the verification never authenticates");
+  });
+
+  test("STRUCTURAL: the retrieval step carries the PAT, issues ONLY reads, and downloads by release ID", () => {
+    assert.equal(stepEnv(retrievalStep)["GH_TOKEN"], "${{ secrets.GY_RELEASE_PAT }}", "the retrieval is the PAT-bearing step (a draft is only readable with push access)");
+    assert.ok(!/gh api --method (POST|PATCH|DELETE)|gh release (create|upload|edit|delete)|curl -X (POST|PATCH|DELETE)/.test(retrievalRun), "the retrieval step issues NO mutation commands");
+    assert.match(retrievalRun, /releases\/\$DRAFT_RELEASE_ID\/assets/, "assets are addressed by RELEASE ID (never by tag — drafts are unaddressable by tag)");
+    assert.match(retrievalRun, /Accept: application\/octet-stream" "repos\/\$REPO\/releases\/assets\/\$asset_id"/, "each asset is downloaded by ASSET ID from that release");
+  });
+
+  test("STRUCTURAL: the verification rejects every required failure class before publication", () => {
+    // The verification is the EXISTING release-ops core (verifyArtifactTriple —
+    // shared with verify-release-assets), whose rejection matrix is pinned by
+    // test/releaseOps.test.ts. Here we pin that the workflow invokes THAT
+    // command with this run's expected tag, so no weaker parallel validator
+    // exists at the workflow layer.
+    assert.match(retrievalRun, /sha256sum -c console-snapshot\.sha256/, "the checksum belt still runs over the downloaded bytes in the retrieval step");
+    assert.match(fullVerifyRun, /--expected-tag "\$TAG"/, "the verifier must check the provenance names THIS run's tag");
+    assert.ok(!stepsWithRun.some((s) => (s["run"] as string).includes("verify-local-release-assets") && (s["run"] as string) !== fullVerifyRun), "EXACTLY ONE step runs the local verifier");
+  });
+
+  // ── executed retrieval behavior ──
+  // Mock gh: stateful against a canned draft release + asset set. A GET of
+  // the release record serves the canned JSON; a GET of the assets list
+  // serves the canned array (through real jq when --jq is passed); a GET of
+  // an asset id streams the canned bytes. It cannot reach GitHub, and every
+  // invocation is logged so absence of mutation commands is PROVEN.
+  function mockGhFor(body: string, assetsById: Record<string, string>): string {
+    return [
+      "#!/usr/bin/env bash",
+      "# test-harness mock: stateful draft release + assets",
+      'printf \'%s\\n\' "gh $*" >> "$MOCK_GH_LOG"',
+      '[ "$1" = "api" ] || exit 0',
+      'url=""; prev=""',
+      'for a in "$@"; do case "$a" in repos/*|http://*|https://*) url="$a" ;; esac; prev="$a"; done',
+      'if [ -n "$MOCK_REFUSE" ]; then echo "gh: mock refusal" >&2; exit 1; fi',
+      'case "$url" in',
+      '  */releases) printf \'%s\\n\' "${MOCK_LIST_BODY:-[]}" ;;',
+      '  */assets)',
+      '    body=$(cat "$MOCK_ASSETS_FILE")',
+      '    jqexpr=""; prev=""',
+      '    for a in "$@"; do if [ "$prev" = "--jq" ]; then jqexpr="$a"; fi; prev="$a"; done',
+      '    if [ -n "$jqexpr" ]; then printf \'%s\' "$body" | jq -r "$jqexpr"; else printf \'%s\\n\' "$body"; fi ;;',
+      `  */releases/${DRAFT_ID})`,
+      '    body=$(cat "$MOCK_RELEASE_FILE")',
+      '    jqexpr=""; prev=""',
+      '    for a in "$@"; do if [ "$prev" = "--jq" ]; then jqexpr="$a"; fi; prev="$a"; done',
+      '    if [ -n "$jqexpr" ]; then printf \'%s\' "$body" | jq -r "$jqexpr"; else printf \'%s\\n\' "$body"; fi ;;',
+      '  */releases/assets/*)',
+      '    id="${url##*/}"',
+      '    file="$MOCK_ASSET_DIR/$id"',
+      '    [ -f "$file" ] || { echo "asset $id not found" >&2; exit 1; }',
+      '    cat "$file" ;;',
+      '  *) echo "unexpected url: $url" >&2; exit 1 ;;',
+      'esac',
+    ].join("\n");
+  }
+  void mockGhFor;
+
+  interface RetrievalResult {
+    status: number;
+    stdout: string;
+    ghCalls: string[];
+    files: Record<string, string>;
+  }
+
+  function runRetrieval(env: Record<string, string>): RetrievalResult {
+    const dir = mkdtempSync(join(tmpdir(), "wf-draftretrieval-sim-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "gh"), env.MOCK_GH_SCRIPT!, { mode: 0o755 });
+    const ghLogPath = join(dir, "gh.log");
+    writeFileSync(ghLogPath, "");
+    const scriptPath = join(dir, "step.sh");
+    writeFileSync(scriptPath, retrievalRun);
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", scriptPath], {
+        encoding: "utf8",
+        cwd: dir,
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          HOME: process.env.HOME ?? dir,
+          MOCK_GH_LOG: ghLogPath,
+          REPO: "GraveYield/grave-indexer",
+          TAG,
+          DRAFT_RELEASE_ID: DRAFT_ID,
+          ...env,
+        },
+      });
+    } catch (err) {
+      const e = err as { status?: number | null; stdout?: string };
+      status = e.status ?? 1;
+      stdout = String(e.stdout ?? "");
+    }
+    const ghCalls = readFileSync(ghLogPath, "utf8").split("\n").filter((l) => l.startsWith("gh "));
+    const files: Record<string, string> = {};
+    const dl = join(dir, "dl");
+    try {
+      for (const name of ["console-snapshot.json", "console-snapshot-provenance.json", "console-snapshot.sha256"]) {
+        const p = join(dl, name);
+        if (existsSync(p)) files[name] = readFileSync(p, "utf8");
+      }
+    } catch { /* dl absent on refusal */ }
+    rmSync(dir, { recursive: true, force: true });
+    return { status, stdout, ghCalls, files };
+  }
+
+  // Server-side canned state: a valid artifact triple held by the "draft".
+  const SNAPSHOT_BYTES = JSON.stringify({ schemaVersion: 2, pools: [], counts: { enriched: 0 }, failures: [] });
+  const SNAPSHOT_SHA = createHash("sha256").update(SNAPSHOT_BYTES).digest("hex");
+  const PROVENANCE_BYTES = JSON.stringify({ versionedTag: TAG, counts: { enriched: 0 } });
+  const CHECKSUM_BYTES = `${SNAPSHOT_SHA}  console-snapshot.json\n`;
+
+  function serverState(opts: { draft?: boolean; tag?: string; assetNames?: string[] }): Record<string, string> {
+    const draft = opts.draft ?? true;
+    const tag = opts.tag ?? TAG;
+    const names = opts.assetNames ?? ["console-snapshot.json", "console-snapshot-provenance.json", "console-snapshot.sha256"];
+    const assets = names.map((n, i) => ({ id: 11 + i, name: n }));
+    const assetDir = mkdtempSync(join(tmpdir(), "wf-draftretrieval-assets-"));
+    const releaseFile = join(assetDir, "release.json");
+    const assetsFile = join(assetDir, "assets.json");
+    writeFileSync(releaseFile, JSON.stringify({ id: Number(DRAFT_ID), draft, tag_name: tag }));
+    writeFileSync(assetsFile, JSON.stringify(assets));
+    // Asset 11 = snapshot, 12 = provenance, 13 = checksum (by position).
+    const bytesFor = (i: number): string => (i === 0 ? SNAPSHOT_BYTES : i === 1 ? PROVENANCE_BYTES : CHECKSUM_BYTES);
+    for (const [i] of names.entries()) writeFileSync(join(assetDir, String(11 + i)), bytesFor(i));
+    dirsToClean.push(assetDir);
+    return {
+      MOCK_RELEASE_FILE: releaseFile,
+      MOCK_ASSETS_FILE: assetsFile,
+      MOCK_ASSET_DIR: assetDir,
+    };
+  }
+  const dirsToClean: string[] = [];
+
+  test("happy retrieval: the draft identity is re-proven, all three exact bytes are downloaded by ID, and ZERO mutation commands are issued", () => {
+    const state = serverState({});
+    const res = runRetrieval({ ...state, MOCK_GH_SCRIPT: mockGhFor("", {}) });
+    assert.equal(res.status, 0, "the retrieval succeeds for this run's own draft");
+    assert.equal(res.files["console-snapshot.json"], SNAPSHOT_BYTES, "the exact snapshot bytes are downloaded");
+    assert.equal(res.files["console-snapshot-provenance.json"], PROVENANCE_BYTES, "the exact provenance bytes are downloaded");
+    assert.equal(res.files["console-snapshot.sha256"], CHECKSUM_BYTES, "the exact checksum bytes are downloaded");
+    assert.equal(res.ghCalls.filter((l) => /--method (POST|PATCH|DELETE)|gh release (create|upload|edit|delete)/.test(l)).length, 0, "NO mutation command was invoked");
+    assert.match(res.stdout, /the exact draft bytes are retrieved/, "the completion is explicit");
+  });
+
+  test("a draft=false release at retrieval refuses — nothing is downloaded, ZERO mutation commands", () => {
+    const state = serverState({ draft: false });
+    const res = runRetrieval({ ...state, MOCK_GH_SCRIPT: mockGhFor("", {}) });
+    assert.notEqual(res.status, 0, "a published release is never retrieved as a draft");
+    assert.equal(Object.keys(res.files).length, 0, "NO bytes are downloaded from a published release");
+    assert.match(res.stdout, /is NOT a draft/, "the refusal is explicit");
+    assert.equal(res.ghCalls.filter((l) => /--method (POST|PATCH|DELETE)/.test(l)).length, 0, "NO mutation command was invoked");
+  });
+
+  test("a FOREIGN tag at retrieval refuses — nothing is downloaded, ZERO mutation commands", () => {
+    const state = serverState({ tag: FOREIGN_TAG });
+    const res = runRetrieval({ ...state, MOCK_GH_SCRIPT: mockGhFor("", {}) });
+    assert.notEqual(res.status, 0, "a foreign release is never retrieved");
+    assert.equal(Object.keys(res.files).length, 0, "NO bytes are downloaded from a foreign release");
+    assert.match(res.stdout, /refusing to retrieve a foreign release/, "the refusal is explicit");
+    assert.equal(res.ghCalls.filter((l) => /--method (POST|PATCH|DELETE)/.test(l)).length, 0, "NO mutation command was invoked");
+  });
+
+  test("an INCOMPLETE asset set on the draft fails the presence check before any full verification", () => {
+    const state = serverState({ assetNames: ["console-snapshot.json", "console-snapshot.sha256"] });
+    const res = runRetrieval({ ...state, MOCK_GH_SCRIPT: mockGhFor("", {}) });
+    assert.notEqual(res.status, 0, "an incomplete draft cannot pass");
+    assert.match(res.stdout, /draft asset presence check FAILED/, "the presence check is the gate");
+    assert.equal(res.ghCalls.filter((l) => /--method (POST|PATCH|DELETE)/.test(l)).length, 0, "NO mutation command was invoked");
+  });
+
+  test("an unreadable release record fails closed before any download", () => {
+    const state = serverState({});
+    const res = runRetrieval({ ...state, MOCK_GH_SCRIPT: mockGhFor("", {}), MOCK_REFUSE: "1" });
+    assert.notEqual(res.status, 0, "an unreadable release refuses");
+    assert.match(res.stdout, /refusing to retrieve from an unverifiable release/, "the refusal is explicit");
+    assert.equal(res.ghCalls.filter((l) => /--method (POST|PATCH|DELETE)/.test(l)).length, 0, "NO mutation command was invoked");
   });
 });

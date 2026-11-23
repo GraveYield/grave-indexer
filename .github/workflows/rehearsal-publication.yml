@@ -329,16 +329,19 @@ jobs:
 
       # ── Scenario: happy path — the FULL pointer architecture + rollback drill ─
       - name: Publish the immutable versioned release (DRAFT-FIRST sequence, created explicitly NOT latest)
-        # TWELFTH ROUND: the rehearsal rehearses the DRAFT-FIRST sequence
-        # that docs/SNAPSHOT_PUBLICATION.md §8.3 requires the production
-        # publisher to adopt BEFORE GitHub-enforced immutable releases are
-        # ever enabled — create as a DRAFT, upload all three assets BY
-        # RELEASE ID, verify the draft assets (presence + download-back
-        # digest belt + provenance tag), then publish with draft=false +
-        # make_latest=false. Drafts are addressed by ID because the by-tag
-        # endpoint serves published releases only. Proving this sequence
-        # live here is the pre-enablement evidence §8.3 demands; the
-        # production patch that adopts it is prepared separately.
+        # TWELFTH ROUND: the rehearsal rehearses the DRAFT-FIRST sequence —
+        # create as a DRAFT, upload all three assets BY RELEASE ID, verify
+        # the draft assets (presence + download-back digest belt + provenance
+        # tag), then publish with draft=false + make_latest=false. Drafts are
+        # addressed by ID because the by-tag endpoint serves published
+        # releases only.
+        # SUPERSEDED-HISTORY NOTE (status reconciliation, sixteenth round):
+        # the "production patch prepared separately" wording below is
+        # outdated — the production publisher on PR #5's branch has
+        # IMPLEMENTED this sequence since the thirteenth round, and the
+        # five rehearsal scenarios (including this one) were EXECUTED live
+        # in this repository on 2026-11-23 (docs/PUBLICATION_REHEARSAL.md
+        # §5, docs/SNAPSHOT_PUBLICATION.md §19).
         if: env.SCENARIO == 'happy' || env.SCENARIO == 'post-activation-failure'
         run: |
           TAG=$(node -e "console.log(JSON.parse(require('fs').readFileSync('data/console-snapshot-provenance.json','utf8')).versionedTag)")

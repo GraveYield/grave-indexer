@@ -40,6 +40,7 @@
 // battery (test/releaseOps.test.ts) keeps exercising the REAL
 // production entry points used by the workflow.
 
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import {
   ReleaseOpsError,
@@ -48,10 +49,12 @@ import {
   fetchStablePointer,
   resolveStableRef,
   resolveLatestRelease,
+  verifyArtifactTriple,
   verifyReleaseAssetSet,
   verifyStableReference,
   type AssetScope,
 } from "./releaseOps.js";
+import { CHECKSUM_ASSET_NAME, PROVENANCE_ASSET_NAME, SNAPSHOT_ASSET_NAME } from "./snapshotPublication.js";
 
 /**
  * Read the GitHub API token from the environment WITHOUT ever printing it.
@@ -162,6 +165,69 @@ export async function cmdVerifyReleaseAssets(args: {
     return 0;
   } catch (err) {
     console.error(`verify-release-assets: FAILED — ${String((err as Error).message ?? err)}`);
+    return 1;
+  }
+}
+
+/**
+ * `verify-local-release-assets` — FULL verification of a LOCAL artifact
+ * triple (sixteenth round — P1 correction). This is the credential-free
+ * half of the draft-verification separation: a privileged retrieval step
+ * downloads the three DRAFT assets by release ID (the only step that
+ * holds the release-write credential), and THIS command then runs the
+ * EXACT same verification core `verify-release-assets` applies to its
+ * own fetched bytes — checksum file over the exact snapshot bytes,
+ * provenance parse + tag identity + SHA-256/byte-length integrity, and
+ * the producer's completeness contract (no completeness failure markers,
+ * well-formed count evidence, exact count agreement, non-empty
+ * publication) — over the exact downloaded bytes, with NO network access
+ * and NO credential in the environment.
+ *
+ * NOT a parallel validator: the checks ARE `verifyArtifactTriple` — the
+ * same function `verifyReleaseAssetSet` calls post-fetch. Missing,
+ * unreadable or empty files fail closed with actionable, asset-naming
+ * errors.
+ *
+ * Exit 0 = the local triple is one complete, internally consistent,
+ * correctly-named artifact set. Exit 1 = any violation.
+ */
+export async function cmdVerifyLocalReleaseAssets(args: { dir: string; expectedTag: string }): Promise<number> {
+  const wanted: Array<[kind: "snapshot" | "provenance" | "checksum", name: string]> = [
+    ["snapshot", SNAPSHOT_ASSET_NAME],
+    ["provenance", PROVENANCE_ASSET_NAME],
+    ["checksum", CHECKSUM_ASSET_NAME],
+  ];
+  try {
+    const bytes: Record<"snapshot" | "provenance" | "checksum", Uint8Array> = {
+      snapshot: new Uint8Array(),
+      provenance: new Uint8Array(),
+      checksum: new Uint8Array(),
+    };
+    for (const [kind, name] of wanted) {
+      const path = `${args.dir.replace(/\/+$/, "")}/${name}`;
+      let content: Buffer;
+      try {
+        content = readFileSync(path);
+      } catch (err) {
+        throw new ReleaseOpsError(
+          "NOT_FOUND",
+          `the '${name}' artifact is missing or unreadable at '${path}' (${String((err as Error).message ?? err)}) — refusing verification of an incomplete artifact set`,
+        );
+      }
+      bytes[kind] = new Uint8Array(content);
+    }
+    verifyArtifactTriple({
+      snapshotBytes: bytes.snapshot,
+      provenanceBytes: bytes.provenance,
+      checksumBytes: bytes.checksum,
+      expectedTag: args.expectedTag,
+    });
+    console.error(
+      `verify-local-release-assets: OK — the local triple in '${args.dir}' is ONE complete artifact set naming ${args.expectedTag} (checksum + provenance digest + tag cross-check + schema/completeness gate)`,
+    );
+    return 0;
+  } catch (err) {
+    console.error(`verify-local-release-assets: FAILED — ${String((err as Error).message ?? err)}`);
     return 1;
   }
 }
@@ -288,6 +354,11 @@ const USAGE = `grave-indexer release-ops — the GitHub-facing commands the priv
       --scope latest requires the repo-wide latest designation to equal
       the expected tag (NON-production utility — the production stable
       reference is the dedicated console-snapshot-prod ref).
+  release-ops verify-local-release-assets --dir <dir> --expected-tag <tag>
+      FULL verification of a LOCAL snapshot + provenance + checksum
+      triple (the exact bytes a privileged retrieval step downloaded
+      from a DRAFT release): checksum + provenance digest + tag
+      cross-check + the completeness gate — NO network, NO credential.
   release-ops stable-pointer-current <owner/repo>
       Read the dedicated stable reference (refs/tags/console-snapshot-prod)
       for rollback bookkeeping: kind=none ONLY on a genuine 404.
@@ -320,6 +391,16 @@ export async function releaseOpsMain(argv: string[]): Promise<number> {
       return 1;
     }
     return cmdVerifyReleaseAssets({ repository: repo, tag, scope: scope as AssetScope, expectedTag: expected });
+  }
+  if (command === "verify-local-release-assets") {
+    const rest = argv.slice(1);
+    const dir = rest.includes("--dir") ? rest[rest.indexOf("--dir") + 1] : undefined;
+    const expected = rest.includes("--expected-tag") ? rest[rest.indexOf("--expected-tag") + 1] : undefined;
+    if (!dir || !expected) {
+      console.error(USAGE);
+      return 1;
+    }
+    return cmdVerifyLocalReleaseAssets({ dir, expectedTag: expected });
   }
   if (command === "stable-pointer-current") {
     const repo = argv.slice(1).find((a) => !a.startsWith("--"));

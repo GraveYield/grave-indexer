@@ -71,11 +71,12 @@ import {
   cmdReleaseLatest,
   cmdStablePointerBuild,
   cmdStablePointerCurrent,
+  cmdVerifyLocalReleaseAssets,
   cmdVerifyReleaseAssets,
   cmdVerifyStable,
 } from "./releaseOpsCli.js";
 
-export { cmdReleaseLatest, cmdStablePointerBuild, cmdStablePointerCurrent, cmdVerifyReleaseAssets, cmdVerifyStable };
+export { cmdReleaseLatest, cmdStablePointerBuild, cmdStablePointerCurrent, cmdVerifyLocalReleaseAssets, cmdVerifyReleaseAssets, cmdVerifyStable };
 
 const LEDGER_FILE = "ingest-ledger.jsonl";
 const SUMMARY_FILE = "discovery-summary.json";
@@ -957,6 +958,16 @@ async function main(): Promise<number> {
         return 1;
       }
       return cmdVerifyReleaseAssets({ repository: repo, tag, scope: scope as AssetScope, expectedTag: expected });
+    }
+    case "verify-local-release-assets": {
+      const argv = process.argv.slice(3);
+      const dir = argv.includes("--dir") ? argv[argv.indexOf("--dir") + 1] : undefined;
+      const expected = argv.includes("--expected-tag") ? argv[argv.indexOf("--expected-tag") + 1] : undefined;
+      if (!dir || !expected) {
+        console.error("usage: grave-indexer verify-local-release-assets --dir <dir> --expected-tag <versioned-tag>");
+        return 1;
+      }
+      return cmdVerifyLocalReleaseAssets({ dir, expectedTag: expected });
     }
     case "stable-pointer-current": {
       const repo = process.argv.slice(3).find((a) => !a.startsWith("--"));

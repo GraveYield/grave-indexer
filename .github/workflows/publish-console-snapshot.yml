@@ -283,32 +283,39 @@ name: publish-console-snapshot
 # EXPLICITLY at job level: the automatic GITHUB_TOKEN is READ-ONLY in
 # every job of this workflow, and no job-level grant can elevate it.
 # The ONLY write-capable credential is the `GY_RELEASE_PAT` secret on
-# the six trusted release-mutation steps (step-level env only): the
-# release job's draft create+upload step, its draft verify+publish step,
-# its failure-path draft-cleanup step, the promote job's stable-ref
-# activation step, the promote job's failure-path rollback step, and the
-# dedicated rollback job's single ref-mutation step. An
+# the seven trusted release mutation/retrieval steps (step-level env
+# only): the release job's draft create+upload step, its draft-byte
+# retrieval step (SIXTEENTH-ROUND P1: authenticated retrieval ONLY —
+# zero custom code), its publish step, its failure-path draft-cleanup
+# step, the promote job's stable-ref activation step, the promote job's
+# failure-path rollback step, and the dedicated rollback job's single
+# ref-mutation step. The full draft-byte verification (sixteenth round)
+# runs in a step that carries NO credential, so repository-built code
+# never coexists with the write credential. An
 # untrusted pull_request context cannot reach any step:
 # workflow_dispatch is the only trigger, all eight jobs are gated to
 # refs/heads/main, and the workflow-level default is read-only.
 #
-# RELEASE PROTECTION MODEL (review Task 3; TWELFTH-ROUND CORRECTION):
-# GitHub-enforced immutable-release status is UNKNOWN — the authorized
-# endpoint (GET /repos/<owner>/<repo>/immutable-releases) requires
-# authentication (unauthenticated calls return 401/403), and no
-# authorized endpoint result has been obtained; an unauthenticated or
-# under-privileged observation CANNOT distinguish "disabled" from "not
-# visible". Immutability is therefore a WORKFLOW-LEVEL convention here,
-# honestly documented: releases are created with --latest=false, assets
-# are never re-uploaded or deleted, `--clobber` is never used, and any
-# tag or release collision fails closed. The publisher is nonetheless
-# PREPARED for enforcement: the release job now runs the DRAFT-FIRST
-# sequence (create draft → upload → verify draft assets → publish with
-# make_latest=false → read-only verification → pointer activation), which
-# is compatible with the feature enabled AND disabled. Enabling it
-# remains an owner decision (docs/SNAPSHOT_PUBLICATION.md §8); the
-# publish-time latest-designation behavior should still be re-verified on
-# the rehearsal target first.
+# RELEASE PROTECTION MODEL (review Task 3; FOURTEENTH-ROUND SETTLEMENT):
+# GitHub-enforced immutable releases are NOT enabled — SETTLED with an
+# AUTHORIZED endpoint result on 2026-11-23:
+# GET /repos/<owner>/<repo>/immutable-releases returned HTTP 200 with
+# {"enabled": false, "enforced_by_owner": false} (read-only query, no
+# setting changed). This supersedes the twelfth-round UNKNOWN record
+# (unauthenticated 401/403 probes, which cannot distinguish "disabled"
+# from "not visible"). Immutability is therefore a WORKFLOW-LEVEL
+# convention here, honestly documented: releases are created with
+# --latest=false, assets are never re-uploaded or deleted, `--clobber`
+# is never used, and any tag or release collision fails closed. The
+# publisher is nonetheless COMPATIBLE with enforcement: the release job
+# runs the DRAFT-FIRST sequence (create draft → upload by release ID →
+# retrieve the exact draft bytes → FULL schema-v2 + provenance +
+# integrity + completeness verification over those bytes → publish with
+# make_latest=false → read-only verification → pointer activation),
+# which works identically with the feature enabled AND disabled.
+# Enabling it remains an owner decision (docs/SNAPSHOT_PUBLICATION.md
+# §8, §18); the sequence has been exercised LIVE in the isolated
+# rehearsal repository (2026-11-23, docs/PUBLICATION_REHEARSAL.md §5).
 
 on:
   workflow_dispatch:
@@ -642,17 +649,22 @@ jobs:
       previous_pointer_json: ${{ steps.rollback.outputs.previous_pointer_json }}
 
   # ─────────────────────────────────────────────────────────────────────
-  # 4. release — PRIVILEGED but ZERO CUSTOM CODE: the only job that
-  #    creates the versioned release. The automatic GITHUB_TOKEN stays
-  #    READ-ONLY (explicit contents:read); the ONLY write-capable
-  #    credential is the owner-provisioned `GY_RELEASE_PAT` secret,
-  #    attached as step-level env to the pinned `gh release` mutation
-  #    step alone. Every other step is a token-free precondition (or an
-  #    authenticated READ gate using the automatic token). No node, no
-  #    repository script, no downloaded-code execution.
+  # 4. release — create + FULLY VERIFY + publish the versioned release,
+  #    draft-first. The automatic GITHUB_TOKEN stays READ-ONLY (explicit
+  #    contents:read); the ONLY write-capable credential is the owner-
+  #    provisioned `GY_RELEASE_PAT` secret, attached as step-level env to
+  #    the pinned mutation/retrieval steps alone (draft create+upload,
+  #    draft-byte retrieval, publish, failure-path cleanup) — every one
+  #    of them zero-custom-code (pinned gh/curl/jq/shell only). The FULL
+  #    draft-byte verification (sixteenth round, P1) runs between the
+  #    retrieval and the publish in a step whose env carries NO
+  #    credential: the release-write PAT never coexists with the
+  #    release-ops bundle code, and every other step is a token-free
+  #    precondition (or an authenticated READ gate using the automatic
+  #    token).
   # ─────────────────────────────────────────────────────────────────────
   release:
-    name: create + upload the immutable versioned release (privileged — trusted gh operations only, no custom code)
+    name: create + verify + publish the immutable versioned release (privileged mutations — pinned gh operations only; verification runs credential-free)
     needs: publish
     # Layer 1 of the main-only restriction on the release-writing job.
     if: github.ref == 'refs/heads/main'
@@ -667,12 +679,18 @@ jobs:
       contents: read
     env:
       # NOTE: no GH_TOKEN and no GY_RELEASE_PAT at job level — the write
-      # credential exists ONLY as the step-level env of the `gh release`
-      # mutation step below. This job contains NO checkout, NO
-      # setup-node, NO pnpm, NO dependency installation, NO node
-      # invocation and NO repository-built or artifact-executed code:
-      # nothing here can reach the privileged credential except the
-      # pinned gh release-mutation command itself.
+      # credential exists ONLY as the step-level env of the PAT-bearing
+      # steps below (draft create+upload, draft-byte retrieval, publish,
+      # failure-path cleanup), and every one of them is a PINNED gh/curl
+      # operation with zero custom code. This job contains NO checkout,
+      # NO setup-node, NO pnpm and NO dependency installation. The
+      # SIXTEENTH-ROUND P1 correction moves the FULL draft verification
+      # into this job, but deliberately OUTSIDE the credential's scope:
+      # the only node invocation (the prebuilt release-ops bundle) runs
+      # in a step whose env carries NO token of any kind, so the write
+      # credential NEVER coexists with repository-built or artifact-
+      # executed code — the PAT steps remain zero-custom-code, and the
+      # code steps remain zero-credential.
       REPO: ${{ github.repository }}
       CHECKOUT_SHA: ${{ github.sha }} # the commit asserted by generate/verify
     steps:
@@ -827,23 +845,44 @@ jobs:
           done
           echo "draft release created and uploaded: $TAG (release id $DRAFT_RELEASE_ID)"
 
-      - name: Verify the DRAFT assets (digests + provenance), then publish the release
-        # The reviewer-required verify-BEFORE-publish gate: under GitHub-
-        # enforced immutable releases, a published release's assets are
-        # locked — so the byte-level verification must happen on the DRAFT,
-        # before the publish makes the asset set immutable. The FULL
-        # schema-v2 + completeness verification over fetched bytes remains
-        # with the read-only verify-versioned job AFTER publish (a
-        # read-only token cannot see drafts) and BEFORE pointer activation
-        # (needs: gate) — the safety property is unchanged: the stable
-        # reference can never move until the published release verified.
-        # Failures here abort BEFORE publish: the release stays an
-        # un-published draft (no immutable residue), the stable reference
-        # is untouched, and the previous artifact keeps serving.
+      - name: Retrieve the exact DRAFT bytes (authenticated retrieval only — zero verification code)
+        # SIXTEENTH-ROUND CORRECTION (P1 — complete draft verification
+        # BEFORE publication): the former single "verify + publish" step
+        # checked only asset presence, byte lengths, digests and the
+        # provenance tag on the draft, and left the FULL schema-v2 +
+        # completeness verification to the post-publish verify-versioned
+        # job. The draft bytes must now undergo the FULL existing
+        # release-ops verification BEFORE the publish. A draft is
+        # addressable only with push access, so the retrieval is the ONE
+        # thing that needs the PAT — but the verification itself is
+        # repository-built code (the release-ops bundle), and the PAT
+        # must NEVER reach repository-built code. The safe separation:
+        #   * THIS step: authenticated retrieval ONLY — the PAT reads
+        #     the draft by ID and downloads the three exact uploaded
+        #     bytes. Zero custom code (pinned gh api + jq + shell only).
+        #   * The NEXT steps (NO credential in their env): the prebuilt
+        #     release-ops bundle verifies the exact downloaded bytes with
+        #     the SAME core verify-release-assets applies to its own
+        #     fetched bytes (checksum + provenance + integrity +
+        #     completeness) — node runs with NO token present.
+        #   * The publish step afterwards: the pinned PATCH mutation.
+        # A read-only token cannot see a draft, so the retrieval step is
+        # PAT-scoped; the verification and every other step of this job
+        # is credential-free.
         env:
           TAG: ${{ needs.publish.outputs.versioned_tag }}
-          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # required to READ the draft (draft listings are push-access-only)
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # required to READ the draft (draft listings are push-access-only); retrieval ONLY
         run: |
+          # Re-verify the draft's identity BEFORE downloading anything:
+          # the release must STILL be a draft and must carry THIS run's
+          # exact tag (the same pre-deletion identity checks the failure-
+          # path cleanup enforces; a published or foreign release is
+          # never downloaded or mutated here).
+          release_json=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID") || { echo "release $DRAFT_RELEASE_ID could not be read; refusing to retrieve from an unverifiable release"; exit 1; }
+          is_draft=$(printf '%s' "$release_json" | jq -r '.draft')
+          release_tag=$(printf '%s' "$release_json" | jq -r '.tag_name')
+          if [ "$is_draft" != "true" ]; then echo "release $DRAFT_RELEASE_ID is NOT a draft (draft='$is_draft') — refusing to retrieve"; exit 1; fi
+          if [ "$release_tag" != "$TAG" ]; then echo "release $DRAFT_RELEASE_ID carries tag '$release_tag', not this run's tag '$TAG' — refusing to retrieve a foreign release"; exit 1; fi
           # Presence: exactly the three required assets, no fewer.
           names=$(gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID/assets" --jq '[.[].name] | sort | join("\n")')
           # FIFTEENTH ROUND (live rehearsal finding): jq's `sort` orders by
@@ -858,7 +897,7 @@ jobs:
             echo "draft asset presence check FAILED — assets on the draft:"; echo "$names"; exit 1
           fi
           # Download the three assets BACK from the draft (by asset ID,
-          # octet-stream) and re-run the checksum belt over the exact
+          # octet-stream) and run the checksum belt over the exact
           # uploaded bytes — the same belt the release job already ran
           # over its staged bundle, now over what GitHub actually holds.
           rm -rf dl && mkdir dl
@@ -868,15 +907,66 @@ jobs:
             gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$asset_id" > "dl/$asset"
           done
           ( cd dl && sha256sum -c console-snapshot.sha256 )
-          # Provenance must name THIS exact release tag (a cross-release or
-          # foreign sidecar can never pass).
-          if ! jq -e --arg tag "$TAG" '.versionedTag == $tag' dl/console-snapshot-provenance.json > /dev/null; then
-            echo "the staged provenance does not name the release tag $TAG — refusing to publish"; exit 1
-          fi
+          echo "the exact draft bytes are retrieved (release id $DRAFT_RELEASE_ID, tag $TAG); the write credential is NOT available to any later step"
+
+      - name: Download the prebuilt release-ops bundle (credential-free)
+        # The verification bundle travels through the run-scoped artifact
+        # service from the read-only verify job (built from the EXACT
+        # github.sha commit — the same trust chain verify-versioned
+        # relies on). NO token exists on this step.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # actions/download-artifact v4
+        with:
+          name: release-ops-cli
+          path: ops
+
+      - name: Assert the release-ops bundle exists (fail closed)
+        run: |
+          test -f ops/release-ops.mjs || { echo "release-ops bundle missing — the draft verification refuses to run without the verified bundle"; exit 1; }
+
+      - name: FULL verification of the exact DRAFT bytes (schema-v2 + provenance + integrity + completeness — credential-free)
+        # SIXTEENTH-ROUND CORRECTION (P1): the FULL existing release-ops
+        # verification now runs over the exact downloaded draft bytes
+        # BEFORE publication. `verify-local-release-assets` calls the
+        # SAME core `verify-release-assets` applies to its own fetched
+        # bytes (verifyArtifactTriple — no weaker parallel validator):
+        #   * the checksum file must match the EXACT snapshot bytes;
+        #   * the provenance sidecar must parse, must NAME this exact
+        #     release tag, and must verify over the bytes (SHA-256 +
+        #     byte length);
+        #   * the schema-v2 completeness contract is enforced
+        #     independently: incomplete discovery/enrichment evidence,
+        #     malformed completeness evidence, mismatched enriched
+        #     counts, empty artifacts and invalid checksums are all
+        #     rejected with condition-identifying errors.
+        # CREDENTIAL BOUNDARY: this step carries NO GH_TOKEN and NO
+        # GY_RELEASE_PAT — the write credential's step-level env ended
+        # with the retrieval step. The release-write PAT therefore NEVER
+        # coexists with repository-built code (the zero-custom-code
+        # restriction in privileged steps is preserved), and the command
+        # performs zero network I/O (pure local verification).
+        # If ANY verification fails, the run aborts BEFORE the publish:
+        # the release REMAINS an un-published draft (no immutable
+        # residue, no tag materialized), the stable reference is
+        # untouched, and the previous artifact keeps serving.
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+        run: |
+          node ops/release-ops.mjs verify-local-release-assets --dir dl --expected-tag "$TAG"
+
+      - name: Publish the VERIFIED draft (draft=false + make_latest=false, then read-back)
+        # Runs ONLY after the full draft verification passed: the publish
+        # materializes the versioned tag at $CHECKOUT_SHA; a racing
+        # duplicate tag fails closed here (422), before activation. The
+        # read-only verify-versioned job re-verifies the PUBLISHED
+        # release end-to-end afterwards and remains the gate before
+        # pointer activation (needs: chain) — the stable reference can
+        # never move until the published release verified too.
+        env:
+          TAG: ${{ needs.publish.outputs.versioned_tag }}
+          GH_TOKEN: ${{ secrets.GY_RELEASE_PAT }} # the publish mutation needs push access; scoped to this step only
+        run: |
           # Publish: draft=false + make_latest=false (explicit STRING — the
-          # API models make_latest as true/false/legacy). The publish
-          # materializes the versioned tag at $CHECKOUT_SHA; a racing
-          # duplicate tag fails closed here (422), before activation.
+          # API models make_latest as true/false/legacy).
           gh api --method PATCH "repos/$REPO/releases/$DRAFT_RELEASE_ID" \
             -F draft=false \
             -f make_latest=false > /dev/null
@@ -942,10 +1032,31 @@ jobs:
             echo "release $DRAFT_RELEASE_ID carries tag '$draft_tag', not this run's tag '$TAG' — refusing to delete a foreign release; OPERATOR INTERVENTION REQUIRED"; exit 1
           fi
           gh api --method DELETE "repos/$REPO/releases/$DRAFT_RELEASE_ID"
-          if gh api "repos/$REPO/releases/$DRAFT_RELEASE_ID" > /dev/null 2>&1; then
-            echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still exists — OPERATOR INTERVENTION REQUIRED"; exit 1
-          fi
-          echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted; the stable reference and every published release were never touched"
+          # SIXTEENTH-ROUND CORRECTION (P2 — explicit read-back
+          # classification): the former read-back treated ANY failed
+          # release lookup after the DELETE as proof that the draft was
+          # deleted — a 401/403/429/5xx response, a network failure, or a
+          # malformed response was silently reinterpreted as "the draft is
+          # gone". The read-back now classifies the EXACT HTTP outcome:
+          #   HTTP 404 — deletion CONFIRMED (the ONLY success verdict);
+          #   HTTP 200 — the release STILL EXISTS: cleanup FAILED;
+          #   HTTP 401/403, 429, 5xx, transport failure, malformed
+          #            response or ANY other unexpected status — the
+          #            deletion status is UNKNOWN.
+          # Successful deletion is claimed ONLY on a genuine 404; every
+          # other outcome reports OPERATOR INTERVENTION REQUIRED and the
+          # step exits non-zero. A published release or another run's
+          # release is never deleted (the pre-deletion identity checks
+          # above are unchanged).
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID") || { echo "draft cleanup read-back FAILED (curl transport error): the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN — never claimed successful; OPERATOR INTERVENTION REQUIRED"; exit 1; }
+          case "$code" in
+            404) echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted (read-back HTTP 404 — deletion confirmed); the stable reference and every published release were never touched" ;;
+            200) echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still EXISTS (HTTP 200) — the deletion did NOT succeed; OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+            *) echo "draft cleanup read-back INCONCLUSIVE: unexpected HTTP $code for release $DRAFT_RELEASE_ID — the deletion status is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+          esac
     outputs:
       versioned_tag: ${{ needs.publish.outputs.versioned_tag }}
 

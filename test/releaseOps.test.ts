@@ -45,8 +45,12 @@ import {
   type HttpImpl,
   type MinimalHttpResponse,
 } from "../src/releaseOps.js";
-import { cmdReleaseLatest, cmdVerifyReleaseAssets, cmdVerifyStable } from "../src/cli.js";
+import { cmdReleaseLatest, cmdVerifyLocalReleaseAssets, cmdVerifyReleaseAssets, cmdVerifyStable } from "../src/cli.js";
+import { verifyArtifactTriple } from "../src/releaseOps.js";
 import { parseConsoleSnapshot } from "../src/consoleSnapshotParse.js";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // ─── Fixture machinery (real schema-v2 snapshots, same builders as prod) ───
 
@@ -1331,3 +1335,161 @@ describe("releaseOps — independent completeness gate over fetched bytes (Findi
     }
   });
 });
+
+// ─── Sixteenth round (P1) — FULL verification of LOCAL draft bytes ──────────
+//
+// The draft-verification separation: a privileged retrieval step downloads
+// the three DRAFT assets by release ID (the only PAT-bearing part), and the
+// credential-free `verify-local-release-assets` command runs the EXACT same
+// verification core (`verifyArtifactTriple` — the function
+// `verifyReleaseAssetSet` calls post-fetch) over the exact downloaded bytes.
+// These tests drive the REAL command through its production entry point
+// (re-exported by src/cli.ts) over REAL files on disk, pinning that the
+// verifier accepts a valid triple and rejects — with condition-identifying
+// errors — invalid checksums, malformed/mismatched provenance, incomplete
+// completeness evidence, count drift, empty artifacts and missing files.
+describe("verify-local-release-assets — FULL local verification of the exact draft bytes (sixteenth round, P1)", () => {
+  /** Write a triple to a temp directory, exactly like the workflow's retrieval step leaves it. */
+  function dirFor(snapshotBytes: Uint8Array, provenanceBytes: Uint8Array, checksumBytes: Uint8Array): string {
+    const dir = mkdtempSync(join(tmpdir(), "releaseops-local-verify-"));
+    writeFileSync(join(dir, SNAPSHOT_ASSET_NAME), Buffer.from(snapshotBytes));
+    writeFileSync(join(dir, PROVENANCE_ASSET_NAME), Buffer.from(provenanceBytes));
+    writeFileSync(join(dir, CHECKSUM_ASSET_NAME), Buffer.from(checksumBytes));
+    dirs.push(dir);
+    return dir;
+  }
+  const dirs: string[] = [];
+
+  /** The VALID bundle's provenance with a drifted enriched count (digest + length still intact). */
+  function countDriftedProvenanceBytes(tag: string): Uint8Array {
+    const drifted = JSON.parse(JSON.stringify(B.provenance)) as PublicationProvenance;
+    drifted.counts.enriched += 1;
+    drifted.versionedTag = tag;
+    return new TextEncoder().encode(JSON.stringify(drifted));
+  }
+
+  /** A bundle whose SNAPSHOT carries a completeness failure marker (sidecar rebuilt over the exact modified bytes). */
+  function markerBundle(tag: string, stage: string): ReturnType<typeof bundleFor> {
+    const { snapshot, bytes } = realSnapshotAt(NOW_MS);
+    const raw = JSON.parse(Buffer.from(bytes).toString("utf8")) as { failures: unknown[] };
+    raw.failures.push({ stage, reason: "injected regression marker (test)" });
+    const modified = new TextEncoder().encode(JSON.stringify(raw));
+    const provenance = buildPublicationProvenance(
+      parseConsoleSnapshot(JSON.parse(new TextDecoder().decode(modified))),
+      modified,
+      {
+        sourceCommitSha: SOURCE_COMMIT,
+        workflowRunId: "1",
+        workflowAttempt: "1",
+        repository: REPO,
+        versionedTag: tag,
+      },
+    );
+    return {
+      provenance,
+      snapshot: modified,
+      provenanceBytes: new TextEncoder().encode(JSON.stringify(provenance)),
+      checksum: new TextEncoder().encode(`${snapshotSha256(modified)}  ${SNAPSHOT_ASSET_NAME}\n`),
+    };
+  }
+
+  test("a VALID triple passes the full local verification (exit 0)", async () => {
+    const dir = dirFor(B.snapshot, B.provenanceBytes, B.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.equal(exit, 0, "the exact downloaded draft bytes of a valid publication verify");
+  });
+
+  test("an INVALID checksum (mutated snapshot bytes, stale sidecar) is rejected", async () => {
+    const mutated = B.snapshot.slice();
+    const lastIdx = mutated.length - 1;
+    mutated.set([Number(mutated[lastIdx]) ^ 0xff], lastIdx);
+    const dir = dirFor(mutated, B.provenanceBytes, B.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "invalid checksums can never verify");
+  });
+
+  test("a provenance sidecar naming a FOREIGN tag is rejected (mixed artifact set)", async () => {
+    const foreign = new TextEncoder().encode(JSON.stringify(A.provenance));
+    const dir = dirFor(B.snapshot, foreign, B.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "a cross-release sidecar can never pass the draft verification");
+  });
+
+  test("a snapshot carrying a discovery-completeness marker is rejected BEFORE publication", async () => {
+    const M = markerBundle(TAG_B, "discovery-completeness");
+    const dir = dirFor(M.snapshot, M.provenanceBytes, M.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "incomplete discovery evidence can never be published");
+  });
+
+  test("a snapshot carrying an enrichment-completeness marker is rejected BEFORE publication", async () => {
+    const M = markerBundle(TAG_B, "enrichment-completeness");
+    const dir = dirFor(M.snapshot, M.provenanceBytes, M.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "incomplete enrichment evidence can never be published");
+  });
+
+  test("a count-drifted sidecar (enriched counts disagree) is rejected BEFORE publication", async () => {
+    const dir = dirFor(B.snapshot, countDriftedProvenanceBytes(TAG_B), B.checksum);
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "mismatched counts can never be published");
+  });
+
+  for (const [kind, bytes] of [
+    ["snapshot", () => new Uint8Array(0)],
+    ["provenance", () => new Uint8Array(0)],
+    ["checksum", () => new Uint8Array(0)],
+  ] as const) {
+    test(`an EMPTY ${kind} artifact is rejected with an asset-naming error`, async () => {
+      const empty = new Uint8Array(0);
+      const dir = dirFor(
+        kind === "snapshot" ? empty : B.snapshot,
+        kind === "provenance" ? empty : B.provenanceBytes,
+        kind === "checksum" ? empty : B.checksum,
+      );
+      const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+      assert.notEqual(exit, 0, "empty artifacts can never verify");
+    });
+  }
+
+  test("a MISSING artifact file is rejected with an actionable error naming the asset", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "releaseops-local-verify-"));
+    dirs.push(dir);
+    writeFileSync(join(dir, SNAPSHOT_ASSET_NAME), Buffer.from(B.snapshot));
+    writeFileSync(join(dir, PROVENANCE_ASSET_NAME), Buffer.from(B.provenanceBytes));
+    // checksum file intentionally absent
+    const exit = await cmdVerifyLocalReleaseAssets({ dir, expectedTag: TAG_B });
+    assert.notEqual(exit, 0, "an incomplete artifact set is refused");
+  });
+
+  test("verifyArtifactTriple (the shared core) rejects an empty snapshot naming the exact asset", () => {
+    assert.throws(
+      () => verifyArtifactTriple({ snapshotBytes: new Uint8Array(0), provenanceBytes: B.provenanceBytes, checksumBytes: B.checksum, expectedTag: TAG_B }),
+      (err: unknown) => err instanceof ReleaseOpsError && err.message.includes(`${SNAPSHOT_ASSET_NAME}' artifact is EMPTY`),
+    );
+  });
+
+  test("verifyArtifactTriple is the SAME core verifyReleaseAssetSet applies post-fetch (valid fetched triple passes it)", async () => {
+    // Drive verifyReleaseAssetSet over an injected fetch transport and let
+    // verifyArtifactTriple accept the same bytes it fetched — proving the
+    // local gate is not a weaker parallel validator.
+    let tripleSeen = false;
+    const base = `https://github.com/${REPO}/releases/download/${TAG_B}`;
+    const byUrl = new Map([
+      [`${base}/${SNAPSHOT_ASSET_NAME}`, B.snapshot],
+      [`${base}/${PROVENANCE_ASSET_NAME}`, B.provenanceBytes],
+      [`${base}/${CHECKSUM_ASSET_NAME}`, B.checksum],
+    ]);
+    const impl: FetchAssetImpl = async (url) => {
+      const bytes = byUrl.get(url);
+      if (!bytes) throw new Error(`unexpected url ${url}`);
+      tripleSeen = true;
+      return bytes;
+    };
+    await verifyReleaseAssetSet({ repository: REPO, tag: TAG_B, scope: "versioned", expectedTag: TAG_B, fetchAsset: impl });
+    assert.ok(tripleSeen, "the fetch happened");
+    // The identical bytes pass the shared core directly.
+    verifyArtifactTriple({ snapshotBytes: B.snapshot, provenanceBytes: B.provenanceBytes, checksumBytes: B.checksum, expectedTag: TAG_B });
+  });
+});
+
