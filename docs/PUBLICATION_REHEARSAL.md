@@ -228,3 +228,35 @@ latest-designation behavior should be re-verified on the rehearsal
 target first. Production Console ingestion is NOT operational (the
 Console's single-GET `GY_SNAPSHOT_URL` contract requires the §13.2
 two-step resolver, which is an owner-approval gate outside this task).
+
+---
+
+## 5. EXECUTED (2026-11-23): all five scenarios ran live — evidence and findings
+
+The repository was initialized (full project mirror with the
+`vendor/protocol` submodule gitlink; the workflow + this protocol) with
+the owner-provided authorized credential, and all five scenarios were
+dispatched and completed on the branch head's workflow:
+
+| Scenario | Run | Conclusion | Note |
+| --- | --- | --- | --- |
+| `happy` | 45178513528 | success | full draft-first pointer architecture, rollback drill, re-activation |
+| `partial-upload` | 45178674124 | success | draft belt refuses the partial draft; stable ref unchanged |
+| `promotion-failure` | 45179021062 | success | missing-release activation refused |
+| `incomplete-artifact` | 45179687002 | success | marker bundle refused by verify-snapshot; no release |
+| `post-activation-failure` | 45178728162 | failure (EXPECTED) | injection; failure-triggered rollback verified the restored state |
+
+The first dispatch attempt for the last two scenarios was CANCELLED while
+queued (GitHub keeps only the newest queued run in a concurrency group);
+they were re-dispatched individually after the previous run completed.
+
+Four real defects were found live and fixed on the PR branch before the
+successful runs (releases-LIST eventual-consistency retry; the sorted-list
+presence check that could never pass; the GITHUB_ENV case-sensitivity bug;
+the unconstructible incomplete fixture). Full details:
+docs/SNAPSHOT_PUBLICATION.md §19. The residual rehearsal gap (§4) is now
+CLOSED for every behavior the five scenarios cover: the pointer
+architecture, the unrelated-release probe, the rollback drill, the
+state-aware reactivation, the failure-triggered rollback path, and the
+draft-first publish sequence all ran against real GitHub behavior with the
+runs' own read-only gates proving each result.

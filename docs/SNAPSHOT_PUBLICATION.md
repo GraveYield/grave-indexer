@@ -1497,3 +1497,90 @@ blocked" claim reconciled in place (§8 table, §8 item 1, owner actions,
   dispatched; NO release, tag, or stable reference was created,
   modified, or deleted in ANY repository; NO Vercel/Console/blockchain
   state was touched.
+
+## 19. Fifteenth round — the rehearsal was EXECUTED: all five scenarios ran live; four real defects found and fixed (2026-11-23)
+
+The isolated rehearsal repository `GraveYield/grave-indexer-pub-rehearsal`
+was initialized (full project mirror + `vendor/protocol` submodule gitlink
++ the rehearsal workflow) with the owner-provided authorized credential,
+and ALL FIVE scenarios were dispatched and completed. This converts the
+rehearsal status from PREPARED — NOT EXECUTED to EXECUTED with live
+evidence, and it did exactly what rehearsals are for: it found FOUR real
+defects that every offline battery and 440 tests had missed.
+
+### 19.1 Execution evidence
+
+| Scenario | Run | Conclusion | Validity |
+| --- | --- | --- | --- |
+| `happy` | 45178513528 | success | the FULL draft-first pointer architecture end-to-end |
+| `partial-upload` | 45178674124 | success | belt refusal on the DRAFT, stable ref unchanged |
+| `promotion-failure` | 45179021062 | success | missing-release pointer refused, stable ref unchanged |
+| `incomplete-artifact` | 45179687002 | success | marker-carrying bundle refused, no release created |
+| `post-activation-failure` | 45178728162 | failure (EXPECTED) | injection at step 28; failure-triggered rollback (29) + restored-state verification (30) succeeded |
+
+All runs: https://github.com/GraveYield/grave-indexer-pub-rehearsal/actions
+(the runs at 45175772727, 45176121803, 45177019594, 45178093622, 45179173221
+are the diagnostic failures below; the runs 45178692742 and 45178710402
+were CANCELLED while queued — GitHub keeps only the newest queued run in a
+concurrency group — and were re-dispatched individually).
+
+Final remote state after the drill: three PUBLISHED versioned releases
+(three assets each, `--latest=false`), the dedicated
+`refs/tags/console-snapshot-prod` reference pointing at an annotated tag
+object whose message is the stable-pointer JSON for the
+post-activation-failure run's restored pointer — the full identity chain
+was verified LIVE by the runs' own read-only gates (`verify-release-assets`,
+`stable-pointer-build`, read-back, `verify-stable`). The releases created
+during DIAGNOSTIC failures (e.g. 455422229, published before the
+env-var finding aborted the run) are rehearsal material retained for
+inspection. Production repositories were never touched.
+
+### 19.2 Findings — all fixed on this branch
+
+1. **Releases-LIST eventual consistency (both workflows):** the draft
+   resolution read immediately after `gh release create` returned FAILED
+   LIVE (~300 ms later the draft was absent from the list; present on a
+   later read). Fix: bounded retry (10 x 2 s) BEFORE the unchanged
+   fail-closed gate, on the draft resolution AND the publish read-back.
+2. **Asset presence check could NEVER pass (both workflows):** jq's
+   `sort` (codepoint order) puts `console-snapshot-provenance.json`
+   (`-` = 0x2D) BEFORE `console-snapshot.json` (`.` = 0x2E), but the
+   expected list was a `printf` in a different order — the check fired
+   SAFETY FAILURE with ALL THREE assets present. Fix: the expected list
+   is now sorted with `LC_ALL=C sort` (byte order = jq order), in both
+   workflows; the pin was updated.
+3. **GITHUB_ENV case sensitivity (rehearsal):** the workflow wrote
+   lowercase `tag=` but every cross-step reference reads `$TAG` — the
+   verification gate failed with a CLI usage error on an empty argument.
+   Fix: write `TAG=` (production is unaffected — it passes the tag as a
+   job output).
+4. **Incomplete fixture was unconstructible (rehearsal):**
+   `buildConsoleSnapshot` is fail-closed at construction ("missing
+   enrichment for ordered pool ..."), so the `--incomplete` fixture
+   crashed at generation instead of producing a bundle for
+   `verify-snapshot` to refuse. Fix: the fixture now reproduces the real
+   producer's path — a complete construction followed by the
+   `enrichment-completeness` failure MARKER (exactly what src/cli.ts
+   writes), which `verify-snapshot` refuses with the recorded
+   completeness error (verified locally: refused exit 1; the complete
+   bundle still passes exit 0).
+
+Each fix was validated with the full offline battery on the exact pushed
+tree (440/440, typecheck, build, bundle, YAML parse, `bash -n` over all
+`run:` blocks) before being re-dispatched; every re-run after a fix
+progressed past the fixed point.
+
+### 19.3 Honest residue and scope
+
+* The rehearsal repository now holds rehearsal artifacts (three published
+  releases, one annotated pointer tag object, one unrelated-release probe
+  release from the `happy` drill). They are NON-PRODUCTION rehearsal
+  material and may be cleaned up by the owner after evidence review; the
+  workflow itself created them and they prove nothing about production
+  repositories.
+* The production publisher (`publish-console-snapshot.yml`) received the
+  SAME consistency-window and sorted-list fixes (Findings 1 and 2 apply
+  to identical code paths) — but it has never been dispatched in
+  production, and no production release, tag, or stable reference exists
+  or was created. The first production publication remains the owner's
+  explicit action.
