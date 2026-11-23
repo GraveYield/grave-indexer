@@ -2517,6 +2517,44 @@ const server = createServer((req, res) => {
     setTimeout(() => req.socket.destroy(), 10); // transport-level failure: the socket dies BEFORE any HTTP status
     return;
   }
+  if (mode === "drip-headers") {
+    // TWENTIETH ROUND: a slow drip of STATUS-LINE / HEADER bytes. The raw
+    // response bytes are written directly on the socket one byte at a time
+    // (every drip far below any per-read timeout) and the header block
+    // NEVER completes (no terminating CRLF CRLF). Only an absolute
+    // deadline enforced DURING status-line and header parsing can end
+    // this request — a per-read socket timeout alone cannot (each drip
+    // byte proves liveness and resets the per-read wait).
+    req.socket.write(Buffer.from("HTTP/1.1 404 Not Found\\r\\nContent-Type: application/json\\r\\nX-Drip: ", "utf8"));
+    const drip = Buffer.alloc(behavior.dripChunkBytes ?? 1, 0x30);
+    let sent = 0;
+    const max = behavior.dripMaxChunks ?? 2000;
+    const timer = setInterval(() => {
+      if (req.socket.destroyed || sent >= max) { clearInterval(timer); if (!req.socket.destroyed) req.socket.end(); return; }
+      req.socket.write(drip);
+      sent++;
+    }, behavior.dripDelayMs ?? 30);
+    req.on("close", () => clearInterval(timer));
+    return;
+  }
+  if (mode === "drip-framing") {
+    // TWENTIETH ROUND: complete headers arrive quickly, then the CHUNK-SIZE
+    // LINE of a chunked transfer body drips one byte at a time and NEVER
+    // completes. The framing read happens INSIDE resp.read1()'s chunked
+    // decoder — only an absolute deadline enforced DURING chunk framing
+    // can end this request; a per-read socket timeout alone cannot.
+    req.socket.write(Buffer.from("HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nTransfer-Encoding: chunked\\r\\nConnection: close\\r\\n\\r\\n", "utf8"));
+    const drip = Buffer.alloc(behavior.dripChunkBytes ?? 1, 0x3b);
+    let sent = 0;
+    const max = behavior.dripMaxChunks ?? 2000;
+    const timer = setInterval(() => {
+      if (req.socket.destroyed || sent >= max) { clearInterval(timer); if (!req.socket.destroyed) req.socket.end(); return; }
+      req.socket.write(drip);
+      sent++;
+    }, behavior.dripDelayMs ?? 30);
+    req.on("close", () => clearInterval(timer));
+    return;
+  }
   if (mode === "stall-headers") {
     // headers never arrive — exercises the connection timeout; the
     // socket stays open until the client gives up.
@@ -3327,6 +3365,106 @@ process.on("SIGTERM", () => { server.closeAllConnections?.(); server.close(() =>
     const res = runCleanup(baseEnv({ GH_TOKEN: "", MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBase }));
     assertUnknownOutcome(res);
     assert.match(res.stdout, /no read-back credential/, "the missing credential is explicit");
+  });
+
+  // ── TWENTIETH ROUND: (1) the ABSOLUTE deadline covers EVERY parsing
+  //    stage — status-line parsing, header reads and chunk framing, not
+  //    only the between-read gaps — so a slow drip of header or framing
+  //    bytes (each byte arriving far below the per-read timeout) can
+  //    never extend the request past the deadline; on expiry the
+  //    connection is closed, the outcome is UNKNOWN and the step exits
+  //    non-zero. (2) the release id is validated as a GENUINE JSON
+  //    integer — strings, booleans, floats and null are rejected BEFORE
+  //    any comparison, and the comparison is integer equality. Every
+  //    executed case runs the ACTUAL cleanup step against the
+  //    deterministic local read-back server. ──
+  test("STRUCTURAL (twentieth round): the response is consumed through a deadline-enforcing reader and the id is a strict JSON integer", () => {
+    const py = cleanupRun.slice(cleanupRun.indexOf("<<'GY_READBACK_PY'"));
+    assert.match(py, /class _DeadlineReader/, "a dedicated reader enforces the deadline on EVERY underlying receive");
+    assert.match(py, /remaining = self\._deadline - time\.monotonic\(\)/, "the remaining time is recomputed from the monotonic deadline before EVERY receive");
+    assert.match(py, /self\._sock\.settimeout\(remaining\)/, "each receive is bounded by EXACTLY the remaining time to the absolute deadline (so one receive cannot outlive it)");
+    assert.match(py, /raise _DeadlineExceeded\(\)/, "deadline expiry is its own exception — never a transport error and never an HTTP status");
+    assert.match(py, /def readline/, "the reader implements readline — the path of the STATUS LINE, the response HEADERS and the CHUNK-SIZE lines");
+    // The wrapper must be installed BEFORE getresponse(): status-line and
+    // header parsing happen inside that single blocking call.
+    const wrapIdx = py.indexOf("conn.sock = _DeadlineSocket(conn.sock, _DeadlineReader(conn.sock, deadline))");
+    const getresponseIdx = py.indexOf("resp = conn.getresponse()");
+    assert.ok(wrapIdx > -1 && getresponseIdx > -1 && wrapIdx < getresponseIdx, "the deadline-enforcing reader is installed BEFORE getresponse() — status-line and header parsing are covered");
+    const deadlineCatches = py.split("\n").filter((l) => l.trim().startsWith("except _DeadlineExceeded")).length;
+    assert.ok(deadlineCatches >= 2, "deadline expiry is classified in BOTH phases (status line/headers AND body/framing)");
+    assert.match(py, /self\._sock\._io_refs \+= 1/, "the reader mirrors socket.makefile's reference bookkeeping (a will-close response hands the connection to the response object BEFORE the body is read — a premature real close would break every later read)");
+    // The connection is closed on EVERY path (timeout included).
+    assert.match(py, /if conn is not None:\n\s*conn\.close\(\)/, "the connection is closed on EVERY exit path — timeout, deadline expiry, interruption, classification");
+    // ── strict release-ID type ──
+    assert.match(py, /isinstance\(parsed\["id"\], bool\) or not isinstance\(parsed\["id"\], int\)/, "a genuine JSON integer is REQUIRED (bool rejected explicitly — bool is a subclass of int in Python)");
+    assert.match(py, /parsed\["id"\] != EXPECTED_RELEASE_ID/, "the identity comparison is INTEGER equality against the expected release id");
+    assert.match(py, /EXPECTED_RELEASE_ID = int\(RELEASE_ID\)/, "the expected id is parsed as an integer (a non-numeric expected id fails closed)");
+    const cleanupCode = cleanupRun.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
+    assert.ok(!cleanupCode.includes('str(parsed.get("id")) != RELEASE_ID'), "the former str() coercion comparison is GONE (the JSON string id once matched the numeric expectation)");
+  });
+
+  test("timeout 18 — SLOW-DRIP HEADERS (each byte far below the per-read timeout, the header block NEVER completes): the ABSOLUTE deadline ends it — a per-read timeout alone cannot", () => {
+    const t0 = Date.now();
+    // One drip byte every 30 ms for 2000 chunks (60 s of material — far
+    // beyond the harness's 45 s kill and the 2 s deadline). The response
+    // NEVER finishes, so the old between-reads-only deadline check (which
+    // could not see inside getresponse()'s header parsing) would hang
+    // here; the deadline-enforcing reader aborts AT the deadline.
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ mode: "drip-headers", dripDelayMs: 30, dripMaxChunks: 2000 }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    // The exact message depends on WHERE the deadline expired (between
+    // receives → the deadline classification; while a receive was blocked
+    // waiting for the next drip → the timeout classification — whose wait
+    // was itself bounded by the remaining time to the deadline). Both name
+    // the absolute monotonic deadline; neither is ever a deletion verdict.
+    assert.match(res.stdout, /deadline/, "the absolute-deadline classification is explicit whichever phase expired");
+    assert.ok(elapsed >= 1.7, `the abort happened AT the absolute deadline — arriving drips did NOT reset it (elapsed ${elapsed.toFixed(1)}s >= 1.7s)`);
+    assert.ok(elapsed < 15, `the 60 s drip did NOT extend the request past the deadline (elapsed ${elapsed.toFixed(1)}s < 15s)`);
+    assert.equal(res.readback.earlyClientClose, true, "the client CLOSED the connection on timeout (the server observed the close — it never finished responding)");
+  });
+
+  test("timeout 19 — SLOW-DRIP CHUNK FRAMING (headers complete quickly, the chunk-size line drips and NEVER completes): the ABSOLUTE deadline ends it", () => {
+    const t0 = Date.now();
+    // The framing read happens INSIDE resp.read1()'s chunked decoder
+    // (readline on the chunk-size line): the nineteenth-round deadline
+    // check ran only BETWEEN read1 calls and could not see inside it.
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ mode: "drip-framing", dripDelayMs: 30, dripMaxChunks: 2000 }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /deadline/, "the absolute-deadline classification is explicit whichever phase expired");
+    assert.ok(elapsed >= 1.7, `the abort happened AT the absolute deadline (elapsed ${elapsed.toFixed(1)}s >= 1.7s)`);
+    assert.ok(elapsed < 15, `the 60 s framing drip did NOT extend the request past the deadline (elapsed ${elapsed.toFixed(1)}s < 15s)`);
+    assert.equal(res.readback.earlyClientClose, true, "the client CLOSED the connection on timeout");
+  });
+
+  const invalidIdCases: Array<[string, string, boolean]> = [
+    ["a STRING id (the former str() coercion would have MATCHED this)", `{"id": "${DRAFT_ID}", "tag_name": "${TAG}", "draft": true}`, true],
+    ["a BOOLEAN id (true)", `{"id": true, "tag_name": "${TAG}", "draft": true}`, false],
+    ["a BOOLEAN id (false)", `{"id": false, "tag_name": "${TAG}", "draft": true}`, false],
+    ["a FLOAT id (1234567.0)", `{"id": ${DRAFT_ID}.0, "tag_name": "${TAG}", "draft": true}`, false],
+    ["a NULL id", `{"id": null, "tag_name": "${TAG}", "draft": true}`, false],
+  ];
+  for (const [name, body, wasStringCoercion] of invalidIdCases) {
+    test(`HTTP 200 with ${name}: UNKNOWN (invalid_id) — a non-integer id can NEVER classify the release as still-existing`, () => {
+      const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: body }));
+      assert.notEqual(res.status, 0, "the step exits non-zero");
+      assert.match(res.stdout, /invalid_id/, "the invalid-id classification is explicit");
+      assert.match(res.stdout, /not a genuine JSON integer/, "the strict-type rule is named");
+      assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
+      assert.ok(!res.stdout.includes("still EXISTS"), "a non-integer id NEVER produces the still-exists verdict");
+      assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
+      if (wasStringCoercion) {
+        assert.notEqual(res.status, 2, "the STRING id is classified UNKNOWN (exit 1), never the definitive still-exists verdict (exit 2) — this is the exact defect the strict type check removes");
+      }
+    });
+  }
+
+  test("control — a GENUINE JSON INTEGER id with the exact draft identity still classifies still-exists (the strict type check does not weaken valid classification)", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: JSON.stringify({ id: Number(DRAFT_ID), tag_name: TAG, draft: true }) }));
+    assert.equal(res.status, 2, "the definitive still-exists verdict is preserved for a genuine integer id");
+    assert.match(res.stdout, /still EXISTS \(HTTP 200\)/, "the still-exists classification is explicit");
+    assert.ok(!res.stdout.includes("invalid_id"), "a genuine integer id is NOT rejected by the type check");
   });
 });
 

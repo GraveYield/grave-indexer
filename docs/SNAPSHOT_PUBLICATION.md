@@ -2018,3 +2018,28 @@ The eighteenth-round mock-curl suite was rewritten: the cleanup step's read-back
 - All four workflow YAMLs parse; **105 `run:` blocks** pass `bash -n`.
 - The production workflow diff is confined to the draft-cleanup read-back (comment + Python heredoc replacing the curl capture); the DELETE fall-through, the pre-deletion identity checks, the seven-step PAT boundary, and every other publication gate are untouched. The credential is used only for the read-back's Authorization header and is never printed or logged.
 - NO publication or rehearsal workflow was dispatched; NO release, tag, or stable reference was created, modified, or deleted in ANY repository; NO repository setting, ruleset, or immutable-release configuration was changed; NO Vercel/Console/blockchain state was touched.
+
+## 24. Twentieth-round correction — the absolute deadline covers EVERY parsing stage; the release id is a strict JSON integer (2026-11-24)
+
+Two targeted follow-up corrections to the nineteenth-round read-back (§23), from the latest independent review. The architecture, the 65,536-byte bound, the deadline VALUES, the classification taxonomy (§18/§23) and the seventeenth-round DELETE fall-through are unchanged.
+
+### Correction 1 — the deadline now covers status-line parsing, headers and chunk framing
+
+The nineteenth-round deadline was checked only BETWEEN streaming reads. Status-line parsing, header reads and chunk framing happen INSIDE one blocking call (`getresponse()` / `resp.read1()`), whose internal receives were bounded only by the per-read socket timeout — so a slow drip of header or framing bytes (each byte arriving well below the per-read timeout, each proving liveness) could extend the request past the absolute deadline indefinitely.
+
+Every response byte now passes through a deadline-enforcing reader (`_DeadlineReader`, installed by wrapping the connection socket BEFORE `getresponse()`, so status-line and header parsing are covered too): before EVERY underlying `recv` the remaining time is recomputed and the socket timeout is set to EXACTLY that remaining time. This covers the status line, the response headers, the chunk-size lines of chunked transfer encoding and the body alike. The deadline NEVER resets when another byte arrives. On expiry the connection is closed, the outcome is classified UNKNOWN and the step exits non-zero (the reader mirrors `socket.makefile`'s `_io_refs` reference contract, so a will-close response can hand the connection to the response object before the body is read without a premature real close).
+
+### Correction 2 — the release id must be a genuine JSON integer
+
+The former 200-branch identity comparison coerced through `str()` (`str(parsed["id"]) != RELEASE_ID`), so a JSON STRING id (`"1234567"`) matched the numeric expectation and could have classified the response as "release still EXISTS". The `id` field must now be a GENUINE JSON integer — strings, booleans, floats and null are rejected (fail closed, UNKNOWN, `invalid_id`) BEFORE any comparison; `bool` is rejected explicitly (it is a subclass of `int` in Python); and the comparison is integer equality against the expected release id (parsed as an integer — a non-numeric expected id fails closed). A genuine integer id with the exact identity still classifies still-exists (exit 2) — valid classification is not weakened.
+
+### Regression tests (twentieth round, `test/publishWorkflow.test.ts` — executed against the actual cleanup step and the deterministic local read-back server)
+
+- **Structural pins:** the deadline-enforcing reader exists and recomputes the remaining time before EVERY receive; it is installed BEFORE `getresponse()`; deadline expiry is classified in BOTH phases; the `_io_refs` bookkeeping pin; the connection is closed on every exit path; the strict-integer-id pins (including the absence of the former `str()` coercion).
+- **timeout 18 — slow-drip HEADERS:** the raw status line and a partial header block drip one byte every 30 ms for 2000 bytes (60 s of material — far beyond the 2 s test deadline and the harness's 45 s kill) and the header block NEVER completes. The abort happens AT the deadline (elapsed ≥ 1.7 s, < 15 s); an implementation whose deadline cannot see inside header parsing would hang and fail. The server-side record proves the client CLOSED the connection on timeout.
+- **timeout 19 — slow-drip CHUNK FRAMING:** complete headers arrive quickly, then the chunk-size line drips one byte every 30 ms (never completing). The framing read happens inside `resp.read1()`'s chunked decoder — the nineteenth-round between-reads check could not see inside it; the abort happens AT the deadline, and the server observes the client close.
+- **id-type battery (5 executed cases + control):** a STRING id (the exact former-coercion defect — asserted UNKNOWN exit 1, never the still-exists exit 2), boolean ids (`true`/`false`), a FLOAT id (`1234567.0`), a NULL id — all UNKNOWN (`invalid_id`) with operator intervention required, never "still EXISTS", never a deletion claim; the control proves a genuine integer id with the exact identity still classifies still-exists.
+
+### Validation (twentieth round, on the corrected tree)
+
+See the completion report for the exact commands, exit codes and counts recorded for this round.

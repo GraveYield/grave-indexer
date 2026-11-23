@@ -1139,6 +1139,30 @@ jobs:
           #     is classified UNKNOWN: uncertainty is NEVER converted into
           #     a successful deletion verdict. Every UNKNOWN outcome states
           #     OPERATOR INTERVENTION REQUIRED and exits non-zero.
+          # TWENTIETH-ROUND CORRECTION 1 (the absolute deadline covers
+          # EVERY parsing stage): the nineteenth-round deadline was
+          # checked only BETWEEN streaming reads — status-line parsing,
+          # header reads and chunk framing happen INSIDE one blocking
+          # call (getresponse / read1) whose internal receives were
+          # bounded only by the per-read socket timeout, so a slow drip
+          # of header or framing bytes (each byte arriving well below
+          # the per-read timeout) could extend the request past the
+          # deadline indefinitely. Every response byte now passes
+          # through a deadline-enforcing reader: the remaining time is
+          # recomputed and the socket timeout is set to EXACTLY that
+          # remaining time before EVERY underlying receive — status
+          # line, headers, chunk-size lines, chunk framing and body
+          # reads alike. The deadline NEVER resets when another byte
+          # arrives; on expiry the connection is closed, the outcome is
+          # classified UNKNOWN and the step exits non-zero.
+          # TWENTIETH-ROUND CORRECTION 2 (strict release-ID type): the
+          # former id comparison coerced through str(), so a JSON
+          # STRING id ("1234567") matched the numeric expectation and
+          # could have classified the response as "release still
+          # EXISTS". The id field must now be a GENUINE JSON integer —
+          # strings, booleans, floats and null are rejected (fail
+          # closed, UNKNOWN) BEFORE any comparison, and the comparison
+          # is integer equality against the expected release id.
           # Successful deletion is claimed ONLY on a validated genuine
           # 404. The pre-deletion identity checks (exact release ID,
           # exact run tag, draft == true proven by read-back BEFORE any
@@ -1171,6 +1195,151 @@ jobs:
           # adjustments). It never resets when another response byte arrives.
           deadline = time.monotonic() + OVERALL_DEADLINE_SECS
 
+          class _DeadlineExceeded(Exception):
+              # Raised ONLY by the deadline-enforcing reader below: the
+              # ABSOLUTE monotonic deadline expired. It is never a transport
+              # error and never an HTTP status.
+              pass
+
+          class _DeadlineReader:
+              # Raw-socket reader that enforces the ABSOLUTE monotonic
+              # deadline on EVERY underlying receive. http.client funnels
+              # every response byte through this reader's methods:
+              #   * readline — the STATUS LINE, the response HEADERS and
+              #     the CHUNK-SIZE lines of chunked transfer encoding;
+              #   * read / read1 / readinto — the response BODY (including
+              #     chunk framing around the data).
+              # Before EVERY recv the remaining time to the deadline is
+              # recomputed and the socket timeout is set to EXACTLY that
+              # remaining time, so a single receive can never outlive the
+              # deadline and a slow drip (however slow, as long as each
+              # byte is a socket event) can never extend the request past
+              # it — the deadline NEVER resets when another byte arrives.
+
+              def __init__(self, sock, deadline):
+                  self._sock = sock
+                  self._deadline = deadline
+                  self._closed = False
+
+              def _recv_bounded(self, n, flags=0):
+                  while True:
+                      remaining = self._deadline - time.monotonic()
+                      if remaining <= 0:
+                          raise _DeadlineExceeded()
+                      self._sock.settimeout(remaining)  # this receive cannot outlive the remaining time to the ABSOLUTE deadline
+                      try:
+                          return self._sock.recv(n, flags)
+                      except InterruptedError:
+                          continue
+                      # A socket.timeout here IS the deadline expiring (the
+                      # timeout was set to exactly the remaining time): it
+                      # propagates and is classified by the surrounding
+                      # phase — never a deletion verdict, never an HTTP
+                      # status.
+
+              def readline(self, size=-1):
+                  # Status lines, header lines and chunk-size lines. The
+                  # deadline is enforced between individual bytes: a slow
+                  # drip of header or framing bytes can NEVER extend the
+                  # request past the absolute deadline.
+                  if size is None or size < 0:
+                      size = MAX_BODY_BYTES + 1
+                  parts = bytearray()
+                  while len(parts) < size:
+                      one = self._recv_bounded(1)
+                      if not one:
+                          break  # EOF
+                      parts += one
+                      if parts[-1:] == b"\n":
+                          break
+                  return bytes(parts)
+
+              def read1(self, size=-1):
+                  # At most ONE underlying receive: the call returns as soon
+                  # as ANY bytes have arrived, so the caller's own deadline
+                  # checks keep running between calls.
+                  if size is None or size < 0:
+                      size = CHUNK_SIZE
+                  return self._recv_bounded(size)
+
+              def read(self, size=-1):
+                  if size is None or size < 0:
+                      # Unbounded (close-delimited) reads stay bounded: no
+                      # more than the cap plus one byte is ever buffered,
+                      # and every receive is deadline-checked.
+                      cap = MAX_BODY_BYTES + 1
+                      parts = bytearray()
+                      while len(parts) < cap:
+                          chunk = self._recv_bounded(min(CHUNK_SIZE, cap - len(parts)))
+                          if not chunk:
+                              break
+                          parts += chunk
+                      return bytes(parts)
+                  parts = bytearray()
+                  while len(parts) < size:
+                      chunk = self._recv_bounded(size - len(parts))
+                      if not chunk:
+                          break  # EOF before size — the caller classifies the incompleteness
+                      parts += chunk
+                  return bytes(parts)
+
+              def readinto(self, b):
+                  view = memoryview(b)
+                  total = 0
+                  while total < len(b):
+                      chunk = self._recv_bounded(len(b) - total)
+                      if not chunk:
+                          break  # EOF
+                      view[total:total + len(chunk)] = chunk
+                      total += len(chunk)
+                  return total
+
+              def peek(self, size=-1):
+                  if size is None or size < 0:
+                      size = CHUNK_SIZE
+                  return self._recv_bounded(size, socket.MSG_PEEK)
+
+              def readable(self):
+                  return True
+
+              def flush(self):
+                  pass
+
+              def fileno(self):
+                  return self._sock.fileno()
+
+              def close(self):
+                  if not self._closed:
+                      self._closed = True
+                      # Mirror socket.makefile's reference contract: the real
+                      # close happens only when the last makefile() reference
+                      # is released (getresponse() hands a will-close
+                      # connection to the response BEFORE the body is read —
+                      # a premature real close would break every later read).
+                      # socket.close() itself defers the real close while
+                      # _io_refs > 0 — exactly the contract needed here.
+                      self._sock.close()
+
+          class _DeadlineSocket:
+              # Presents the connected socket to http.client while routing
+              # EVERY response byte through _DeadlineReader — status-line
+              # parsing, headers, chunk framing and body reads all enforce
+              # the absolute deadline. Everything else delegates.
+              def __init__(self, sock, reader):
+                  self._sock = sock
+                  self._reader = reader
+
+              def makefile(self, *args, **kwargs):
+                  # Mirror socket.makefile's reference bookkeeping exactly:
+                  # the real socket close stays DEFERRED until this reader is
+                  # closed, so a will-close response can hand the connection
+                  # to the response object before the body is consumed.
+                  self._sock._io_refs += 1
+                  return self._reader
+
+              def __getattr__(self, name):
+                  return getattr(self._sock, name)
+
           def unknown(reason):
               print("draft cleanup read-back INCONCLUSIVE: " + reason + " — the deletion status of release " + RELEASE_ID + " is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED")
               sys.exit(1)
@@ -1189,6 +1358,15 @@ jobs:
           # The credential is used ONLY for the Authorization header below; it is
           # never printed, logged or embedded in any classification message.
 
+          # TWENTIETH-ROUND CORRECTION 2: the expected release id as an
+          # INTEGER — the identity comparison below is integer equality,
+          # never string coercion. A non-numeric expected id fails closed.
+          try:
+              EXPECTED_RELEASE_ID = int(RELEASE_ID)
+          except ValueError:
+              unknown("the expected release id is not an integer (" + RELEASE_ID + ") — refusing to compare release identities")
+
+          conn = None
           parts = urlsplit(API_BASE)
           if parts.scheme == "https":
               conn = http.client.HTTPSConnection(parts.hostname, port=parts.port or 443, timeout=CONNECT_TIMEOUT_SECS, context=ssl.create_default_context())
@@ -1213,7 +1391,17 @@ jobs:
                       unknown("the overall request deadline expired before the response headers arrived")
                   if conn.sock is not None:
                       conn.sock.settimeout(min(remaining, CONNECT_TIMEOUT_SECS))  # the connection/header wait is bounded by BOTH the connection timeout and the absolute deadline
+                  # TWENTIETH-ROUND CORRECTION 1: route EVERY response byte
+                  # through the deadline-enforcing reader — getresponse()'s
+                  # status-line and header parsing and every later body read
+                  # (including chunk framing) recompute the remaining time
+                  # before EVERY underlying receive, so a slow drip of
+                  # header or framing bytes can never extend the request
+                  # past the absolute monotonic deadline.
+                  conn.sock = _DeadlineSocket(conn.sock, _DeadlineReader(conn.sock, deadline))
                   resp = conn.getresponse()
+              except _DeadlineExceeded:
+                  unknown("the ABSOLUTE overall request deadline (" + str(OVERALL_DEADLINE_SECS) + "s, monotonic clock) expired while receiving or parsing the status line or the response headers — a slow-drip header stream can never extend the deadline (it never resets when another byte arrives); the connection was closed and the response is INCOMPLETE and unclassifiable")
               except (socket.timeout, TimeoutError, InterruptedError):
                   unknown("the read-back TIMED OUT while connecting or while receiving the response headers (connection timeout " + str(CONNECT_TIMEOUT_SECS) + "s, absolute overall deadline " + str(OVERALL_DEADLINE_SECS) + "s on the monotonic clock) — a timeout is never an HTTP status and never a deletion verdict")
               except (http.client.HTTPException, ConnectionError, OSError) as exc:
@@ -1245,6 +1433,8 @@ jobs:
                       # indefinitely below the per-read socket timeout,
                       # exactly the bypass this correction forbids.)
                       chunk = resp.read1(min(CHUNK_SIZE, MAX_BODY_BYTES - len(body) + 1))
+                  except _DeadlineExceeded:
+                      unknown("the ABSOLUTE overall request deadline expired (" + str(OVERALL_DEADLINE_SECS) + "s, monotonic clock) while consuming the response body — body reads and chunk framing are each bounded by the deadline, recomputed before EVERY underlying receive; the response is INCOMPLETE and unclassifiable, and the deadline never resets when another byte arrives (a slow-drip response cannot keep this request alive)")
                   except (socket.timeout, TimeoutError, InterruptedError):
                       unknown("reading the response body TIMED OUT (bounded by the absolute " + str(OVERALL_DEADLINE_SECS) + "s monotonic deadline) — the response is INCOMPLETE and cannot be classified")
                   except (http.client.IncompleteRead, http.client.HTTPException, ConnectionError, OSError) as exc:
@@ -1272,12 +1462,23 @@ jobs:
               if status == 200:
                   if "id" not in parsed:
                       unknown("HTTP 200 release object is missing the \"id\" field (missing_id) — an unidentified object can never classify the deletion")
+                  # TWENTIETH-ROUND CORRECTION 2 (strict release-ID type):
+                  # the id field must be a GENUINE JSON integer — a string,
+                  # boolean, float or null is rejected BEFORE any comparison
+                  # (the former str() coercion let the JSON STRING
+                  # \"1234567\" match the numeric expectation and could have
+                  # classified the response as \"release still EXISTS\").
+                  # bool is rejected explicitly: bool is a subclass of int in
+                  # Python, so a bare isinstance(int) test would let true and
+                  # false through.
+                  if isinstance(parsed["id"], bool) or not isinstance(parsed["id"], int):
+                      unknown("HTTP 200 release object carries an INVALID \"id\" field (invalid_id — " + str(type(parsed["id"]).__name__) + " is not a genuine JSON integer; strings, booleans, floats and null are all rejected) — the object's identity can never be established")
                   if "tag_name" not in parsed:
                       unknown("HTTP 200 release object is missing the \"tag_name\" field (missing_tag) — an unidentified object can never classify the deletion")
                   if not isinstance(parsed.get("draft"), bool):
                       unknown("HTTP 200 release object has an INVALID \"draft\" field (invalid_draft — not a boolean) — the release state cannot be established")
-                  if str(parsed.get("id")) != RELEASE_ID:
-                      unknown("HTTP 200 release object carries id " + str(parsed.get("id")) + ", not THIS run's draft " + RELEASE_ID + " (mismatch_id) — the object's identity cannot be established")
+                  if parsed["id"] != EXPECTED_RELEASE_ID:
+                      unknown("HTTP 200 release object carries id " + str(parsed["id"]) + ", not THIS run's draft " + RELEASE_ID + " (mismatch_id) — the object's identity cannot be established")
                   if parsed.get("tag_name") != EXPECTED_TAG:
                       unknown("HTTP 200 release object carries tag " + str(parsed.get("tag_name")) + ", not THIS run's tag " + EXPECTED_TAG + " (mismatch_tag) — the object's identity cannot be established")
                   if parsed["draft"] is True:
@@ -1285,7 +1486,8 @@ jobs:
                   unknown("HTTP 200 returned a release object that CONTRADICTS the expected cleanup state (published — expected the deleted draft " + RELEASE_ID + "/" + EXPECTED_TAG + ") — the deletion status cannot be established from a contradicting object")
               unknown("unexpected HTTP " + str(status) + " for release " + RELEASE_ID + " — an authentication failure, authorization failure, rate limit, server error or ANY other unexpected status leaves the deletion status unestablished")
           finally:
-              conn.close()
+              if conn is not None:
+                  conn.close()  # the connection is closed on EVERY path — timeout, deadline expiry, interruption, classification
           GY_READBACK_PY
           readback_exit=$?
           set -e
