@@ -30,7 +30,7 @@
 //     ACTIONS_RUNTIME_TOKEN and takes no github.token input;
 //   - `run:` steps receive secrets only through explicitly declared env.
 
-import { describe, test } from "node:test";
+import { before, after, describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -532,7 +532,7 @@ describe("publish-console-snapshot workflow — main-only restriction and token 
       // draft — a by-ID DELETE, authorized by a read-back that proves
       // draft==true AND this run's exact tag; published and foreign
       // releases are never deleted.
-      ["release", /--method DELETE "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"[\s\S]*the un-published draft \$DRAFT_RELEASE_ID \(tag \$TAG\) was deleted/s],
+      ["release", /--method DELETE "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID"[\s\S]*the un-published draft " \+ RELEASE_ID \+ " \(tag " \+ EXPECTED_TAG \+ "\) was deleted/s],
       // SEVENTH ROUND: the activation's ref update is the repository-qualified
       // PATCH; the pattern is anchored on the activation's own completion
       // echo so it cannot also match the rollback step (which now contains
@@ -2442,63 +2442,226 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     'exit 1',
   ].join("\n");
 
-  // Mock curl: the post-DELETE read-back now captures BOTH the HTTP status
-  // AND the response body (the script captures the body into a bounded
-  // temporary file). Default behavior mirrors the stateful server above:
-  // the release exists (state file present) → 200 + the state JSON as the
-  // body; absent → 404 + the EXACT GitHub API Not Found body; a FORCED 200
-  // without an explicit body still serves a plausible release object for
-  // this run's identity (the server kept the release). Overrides:
-  // MOCK_READBACK_STATUS forces a status; MOCK_READBACK_BODY (even empty)
-  // overrides the body; MOCK_CURL_BODY_BYTES writes an N-byte body
-  // (oversized); MOCK_CURL_TRANSPORT_ERROR / MOCK_CURL_TLS_ERROR /
-  // MOCK_CURL_DNS_ERROR / MOCK_CURL_OVERSIZE_EXIT make curl itself fail
-  // with exit 7 / 35 / 6 / 63. It cannot reach GitHub.
-  const mockCurl = [
-    "#!/usr/bin/env bash",
-    "# test-harness mock: bounded-capture release read-back (status + body)",
-    'url=""; outfile=""; prev=""',
-    'for a in "$@"; do',
-    '  case "$a" in http*) url="$a" ;; esac',
-    '  if [ "$prev" = "-o" ]; then outfile="$a"; fi',
-    '  prev="$a"',
-    'done',
-    'case "$url" in',
-    '  */releases/$MOCK_RELEASE_ID_URL) ;;',
-    '  *) if [ -n "$MOCK_CURL_ALLOWED_PREFIX" ] && [ "${url#$MOCK_CURL_ALLOWED_PREFIX}" = "$url" ]; then echo "unexpected url: $url" >&2; exit 1; fi ;;',
-    'esac',
-    'if [ -n "${MOCK_CURL_TRANSPORT_ERROR:-}" ]; then echo "curl: (7) connection refused (mock)" >&2; exit 7; fi',
-    'if [ -n "${MOCK_CURL_TLS_ERROR:-}" ]; then echo "curl: (35) TLS handshake failure (mock)" >&2; exit 35; fi',
-    'if [ -n "${MOCK_CURL_DNS_ERROR:-}" ]; then echo "curl: (6) could not resolve host (mock)" >&2; exit 6; fi',
-    'if [ -n "${MOCK_CURL_OVERSIZE_EXIT:-}" ]; then echo "curl: (63) maximum response size exceeded (mock)" >&2; exit 63; fi',
-    'state="$MOCK_STATE_FILE"',
-    'status="${MOCK_READBACK_STATUS:-}"',
-    'if [ -z "$status" ]; then if [ -f "$state" ]; then status="200"; else status="404"; fi; fi',
-    'if [ -n "${MOCK_CURL_BODY_BYTES:-}" ]; then',
-    '  body=$(head -c "$MOCK_CURL_BODY_BYTES" /dev/zero | tr \'\\0\' \'x\')',
-    'elif [ -n "${MOCK_READBACK_BODY+x}" ]; then',
-    '  body="$MOCK_READBACK_BODY"',
-    'else',
-    '  if [ "$status" = "404" ]; then',
-    '    body=\'{"message": "Not Found", "documentation_url": "https://docs.github.com/rest", "status": "404"}\'',
-    '  elif [ "$status" = "200" ] && [ -f "$state" ]; then',
-    '    body=$(cat "$state")',
-    '  elif [ "$status" = "200" ]; then',
-    '    body="{\\"id\\": $MOCK_RELEASE_ID_URL, \\"draft\\": true, \\"tag_name\\": \\"$MOCK_RELEASE_TAG\\"}"',
-    '  else',
-    '    body="{\\"message\\": \\"Unexpected status $status\\", \\"documentation_url\\": \\"https://docs.github.com/rest\\"}"',
-    '  fi',
-    'fi',
-    'if [ -n "$outfile" ]; then printf \'%s\' "$body" > "$outfile"; fi',
-    'printf \'%s\' "$status"',
-    'exit 0',
-  ].join("\n");
+  // Mock curl is GONE (nineteenth round): the cleanup read-back no longer
+  // uses curl at all — it is the workflow's Python stdlib streaming
+  // implementation. The read-back's HTTP behavior is exercised against a
+  // DETERMINISTIC LOCAL HTTP SERVER running in its OWN PROCESS (started
+  // once per suite in `before`). Process isolation is REQUIRED: the
+  // server must be able to accept connections and stream responses while
+  // the suite's synchronous execFileSync call blocks the test process's
+  // event loop. The server's behavior per run is programmed through a
+  // behavior FILE that runCleanup writes before invoking the step, so
+  // every network-level property (status, body, Content-Length presence,
+  // chunked transfer encoding, slow drips, stalls, interruptions, hangs)
+  // is controlled without any live GitHub API dependency. It cannot reach
+  // GitHub.
+  interface ReadbackBehavior {
+    status?: number;
+    body?: string;
+    bodyBytes?: number; // N-byte filler body (overrides body)
+    chunked?: boolean; // no Content-Length — Transfer-Encoding: chunked
+    mode?: "immediate" | "refuse" | "stall-headers" | "stall-mid-body" | "hangup-mid-body" | "close-after-partial" | "drip-forever";
+    stallAfterBytes?: number; // for stall-mid-body / hangup-mid-body
+    dripDelayMs?: number; // for drip-forever
+    dripChunkBytes?: number; // for drip-forever
+    dripMaxChunks?: number; // for drip-forever (safety bound)
+    statePath?: string; // state-driven default: consults the draft's server-side state AT REQUEST TIME
+  }
+
+  interface ReadbackInfo {
+    requests: number;
+    earlyClientClose: boolean; // the client closed the connection BEFORE the server finished responding
+    finished: boolean;
+  }
+
+  let readbackDir = "";
+  let readbackBehaviorPath = "";
+  let readbackInfoPath = "";
+  let readbackServerUrl = "";
+  let readbackServerChild: ReturnType<typeof import("node:child_process").spawn> | null = null;
+
+  // The server runs as its own node process (its event loop must stay
+  // free — the suite's execFileSync blocks the test process's loop). The
+  // child's source is written to the suite temp directory by `before`.
+  const readbackServerSource = `
+import { createServer } from "node:http";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const behaviorPath = process.env.READBACK_BEHAVIOR_PATH;
+const infoPath = process.env.READBACK_INFO_PATH;
+const NF_BODY = JSON.stringify({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
+let info = { requests: 0, earlyClientClose: false, finished: false };
+const writeInfo = () => { try { writeFileSync(infoPath, JSON.stringify(info)); } catch { /* parent gone */ } };
+const server = createServer((req, res) => {
+  info = { requests: 0, earlyClientClose: false, finished: false };
+  info.requests++;
+  writeInfo();
+  req.on("close", () => { if (!info.finished) info.earlyClientClose = true; writeInfo(); });
+  res.on("close", () => writeInfo());
+  let behavior;
+  try { behavior = JSON.parse(readFileSync(behaviorPath, "utf8")); } catch { behavior = {}; }
+  // The state-driven default reproduces the OLD stateful mock curl
+  // semantics: the state file represents the draft's existence on the
+  // server AT REQUEST TIME — present → 200 + the draft body; absent →
+  // 404 + the EXACT GitHub API Not Found body.
+  if (behavior.statePath !== undefined) {
+    if (existsSync(behavior.statePath)) {
+      behavior = { status: 200, body: readFileSync(behavior.statePath, "utf8") };
+    } else {
+      behavior = { status: 404, body: NF_BODY };
+    }
+  }
+  const status = behavior.status ?? 200;
+  const bodyOf = () => behavior.bodyBytes != null ? Buffer.alloc(behavior.bodyBytes, 0x78) : Buffer.from(behavior.body ?? "", "utf8");
+  const mode = behavior.mode ?? "immediate";
+  if (mode === "refuse") {
+    setTimeout(() => req.socket.destroy(), 10); // transport-level failure: the socket dies BEFORE any HTTP status
+    return;
+  }
+  if (mode === "stall-headers") {
+    // headers never arrive — exercises the connection timeout; the
+    // socket stays open until the client gives up.
+    return;
+  }
+  if (mode === "drip-forever") {
+    const chunk = Buffer.alloc(behavior.dripChunkBytes ?? 1, 0x7a);
+    let sent = 0;
+    const max = behavior.dripMaxChunks ?? Infinity;
+    res.writeHead(status, { "Content-Type": "application/json" }); // no Content-Length → chunked
+    const timer = setInterval(() => {
+      if (res.destroyed || res.writableEnded || sent >= max) {
+        clearInterval(timer);
+        if (!res.writableEnded && !res.destroyed) { res.end(); info.finished = true; writeInfo(); }
+        return;
+      }
+      res.write(chunk);
+      sent++;
+    }, behavior.dripDelayMs ?? 50);
+    return;
+  }
+  const body = bodyOf();
+  if (mode === "stall-mid-body") {
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": String(body.length) });
+    const take = Math.min(behavior.stallAfterBytes ?? Math.floor(body.length / 2), body.length);
+    if (take > 0) res.write(body.subarray(0, take));
+    // never end — the body never completes
+    return;
+  }
+  if (mode === "hangup-mid-body") {
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": String(body.length) });
+    const take = Math.min(behavior.stallAfterBytes ?? Math.floor(body.length / 2), body.length);
+    if (take > 0) res.write(body.subarray(0, take));
+    setTimeout(() => req.socket.destroy(), 10); // transport interruption mid-body
+    return;
+  }
+  if (mode === "close-after-partial") {
+    // A CLEAN early end before the declared Content-Length: the server
+    // declares 1000 bytes, sends 10, then closes the connection.
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": "1000", "Connection": "close" });
+    res.write(body.subarray(0, Math.min(10, body.length)));
+    res.end();
+    info.finished = true;
+    writeInfo();
+    return;
+  }
+  if (behavior.chunked === true) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    let off = 0;
+    const writeNext = () => {
+      if (res.writableEnded || res.destroyed) { info.finished = true; writeInfo(); return; }
+      const take = Math.min(1024, body.length - off);
+      res.write(body.subarray(off, off + take));
+      off += take;
+      if (off < body.length) setTimeout(writeNext, 0);
+      else { res.end(); info.finished = true; writeInfo(); }
+    };
+    writeNext();
+  } else {
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": String(body.length) });
+    res.end(body);
+    info.finished = true;
+    writeInfo();
+  }
+});
+server.listen(0, "127.0.0.1", () => {
+  const addr = server.address();
+  console.log("PORT=" + (typeof addr === "object" && addr !== null ? addr.port : 0));
+});
+process.on("SIGTERM", () => { server.closeAllConnections?.(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 500).unref(); });
+`;
+
+  before(async () => {
+    readbackDir = mkdtempSync(join(tmpdir(), "wf-readback-server-"));
+    readbackBehaviorPath = join(readbackDir, "behavior.json");
+    readbackInfoPath = join(readbackDir, "info.json");
+    writeFileSync(readbackBehaviorPath, "{}");
+    writeFileSync(readbackInfoPath, "{}");
+    const serverScript = join(readbackDir, "readback-server.mjs");
+    writeFileSync(serverScript, readbackServerSource, { mode: 0o644 });
+    const { spawn } = await import("node:child_process");
+    readbackServerChild = spawn(process.execPath, [serverScript], {
+      env: { ...process.env, READBACK_BEHAVIOR_PATH: readbackBehaviorPath, READBACK_INFO_PATH: readbackInfoPath },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the read-back server did not start")), 10000);
+      let out = "";
+      readbackServerChild!.stdout!.on("data", (d: Buffer) => {
+        out += d.toString();
+        const m = out.match(/PORT=(\d+)/);
+        if (m) {
+          clearTimeout(timer);
+          readbackServerUrl = `http://127.0.0.1:${m[1]}`;
+          resolve();
+        }
+      });
+      readbackServerChild!.on("exit", () => { clearTimeout(timer); reject(new Error("the read-back server exited prematurely")); });
+    });
+  });
+
+  after(async () => {
+    if (readbackServerChild !== null) {
+      readbackServerChild.kill("SIGKILL");
+      readbackServerChild = null;
+    }
+  });
 
   interface CleanupResult {
     status: number;
     stdout: string;
     ghCalls: string[];
     deleted: boolean; // whether a --method DELETE was invoked at all
+    readback: ReadbackInfo;
+  }
+
+  // Default read-back behavior mirrors the OLD stateful mock curl: the
+  // state file represents the draft's existence on the server AT READ-BACK
+  // TIME (a successful DELETE removes it → 404; a failed DELETE leaves it →
+  // 200 + the draft body). Explicit overrides reproduce the old MOCK_* keys.
+  function readbackBehaviorFor(env: Record<string, string>): ReadbackBehavior {
+    if (env.MOCK_READBACK_BEHAVIOR !== undefined) {
+      return JSON.parse(env.MOCK_READBACK_BEHAVIOR) as ReadbackBehavior;
+    }
+    if (env.MOCK_CURL_TRANSPORT_ERROR || env.MOCK_CURL_TLS_ERROR || env.MOCK_CURL_DNS_ERROR) {
+      return { status: 200, body: "", mode: "refuse" };
+    }
+    if (env.MOCK_READBACK_STATUS !== undefined || env.MOCK_READBACK_BODY !== undefined || env.MOCK_CURL_BODY_BYTES !== undefined) {
+      const status = env.MOCK_READBACK_STATUS ?? "200";
+      let body: string;
+      if (env.MOCK_CURL_BODY_BYTES !== undefined) body = "x".repeat(Number(env.MOCK_CURL_BODY_BYTES));
+      else if (env.MOCK_READBACK_BODY !== undefined) body = env.MOCK_READBACK_BODY;
+      else if (status === "404") body = JSON.stringify({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
+      else if (status === "200") body = env.MOCK_DRAFT_BODY ?? JSON.stringify({ id: Number(DRAFT_ID), draft: true, tag_name: TAG });
+      else body = JSON.stringify({ message: `Unexpected status ${status}`, documentation_url: "https://docs.github.com/rest" });
+      return { status: Number(status), body };
+    }
+    // State-driven default: 200 + the state body while the state file
+    // exists, 404 + the exact GitHub Not Found body once it is gone.
+    // (runCleanup replaces the sentinel statePath with THIS run's state
+    // file, which the stateful mock gh creates/removes.)
+    if (env.MOCK_CURL_OVERSIZE_EXIT) {
+      return { status: 404, bodyBytes: 70000 };
+    }
+    return { statePath: "state-driven-default" };
   }
 
   function runCleanup(env: Record<string, string>): CleanupResult {
@@ -2506,11 +2669,18 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     const bin = join(dir, "bin");
     mkdirSync(bin);
     writeFileSync(join(bin, "gh"), mockGh, { mode: 0o755 });
-    writeFileSync(join(bin, "curl"), mockCurl, { mode: 0o755 });
     const ghLogPath = join(dir, "gh.log");
     const statePath = join(dir, "draft-state.json");
     writeFileSync(ghLogPath, "");
     if (env.MOCK_DRAFT_BODY) writeFileSync(statePath, env.MOCK_DRAFT_BODY);
+    // Program the local read-back server for THIS run. The state-driven
+    // default consults the state file AT REQUEST TIME (so a successful
+    // mock-gh DELETE → 404, a failed DELETE → 200), exactly like the old
+    // stateful mock curl.
+    const behavior = readbackBehaviorFor(env);
+    if (behavior.statePath !== undefined) behavior.statePath = statePath; // point the state-driven default at THIS run's state file
+    writeFileSync(readbackBehaviorPath, JSON.stringify(behavior));
+    writeFileSync(readbackInfoPath, JSON.stringify({ requests: 0, earlyClientClose: false, finished: false })); // reset per run
     const scriptPath = join(dir, "step.sh");
     writeFileSync(scriptPath, cleanupRun);
     let status = 0;
@@ -2519,6 +2689,8 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
       stdout = execFileSync("bash", ["--noprofile", "--norc", "-e", "-o", "pipefail", scriptPath], {
         encoding: "utf8",
         cwd: dir,
+        timeout: 45000,
+        killSignal: "SIGKILL",
         env: {
           PATH: `${bin}:${process.env.PATH ?? ""}`,
           HOME: process.env.HOME ?? dir,
@@ -2526,6 +2698,8 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
           MOCK_STATE_FILE: statePath,
           MOCK_RELEASE_ID_URL: DRAFT_ID,
           MOCK_RELEASE_TAG: TAG,
+          GH_TOKEN: "test-readback-token",
+          GY_READBACK_API_BASE: readbackServerUrl,
           ...env,
         },
       });
@@ -2535,15 +2709,27 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
       stdout = String(e.stdout ?? "");
     }
     const ghCalls = readFileSync(ghLogPath, "utf8").split("\n").filter((l) => l.startsWith("gh "));
+    // The server records its info file when the request's socket closes;
+    // poll briefly so the record is present, then accept what is there.
+    let readback: ReadbackInfo = { requests: 0, earlyClientClose: false, finished: false };
+    for (let waited = 0; waited < 600; waited += 50) {
+      try {
+        const info = JSON.parse(readFileSync(readbackInfoPath, "utf8")) as ReadbackInfo;
+        if (info.requests > 0) { readback = info; break; }
+      } catch { /* info not yet written */ }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
     const result: CleanupResult = {
       status,
       stdout,
       ghCalls,
       deleted: ghCalls.some((l) => l.includes("--method DELETE")),
+      readback,
     };
     rmSync(dir, { recursive: true, force: true });
     return result;
   }
+
 
   const draftBody = (draft: boolean, tag: string) => JSON.stringify({ id: Number(DRAFT_ID), draft, tag_name: tag });
 
@@ -2641,26 +2827,44 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
   // auth/permission/rate-limit/outage/transport/unexpected outcome = the
   // deletion status is UNKNOWN. All of these EXECUTE the actual cleanup
   // script against mocked HTTP responses.
-  test("STRUCTURAL: the read-back captures a BOUNDED response body and only a VALIDATED 404 claims success (eighteenth round)", () => {
-    assert.match(cleanupRun, /curl -sS --max-filesize 65536/, "the download is bounded by --max-filesize (enforced whenever a Content-Length declares a size)");
-    assert.match(cleanupRun, /-o "\$readback_body"/, "the response body is captured into a temporary FILE (never a shell variable)");
-    assert.match(cleanupRun, /-w '%\{http_code\}'/, "the HTTP status is captured separately from the body");
-    assert.match(cleanupRun, /curl_exit=\$\?/, "curl's exit status is captured separately");
-    assert.match(cleanupRun, /readback_tmpdir=\$\(mktemp -d\)/, "the capture uses a dedicated temporary directory");
-    assert.match(cleanupRun, /trap 'rm -rf "\$readback_tmpdir"' EXIT/, "the temporary files are removed on EVERY path by an EXIT trap");
-    assert.match(cleanupRun, /readback_size=\$\(wc -c < "\$readback_body"/, "the captured body's byte count is enforced post-download (a missing or misleading Content-Length cannot bypass the limit)");
-    assert.match(cleanupRun, /"\$readback_size" -gt 65536/, "oversized responses are rejected");
-    assert.match(cleanupRun, /"\$readback_size" -eq 0/, "empty responses are rejected");
-    assert.match(cleanupRun, /jq -e 'type == "object"'/, "the body must be valid JSON before ANY classification");
-    assert.match(cleanupRun, /case "\$code" in/, "the status is classified explicitly");
-    const idx404 = cleanupRun.indexOf('jq -e \'.message == "Not Found" and .status == "404"\'');
-    const idx200 = cleanupRun.indexOf('exact_draft) echo "draft cleanup read-back FAILED');
-    const idxOther = cleanupRun.indexOf('*) echo "draft cleanup read-back INCONCLUSIVE: unexpected HTTP $code');
-    assert.ok(idx404 > -1 && idx200 > -1 && idxOther > -1, "all three classification branches exist");
-    assert.ok(idx404 < idx200 && idx200 < idxOther, "404 = validated confirmation, 200 = validated still-exists, everything else = UNKNOWN");
-    assert.match(cleanupRun, /jq -e '\.message == "Not Found" and \.status == "404"'/, "a 404 is confirmed ONLY when the body is the exact GitHub API Not Found structure");
-    assert.match(cleanupRun, /has\("id"\) \| not then "missing_id"/, "the 200 branch validates the release object's id, tag_name and draft fields");
-    assert.match(cleanupRun, /the deletion status of release \$DRAFT_RELEASE_ID is UNKNOWN/, "uncertain outcomes are classified UNKNOWN");
+  test("STRUCTURAL: the read-back is a version-independent streaming implementation with a hard 65,536-byte cap and an absolute deadline (nineteenth round)", () => {
+    // curl is GONE from the read-back: --max-filesize is a
+    // curl-version-dependent enforcement for responses without a known
+    // size, and a post-download byte count only rejects AFTER the full
+    // body has already been consumed. (Comment lines are stripped — the
+    // EXPLANATION of why --max-filesize was removed may mention it, the
+    // CODE must not use it.)
+    const cleanupCode = cleanupRun.split("\n").filter((l) => !l.trim().startsWith("#")).join("\n");
+    assert.ok(!cleanupCode.includes("max-filesize"), "curl's --max-filesize is GONE from the read-back CODE (version-dependent for responses without a known size)");
+    assert.ok(!/\bcurl\b/.test(cleanupCode.slice(cleanupCode.indexOf("python3 -"))), "the read-back no longer invokes curl at all");
+    assert.match(cleanupRun, /python3 - "\$REPO" "\$DRAFT_RELEASE_ID" "\$TAG" <<'GY_READBACK_PY'/, "the read-back is an in-process Python stdlib streaming implementation invoked with the run's identity");
+    const py = cleanupRun.slice(cleanupRun.indexOf("<<'GY_READBACK_PY'"));
+    assert.match(py, /MAX_BODY_BYTES = 65536/, "the hard response-size bound is exactly 65,536 bytes");
+    assert.match(py, /MAX_BODY_BYTES - len\(body\) \+ 1/, "each streaming read asks for no more than the remaining allowance plus one byte");
+    assert.match(py, /len\(body\) > MAX_BODY_BYTES/, "byte 65,537 rejects the response immediately (a complete 65,536-byte body is still accepted)");
+    assert.match(py, /time\.monotonic\(\)/, "the overall deadline is an absolute point on the monotonic clock");
+    assert.match(py, /OVERALL_DEADLINE_SECS = float/, "a finite overall request deadline is enforced");
+    assert.match(py, /CONNECT_TIMEOUT_SECS = float/, "a finite connection timeout is enforced");
+    assert.match(py, /conn\.sock\.settimeout\(remaining\)/, "EVERY blocking read is bounded by the remaining time to the absolute deadline (computed before each read)");
+    assert.match(py, /min\(remaining, CONNECT_TIMEOUT_SECS\)/, "the connection/header phase is bounded by BOTH the connection timeout and the absolute deadline");
+    assert.match(py, /Accept-Encoding.*identity/, "no automatic decompression layer may bypass the bound");
+    assert.match(py, /Content-Encoding/, "a non-identity Content-Encoding fails closed (never parsed)");
+    assert.match(py, /IncompleteRead/, "incomplete transfers are detected and classified UNKNOWN");
+    assert.match(py, /declared_length is not None and received < declared_length/, "a body shorter than the declared Content-Length is classified INCOMPLETE");
+    assert.match(py, /json\.loads\(body\.decode/, "the JSON parser consumes EXACTLY the bounded streaming bytes (never a declared size or a post-download count)");
+    assert.match(py, /resp\.read1\(min\(CHUNK_SIZE, MAX_BODY_BYTES - len\(body\) \+ 1\)\)/, "the body is consumed in bounded streaming reads of ONE raw read each (read1 — the deadline check runs between reads; resp.read(n) would block until n bytes accumulate and let a slow drip bypass the deadline) — never buffered in full before its size is checked");
+    // NO temporary files exist anywhere in this step (the bounded
+    // in-memory cap needs none — nothing to clean up on ANY path).
+    assert.ok(!/mktemp|tempfile|mkstemp/.test(cleanupCode), "the step uses NO temporary files (bounded in-memory streaming needs none)");
+    assert.ok(!/\$\(python3|python3 -c/.test(cleanupCode), "no response is ever loaded into a shell variable");
+    // classification taxonomy preserved (eighteenth round)
+    const idx404 = py.indexOf("if status == 404");
+    const idx200 = py.indexOf("if status == 200");
+    assert.ok(idx404 > -1 && idx200 > -1 && idx404 < idx200, "404 classification precedes 200; everything else falls through to UNKNOWN");
+    assert.match(py, /parsed\.get\("message"\) != "Not Found" or parsed\.get\("status"\) != "404"/, "a 404 is confirmed ONLY when the body is the exact GitHub API Not Found structure");
+    assert.match(py, /not isinstance\(parsed\.get\("draft"\), bool\)/, "the 200 branch validates the release object's id, tag_name and draft fields");
+    assert.match(py, /unexpected HTTP /, "any unexpected HTTP status is UNKNOWN");
+    assert.match(py, /the deletion status of release " \+ RELEASE_ID \+ " is UNKNOWN/, "uncertain outcomes are classified UNKNOWN");
     assert.ok(!/if gh api "repos\/\$REPO\/releases\/\$DRAFT_RELEASE_ID" > \/dev\/null 2>&1/.test(cleanupRun), "the old any-failure-means-deleted pattern is GONE");
     assert.ok(!/curl -sS -o \/dev\/null/.test(cleanupRun), "the status-only capture (curl -sS -o /dev/null — the body discarded) is GONE");
   });
@@ -2678,7 +2882,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     test(`HTTP ${status} at read-back: the deletion status is UNKNOWN — never claimed successful`, () => {
       const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: status }));
       assert.notEqual(res.status, 0, "an inconclusive read-back never exits zero");
-      assert.match(res.stdout, /the deletion status is UNKNOWN/, "the UNKNOWN classification is explicit");
+      assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
       assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
       assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
     });
@@ -2687,7 +2891,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
   test("a curl TRANSPORT failure at read-back: the deletion status is UNKNOWN — never claimed successful", () => {
     const res = runCleanup(baseEnv({ MOCK_CURL_TRANSPORT_ERROR: "1" }));
     assert.notEqual(res.status, 0, "a transport failure never exits zero");
-    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /transport error/, "the transport failure is explicit");
     assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
     assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
     assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
@@ -2716,7 +2920,7 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
     assert.match(deleteLine!, /is NOT yet established/, "the DELETE-failure message explicitly states the deletion is NOT established");
     assert.ok(!/was deleted/.test(deleteLine!), "the DELETE-failure message NEVER claims success");
     const deleteIdx = cleanupRun.indexOf(deleteLine!);
-    const readbackIdx = cleanupRun.indexOf("curl -sS --max-filesize");
+    const readbackIdx = cleanupRun.indexOf("python3 -");
     assert.ok(deleteIdx > -1 && readbackIdx > deleteIdx, "the read-back classification ALWAYS follows the DELETE");
   });
 
@@ -2744,17 +2948,17 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
       const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: status }));
       assert.notEqual(res.status, 0, "an inconclusive read-back never exits zero");
       assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure is visible");
-      assert.match(res.stdout, /the deletion status is UNKNOWN/, "the UNKNOWN classification is explicit");
+      assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
       assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
       assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
     });
   }
 
-  test("DELETE call FAILS + read-back curl TRANSPORT failure: the deletion status is UNKNOWN — never claimed successful", () => {
+  test("DELETE call FAILS + read-back TRANSPORT failure: the deletion status is UNKNOWN — never claimed successful", () => {
     const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_CURL_TRANSPORT_ERROR: "1" }));
     assert.notEqual(res.status, 0, "a transport failure never exits zero");
     assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure is visible");
-    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /transport error/, "the transport failure is explicit");
     assert.match(res.stdout, /the deletion status of release 1234567 is UNKNOWN/, "the UNKNOWN classification is explicit");
     assert.match(res.stdout, /OPERATOR INTERVENTION REQUIRED/, "operator intervention is required");
     assert.ok(!res.stdout.includes("was deleted (read-back HTTP 404"), "successful deletion is NEVER claimed");
@@ -2873,29 +3077,256 @@ describe("publish-console-snapshot workflow — failure-path draft cleanup (thir
   }
 
   // ── oversized / limit-enforcement cases ──
-  test("a response body EXCEEDING the configured limit: UNKNOWN (the post-download byte count enforces the limit regardless of Content-Length)", () => {
+  test("a response body EXCEEDING the configured limit: UNKNOWN (the streaming cap rejects byte 65,537 — with a declared Content-Length)", () => {
     const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_CURL_BODY_BYTES: "70000" }));
     assertUnknownOutcome(res);
     assert.match(res.stdout, /exceeds the 65536-byte limit/, "the oversized classification is explicit");
   });
-  test("curl aborts on the declared size limit (--max-filesize, exit 63): UNKNOWN", () => {
-    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_CURL_OVERSIZE_EXIT: "1" }));
+  test("an oversized response served WITHOUT a declared size (curl's --max-filesize abort is no longer available — the streaming cap still rejects): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 70000, chunked: true }) }));
     assertUnknownOutcome(res);
-    assert.match(res.stdout, /curl transport error/, "a --max-filesize abort is a failed capture → UNKNOWN");
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "the streaming cap enforces the limit regardless of Content-Length");
   });
 
   // ── remaining HTTP and transport cases (connection 7, auth/rate-limit/
   //    outage statuses and 418 are already covered above; here: TLS and
   //    DNS failures) ──
-  test("a TLS HANDSHAKE failure during read-back (curl exit 35): UNKNOWN", () => {
+  test("a TLS HANDSHAKE failure during read-back (transport-level failure): UNKNOWN", () => {
     const res = runCleanup(baseEnv({ MOCK_CURL_TLS_ERROR: "1" }));
     assertUnknownOutcome(res);
-    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /transport error/, "the transport failure is explicit");
   });
-  test("a DNS failure during read-back (curl exit 6): UNKNOWN", () => {
+  test("a DNS failure during read-back (transport-level failure): UNKNOWN", () => {
     const res = runCleanup(baseEnv({ MOCK_CURL_DNS_ERROR: "1" }));
     assertUnknownOutcome(res);
-    assert.match(res.stdout, /curl transport error/, "the transport failure is explicit");
+    assert.match(res.stdout, /transport error/, "the transport failure is explicit");
+  });
+
+  // ── NINETEENTH ROUND: version-independent streaming response-size cap
+  //    (hard 65,536-byte boundary) + absolute request deadline. Every
+  //    case below EXECUTES the actual cleanup step against the
+  //    deterministic local read-back server — never a live GitHub API,
+  //    never a workflow dispatch, and every execution is time-bounded. ──
+  const nfBase = JSON.stringify({ message: "Not Found", documentation_url: "https://docs.github.com/rest", status: "404" });
+  // A VALID GitHub Not Found body padded to EXACTLY n bytes (JSON
+  // whitespace is insignificant, so the padded body still parses as the
+  // exact GitHub API Not Found structure).
+  const nfPadded = (n: number): string => {
+    assert.ok(n >= nfBase.length, "padding target must exceed the base body");
+    return nfBase.slice(0, -1) + " ".repeat(n - nfBase.length) + "}";
+  };
+  const TINY_TIMEOUTS = { GY_READBACK_CONNECT_TIMEOUT_SECS: "1", GY_READBACK_OVERALL_DEADLINE_SECS: "2" };
+
+  // ── 6.1 — response-size enforcement ──
+  test("size 1 — a complete valid response BELOW the limit: deletion CONFIRMED", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBase }));
+    assert.equal(res.status, 0, "a small valid 404 is accepted");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the success verdict is claimed");
+  });
+  test("size 2 — a complete response of EXACTLY 65,536 bytes is ACCEPTED (exact boundary)", () => {
+    const body = nfPadded(65536);
+    assert.equal(Buffer.byteLength(body, "utf8"), 65536, "the fixture is exactly 65,536 bytes");
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body }) }));
+    assert.equal(res.status, 0, "a complete body of exactly 65,536 bytes is ACCEPTED when all other validation succeeds");
+    assert.match(res.stdout, /deletion confirmed[\s\S]*65536 bytes/, "the accepted body's exact size is recorded");
+  });
+  test("size 3 — a response of 65,537 bytes is REJECTED (exact boundary)", () => {
+    const body = nfPadded(65537);
+    assert.equal(Buffer.byteLength(body, "utf8"), 65537, "the fixture is exactly 65,537 bytes");
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit \(byte 65537 received/, "byte 65,537 is named as the trigger");
+  });
+  test("size 4 — an oversized response WITH a declared Content-Length: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 70000 }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "the declared Content-Length does not legitimize the oversized body");
+  });
+  test("size 5 — an oversized response WITHOUT a declared Content-Length (chunked): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 70000, chunked: true }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "the limit is enforced without any Content-Length");
+  });
+  test("size 6 — a CHUNKED response without Content-Length, EXACTLY at the limit: ACCEPTED", () => {
+    const body = nfPadded(65536);
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body, chunked: true }) }));
+    assert.equal(res.status, 0, "a chunked body of exactly 65,536 bytes is accepted");
+    assert.match(res.stdout, /deletion confirmed/, "chunked transfer encoding cannot bypass or invalidate the bound");
+  });
+  test("size 7 — a CHUNKED response without Content-Length, ONE byte over the limit: UNKNOWN", () => {
+    const body = nfPadded(65537);
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body, chunked: true }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "byte 65,537 is rejected in chunked transfer too");
+  });
+  test("size 8 — a response that exceeds the limit DURING streaming: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 70000, chunked: true }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /exceeds the 65536-byte limit/, "the cap fires mid-stream — never only post-download");
+  });
+  test("size 9 — a response that CONTINUES SENDING after the limit is reached: the client stops consuming and classifies UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 200000, chunked: true }) }));
+    assertUnknownOutcome(res);
+    assert.equal(res.readback.earlyClientClose, true, "the client closed the connection BEFORE the server finished sending the oversized body — it stopped consuming at the cap instead of draining the unbounded response");
+  });
+  test("size 10 — a PARTIAL response followed by a transport interruption: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "hangup-mid-body", stallAfterBytes: 10 }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /INTERRUPTED|INCOMPLETE/, "the interruption is classified — a partial response is never parsed");
+  });
+  test("size 11 — the step uses NO temporary files, so a size-limit failure leaves nothing to clean up", () => {
+    assert.ok(!/mktemp|tempfile|mkstemp/.test(cleanupRun), "no temporary file is ever created by this step (bounded in-memory streaming needs none)");
+    const res = runCleanup(baseEnv({ MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, bodyBytes: 70000 }) }));
+    assertUnknownOutcome(res);
+  });
+
+  // ── 6.2 — timeout and transport behavior ──
+  test("timeout 12 — CONNECTION timeout (headers never arrive): UNKNOWN within the connection timeout", () => {
+    const t0 = Date.now();
+    const res = runCleanup(baseEnv({ ...TINY_TIMEOUTS, MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "stall-headers" }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /TIMED OUT while connecting or while receiving the response headers/, "the connection-timeout classification is explicit");
+    assert.ok(elapsed < 10, `the connection timeout bounds the wait (elapsed ${elapsed.toFixed(1)}s < 10s)`);
+  });
+  test("timeout 13 — OVERALL request deadline (headers arrive, the body then stalls forever): UNKNOWN at the deadline", () => {
+    const t0 = Date.now();
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "stall-mid-body", stallAfterBytes: 5 }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /TIMED OUT|deadline/, "the stalled body is classified (timeout/deadline), never parsed");
+    assert.ok(elapsed < 10, `the absolute deadline bounds the wait (elapsed ${elapsed.toFixed(1)}s < 10s)`);
+  });
+  test("timeout 14 — SLOW-DRIP response (each drip far below the per-read timeout, total far beyond the overall deadline): the ABSOLUTE deadline aborts and NEVER resets on another byte", () => {
+    const t0 = Date.now();
+    // 1 byte every 100 ms: the per-read timeout (remaining time to the
+    // deadline, ~2 s) is never tripped by a 100 ms gap — only the
+    // absolute deadline ends the request. An implementation with a
+    // per-read-only timeout (or a deadline that resets on activity)
+    // would hang here until the harness's 45 s kill.
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, mode: "drip-forever", dripDelayMs: 100, dripChunkBytes: 1 }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /TIMED OUT|deadline expired/, "the overall-deadline classification is explicit (whichever bound fires first — both are the absolute deadline)");
+    assert.ok(elapsed >= 1.7, `the abort happened AT the absolute deadline — arriving drips did NOT reset it (elapsed ${elapsed.toFixed(1)}s >= 1.7s)`);
+    assert.ok(elapsed < 10, `the abort is bounded (elapsed ${elapsed.toFixed(1)}s < 10s)`);
+  });
+  test("timeout 15 — response headers received but the body NEVER completes (declared Content-Length, bytes stall): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "stall-mid-body", stallAfterBytes: 0 }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /TIMED OUT|deadline|INCOMPLETE/, "headers without a complete body can never classify the deletion");
+  });
+  test("timeout 15b — a CLEAN early end BEFORE the declared Content-Length is INCOMPLETE: UNKNOWN", () => {
+    // The server declares 1000 bytes, sends 10, then closes the
+    // connection cleanly — the transfer is incomplete; the body is
+    // never parsed.
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "close-after-partial" }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /INCOMPLETE/, "the declared-vs-received mismatch is classified INCOMPLETE");
+  });
+  test("timeout 16 — TRANSPORT interruption DURING the body transfer: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "2", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, body: nfBase, mode: "hangup-mid-body", stallAfterBytes: 10 }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /INTERRUPTED|INCOMPLETE|transport error/, "the interruption is explicit");
+  });
+  test("timeout 17 — a response that sends data INDEFINITELY without exceeding the per-read timeout: the absolute deadline ends it (bounded execution)", () => {
+    const t0 = Date.now();
+    const res = runCleanup(baseEnv({ GY_READBACK_CONNECT_TIMEOUT_SECS: "2", GY_READBACK_OVERALL_DEADLINE_SECS: "1.5", MOCK_READBACK_BEHAVIOR: JSON.stringify({ status: 404, mode: "drip-forever", dripDelayMs: 20, dripChunkBytes: 1 }) }));
+    const elapsed = (Date.now() - t0) / 1000;
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /TIMED OUT|deadline expired/, "the indefinite drip is ended by the absolute deadline");
+    assert.ok(elapsed < 10, `execution stays bounded (elapsed ${elapsed.toFixed(1)}s < 10s)`);
+  });
+
+  // ── 6.3 — classification regression over the streaming read-back ──
+  test("class 19 — a VALID GitHub 404 Not Found response: deletion CONFIRMED", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBase }));
+    assert.equal(res.status, 0, "a validated 404 confirms the deletion");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the success verdict is claimed ONLY by the validated 404");
+  });
+  test("class 20 — a VALID matching HTTP 200 release response: the release STILL EXISTS (definitive FAILED, not UNKNOWN)", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: draftBody(true, TAG) }));
+    assertStillExists(res);
+  });
+  test("class 21 — HTTP 200 with a MISMATCHED release ID: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: JSON.stringify({ id: 999999, tag_name: TAG, draft: true }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /mismatch_id/, "the identity mismatch is explicit");
+  });
+  test("class 22 — HTTP 200 with a MISMATCHED tag: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: JSON.stringify({ id: Number(DRAFT_ID), tag_name: FOREIGN_TAG, draft: true }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /mismatch_tag/, "the tag mismatch is explicit");
+  });
+  test("class 23 — HTTP 200 with an INVALID draft type: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: JSON.stringify({ id: Number(DRAFT_ID), tag_name: TAG, draft: "true" }) }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /invalid_draft/, "the invalid draft type is explicit");
+  });
+  test("class 24 — an EMPTY response body: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: "" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /empty response body/, "the empty body is explicit");
+  });
+  test("class 25 — MALFORMED JSON: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: '{"message": "Not Found",' }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /NOT valid JSON/, "malformed JSON is explicit");
+  });
+  test("class 26 — TRUNCATED JSON: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: '{"id": 1234567, "tag_n' }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /NOT valid JSON/, "truncated JSON is explicit");
+  });
+  test("class 27 — an HTML response: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: "<html><body>upstream error</body></html>" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /NOT valid JSON/, "HTML content is explicit");
+  });
+  test("class 28 — an UNEXPECTED HTTP status (418): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "418" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /unexpected HTTP 418/, "the unexpected status is explicit");
+  });
+  test("class 29 — an AUTHENTICATION failure (401): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "401" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /unexpected HTTP 401/, "the authentication failure is explicit");
+  });
+  test("class 30 — a RATE-LIMIT response (429): UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: "429" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /unexpected HTTP 429/, "the rate limit is explicit");
+  });
+  for (const status of ["500", "503"]) {
+    test(`class 31 — a SERVER error (HTTP ${status}): UNKNOWN`, () => {
+      const res = runCleanup(baseEnv({ MOCK_READBACK_STATUS: status }));
+      assertUnknownOutcome(res);
+      assert.match(res.stdout, /unexpected HTTP /, "the server error is explicit");
+    });
+  }
+  test("class 32 — a FAILED DELETE followed by a VALID 404 read-back: deletion CONFIRMED (the read-back is authoritative)", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBase }));
+    assert.equal(res.status, 0, "the genuine 404 read-back confirms the deletion even after the DELETE call errored");
+    assert.equal(res.deleted, true, "the DELETE was attempted");
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+    assert.match(res.stdout, /was deleted \(read-back HTTP 404 — deletion confirmed/, "the validated read-back claims the deletion");
+  });
+  test("class 33 — a FAILED DELETE followed by a VALID 200 read-back: the release STILL EXISTS", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "200", MOCK_READBACK_BODY: draftBody(true, TAG) }));
+    assertStillExists(res);
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+  });
+  test("class 34 — a FAILED DELETE followed by an UNKNOWN read-back: UNKNOWN", () => {
+    const res = runCleanup(baseEnv({ MOCK_DELETE_FAILS: "1", MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: "not-json" }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /draft cleanup DELETE reported an error/, "the DELETE failure stays visible");
+    assert.match(res.stdout, /NOT valid JSON/, "the inconclusive read-back names its reason");
+  });
+  test("class extra — a MISSING read-back credential: UNKNOWN (fail closed)", () => {
+    const res = runCleanup(baseEnv({ GH_TOKEN: "", MOCK_READBACK_STATUS: "404", MOCK_READBACK_BODY: nfBase }));
+    assertUnknownOutcome(res);
+    assert.match(res.stdout, /no read-back credential/, "the missing credential is explicit");
   });
 });
 

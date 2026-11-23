@@ -1061,37 +1061,79 @@ jobs:
           # HTTP status (`curl -o /dev/null -w '%{http_code}'`) and
           # DISCARDED the response body — a malformed, empty, truncated,
           # HTML or structurally invalid response carrying the same status
-          # was treated as authoritative evidence of the release's state
-          # (a malformed 404 could "confirm" a deletion; a malformed 200
-          # could claim the release still exists). The read-back now
-          # captures AND validates the actual response:
-          #   * the body is captured into a temporary file (NEVER into a
-          #     shell variable — no unbounded response can enter the
-          #     shell's memory), with curl's `--max-filesize` enforcing
-          #     the 65536-byte limit whenever a Content-Length declares a
-          #     size AND a post-download byte count enforcing the SAME
-          #     limit when none is declared — a missing or misleading
-          #     Content-Length cannot bypass the bound. curl's exit
-          #     status, the HTTP status and the body are each captured
-          #     SEPARATELY; the temporary directory is removed by an EXIT
-          #     trap on EVERY path (success and failure); no credential,
-          #     header or token material is ever echoed to the log;
+          # was treated as authoritative evidence of the release's state.
+          # The read-back began to capture AND validate the actual
+          # response (separate curl exit status / HTTP status / body).
+          #
+          # NINETEENTH-ROUND CORRECTION (version-independent streaming
+          # response cap + absolute request deadline): the eighteenth
+          # round bounded the capture with curl's `--max-filesize` plus a
+          # post-download `wc -c` byte count. NEITHER is an acceptable
+          # primary enforcement mechanism:
+          #   * `--max-filesize` is curl-version-dependent for responses
+          #     WITHOUT a known size (chunked, no Content-Length) — some
+          #     versions cannot enforce it at all when the size is
+          #     unknown;
+          #   * a post-download byte count only rejects a response AFTER
+          #     it has already been consumed IN FULL — an unbounded body
+          #     would be downloaded (and written) before the check runs.
+          # The read-back is now a Python standard-library streaming
+          # implementation, invoked in-process (`python3 -` heredoc) —
+          # the EXACT same implementation the regression tests execute
+          # against deterministic local HTTP servers:
+          #   * HARD RESPONSE-SIZE BOUND — exactly 65536 bytes: the body
+          #     is consumed in bounded streaming reads of no more than
+          #     the remaining allowance plus one byte; a complete body of
+          #     exactly 65536 bytes is ACCEPTED; the response is REJECTED
+          #     the moment byte 65537 arrives; the bound applies with or
+          #     without Content-Length, to chunked and unknown-length
+          #     responses alike, and to the bytes actually handed to the
+          #     JSON parser (never a declared size or a post-download
+          #     count). No unbounded response ever enters a shell
+          #     variable, a memory buffer or a temporary file (the buffer
+          #     is capped at 65537 bytes by construction; this step uses
+          #     NO temporary files at all — nothing to clean up on any
+          #     path, including timeout and interruption).
+          #   * NO DECODING BYPASS — `Accept-Encoding: identity` is
+          #     requested; a response advertising any other
+          #     Content-Encoding is classified UNKNOWN (fail closed), so
+          #     no decompression layer can slip bytes past the bound.
+          #   * ABSOLUTE REQUEST DEADLINE — a finite connection timeout
+          #     (10 s) and a finite overall deadline (30 s) cover
+          #     connection establishment, the response headers and the
+          #     complete response body. The deadline is an ABSOLUTE point
+          #     on the MONOTONIC clock (time.monotonic — immune to
+          #     wall-clock adjustments, unlike time.time); before EVERY
+          #     blocking read the remaining time is recomputed and the
+          #     socket timeout is set to exactly that remaining time, so
+          #     no single blocking operation can outlive the deadline.
+          #     The deadline NEVER resets when another byte arrives — a
+          #     slow-drip response cannot keep the request alive
+          #     indefinitely (a per-read timeout alone would, because
+          #     each arriving byte proves liveness and restarts the wait).
+          #   * TRANSPORT / HTTP SEPARATION — connection failure, DNS or
+          #     TLS failure, connection timeout, overall-deadline expiry,
+          #     interrupted transfer, incomplete response, size-limit
+          #     violation, JSON parse failure and release-identity
+          #     mismatch are each classified DISTINCTLY; a transport
+          #     failure can never be mistaken for an HTTP status, and a
+          #     failed request never substitutes an empty body or a
+          #     default status.
+          # The classification taxonomy is UNCHANGED (eighteenth round):
           #   * HTTP 404 claims deletion CONFIRMED (the ONLY success
-          #     verdict) only when the body is non-empty, valid JSON and
-          #     the EXACT GitHub API Not Found structure
-          #     ({"message":"Not Found","status":"404"} — the shape
-          #     verified live against api.github.com on 2026-11-24), read
-          #     with the SAME authenticated repository context the
-          #     pre-deletion identity check used;
-          #   * HTTP 200 is validated as a GitHub Release object: a JSON
-          #     object with an `id` equal to THIS run's $DRAFT_RELEASE_ID,
-          #     a `tag_name` equal to THIS run's $TAG and a boolean
-          #     `draft` field. An exact draft match means the release
-          #     STILL EXISTS — cleanup FAILED; a published or mismatched
-          #     object contradicts the expected cleanup state;
-          #   * EVERYTHING ELSE — transport/DNS/TLS failure, oversized or
-          #     empty body, truncated response, malformed or structurally
-          #     invalid JSON, an HTML error page, a missing/invalid
+          #     verdict) only when the body is within the limit,
+          #     complete, valid JSON and the EXACT GitHub API Not Found
+          #     structure ({"message":"Not Found","status":"404"});
+          #   * HTTP 200 claims "release STILL EXISTS" only when the body
+          #     is validated as a GitHub Release object whose `id` equals
+          #     THIS run's $DRAFT_RELEASE_ID, whose `tag_name` equals
+          #     THIS run's $TAG and whose `draft` field is a boolean —
+          #     cleanup FAILED, operator intervention required; a
+          #     published or identity-contradicting object is UNKNOWN;
+          #   * EVERYTHING ELSE — transport/DNS/TLS failure, connection
+          #     timeout, overall-deadline expiry, interrupted or
+          #     incomplete transfer, oversized or empty body, malformed
+          #     or truncated JSON, an HTML error page, a missing/invalid
           #     `id`/`tag_name`/`draft` field, a mismatched release
           #     identity, HTTP 401/403/429/5xx and ANY unexpected status —
           #     is classified UNKNOWN: uncertainty is NEVER converted into
@@ -1101,54 +1143,155 @@ jobs:
           # 404. The pre-deletion identity checks (exact release ID,
           # exact run tag, draft == true proven by read-back BEFORE any
           # DELETE) and the seventeenth-round DELETE fall-through are
-          # unchanged.
-          readback_tmpdir=$(mktemp -d) || { echo "draft cleanup read-back could not create a temporary directory: the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1; }
-          trap 'rm -rf "$readback_tmpdir"' EXIT
-          readback_body="$readback_tmpdir/body.json"
+          # unchanged. The credential is used ONLY for the Authorization
+          # header and is never printed or logged.
           set +e # the read-back must ALWAYS reach classification — its own failure never aborts the step unclassified (the seventeenth-round invariant)
-          code=$(curl -sS --max-filesize 65536 \
-            -o "$readback_body" \
-            -w '%{http_code}' \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/releases/$DRAFT_RELEASE_ID" 2>"$readback_tmpdir/curl.err")
-          curl_exit=$?
+          python3 - "$REPO" "$DRAFT_RELEASE_ID" "$TAG" <<'GY_READBACK_PY'
+          import http.client, json, os, socket, ssl, sys, time
+          from urllib.parse import urlsplit
+
+          # argv: REPO, DRAFT_RELEASE_ID, EXPECTED_TAG — passed by the workflow step.
+          REPO = sys.argv[1]
+          RELEASE_ID = sys.argv[2]
+          EXPECTED_TAG = sys.argv[3]
+
+          # Hard response-size bound: exactly 65536 bytes. Byte 65537 rejects.
+          MAX_BODY_BYTES = 65536
+          CHUNK_SIZE = 8192
+          # Finite connection timeout and finite absolute overall request deadline
+          # (both cover a small GitHub API JSON response with ample headroom). The
+          # environment overrides exist ONLY so the deterministic local-server
+          # regression tests can keep execution bounded; production defaults apply
+          # in the workflow.
+          CONNECT_TIMEOUT_SECS = float(os.environ.get("GY_READBACK_CONNECT_TIMEOUT_SECS", "10"))
+          OVERALL_DEADLINE_SECS = float(os.environ.get("GY_READBACK_OVERALL_DEADLINE_SECS", "30"))
+          API_BASE = os.environ.get("GY_READBACK_API_BASE", "https://api.github.com").rstrip("/")
+
+          # ABSOLUTE deadline on the MONOTONIC clock (immune to wall-clock
+          # adjustments). It never resets when another response byte arrives.
+          deadline = time.monotonic() + OVERALL_DEADLINE_SECS
+
+          def unknown(reason):
+              print("draft cleanup read-back INCONCLUSIVE: " + reason + " — the deletion status of release " + RELEASE_ID + " is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED")
+              sys.exit(1)
+
+          def still_exists(detail):
+              print("draft cleanup read-back FAILED: release " + RELEASE_ID + " still EXISTS (HTTP 200) — " + detail + "; OPERATOR INTERVENTION REQUIRED")
+              sys.exit(2)
+
+          def confirmed(size):
+              print("verified: the un-published draft " + RELEASE_ID + " (tag " + EXPECTED_TAG + ") was deleted (read-back HTTP 404 — deletion confirmed; the response body was validated as the exact GitHub API Not Found structure, " + str(size) + " bytes); the stable reference and every published release were never touched")
+              sys.exit(0)
+
+          token = os.environ.get("GH_TOKEN", "")
+          if not token:
+              unknown("no read-back credential is available (GH_TOKEN is empty) — the deletion cannot be verified without authentication")
+          # The credential is used ONLY for the Authorization header below; it is
+          # never printed, logged or embedded in any classification message.
+
+          parts = urlsplit(API_BASE)
+          if parts.scheme == "https":
+              conn = http.client.HTTPSConnection(parts.hostname, port=parts.port or 443, timeout=CONNECT_TIMEOUT_SECS, context=ssl.create_default_context())
+          elif parts.scheme == "http":
+              conn = http.client.HTTPConnection(parts.hostname, port=parts.port or 80, timeout=CONNECT_TIMEOUT_SECS)
+          else:
+              unknown("the read-back API base URL scheme is unsupported (" + str(parts.scheme) + ")")
+
+          path = (parts.path or "") + "/repos/" + REPO + "/releases/" + RELEASE_ID
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Accept-Encoding": "identity",  # nothing may decode bytes outside the bounded streaming read
+              "Authorization": "Bearer " + token,
+              "User-Agent": "grave-indexer-draft-cleanup-readback",
+          }
+
+          try:
+              try:
+                  conn.request("GET", path, headers=headers)
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      unknown("the overall request deadline expired before the response headers arrived")
+                  if conn.sock is not None:
+                      conn.sock.settimeout(min(remaining, CONNECT_TIMEOUT_SECS))  # the connection/header wait is bounded by BOTH the connection timeout and the absolute deadline
+                  resp = conn.getresponse()
+              except (socket.timeout, TimeoutError, InterruptedError):
+                  unknown("the read-back TIMED OUT while connecting or while receiving the response headers (connection timeout " + str(CONNECT_TIMEOUT_SECS) + "s, absolute overall deadline " + str(OVERALL_DEADLINE_SECS) + "s on the monotonic clock) — a timeout is never an HTTP status and never a deletion verdict")
+              except (http.client.HTTPException, ConnectionError, OSError) as exc:
+                  unknown("read-back transport error while connecting or receiving headers (" + type(exc).__name__ + ") — a transport failure is never an HTTP 404 and never substitutes a default status")
+              status = resp.status
+              declared_length = resp.length  # captured BEFORE reading (resp.length decrements as the body is consumed)
+              content_encoding = (resp.getheader("Content-Encoding") or "identity").strip().lower()
+              if content_encoding not in ("identity", ""):
+                  unknown("HTTP " + str(status) + " arrived with Content-Encoding '" + content_encoding + "' — the body bound cannot be enforced through an unexamined decoding layer, so the response is never parsed")
+              body = bytearray()
+              while True:
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      unknown("the overall request deadline (" + str(OVERALL_DEADLINE_SECS) + "s, monotonic clock) expired while consuming the response body — the response is INCOMPLETE and unclassifiable; the deadline never resets when another byte arrives (a slow-drip response cannot keep this request alive)")
+                  if conn.sock is not None:
+                      conn.sock.settimeout(remaining)  # no single blocking read can exceed the remaining time to the absolute deadline
+                  try:
+                      # Bounded streaming read: never more than the remaining
+                      # allowance plus one byte, so byte 65537 is detected the
+                      # moment it arrives while a complete 65536-byte body is
+                      # still accepted. The JSON parser will consume EXACTLY
+                      # these bounded bytes — never a declared size and never a
+                      # post-download count.
+                      # resp.read1 = at most ONE raw read per call: the call
+                      # returns as soon as ANY bytes have arrived, so the
+                      # absolute-deadline check above runs between reads.
+                      # (resp.read(n) would block until n bytes accumulate
+                      # — a slow-drip response could keep it alive
+                      # indefinitely below the per-read socket timeout,
+                      # exactly the bypass this correction forbids.)
+                      chunk = resp.read1(min(CHUNK_SIZE, MAX_BODY_BYTES - len(body) + 1))
+                  except (socket.timeout, TimeoutError, InterruptedError):
+                      unknown("reading the response body TIMED OUT (bounded by the absolute " + str(OVERALL_DEADLINE_SECS) + "s monotonic deadline) — the response is INCOMPLETE and cannot be classified")
+                  except (http.client.IncompleteRead, http.client.HTTPException, ConnectionError, OSError) as exc:
+                      unknown("the response transfer was INTERRUPTED before completion (transport error: " + type(exc).__name__ + ") — an incomplete response is never parsed and never classified as evidence")
+                  if not chunk:
+                      break
+                  body += chunk
+                  if len(body) > MAX_BODY_BYTES:
+                      unknown("response body exceeds the " + str(MAX_BODY_BYTES) + "-byte limit (byte " + str(MAX_BODY_BYTES + 1) + " received during streaming) — oversized responses are never trusted and are never parsed")
+              received = len(body)
+              if declared_length is not None and received < declared_length:
+                  unknown("the response declared Content-Length " + str(declared_length) + " but only " + str(received) + " bytes arrived — the transfer is INCOMPLETE and the body is never parsed")
+              if received == 0:
+                  unknown("empty response body (HTTP " + str(status) + ") — a response without a body cannot classify the deletion")
+              try:
+                  parsed = json.loads(body.decode("utf-8"))
+              except (UnicodeDecodeError, ValueError):
+                  unknown("response body (HTTP " + str(status) + ", " + str(received) + " bytes) is NOT valid JSON — malformed, truncated or HTML responses are never trusted")
+              if not isinstance(parsed, dict):
+                  unknown("response body (HTTP " + str(status) + ", " + str(received) + " bytes) is not a JSON object — unexpected content is never trusted")
+              if status == 404:
+                  if parsed.get("message") != "Not Found" or parsed.get("status") != "404":
+                      unknown("HTTP 404 whose body is NOT the expected GitHub API Not Found structure — an invalid body can never confirm a deletion")
+                  confirmed(received)
+              if status == 200:
+                  if "id" not in parsed:
+                      unknown("HTTP 200 release object is missing the \"id\" field (missing_id) — an unidentified object can never classify the deletion")
+                  if "tag_name" not in parsed:
+                      unknown("HTTP 200 release object is missing the \"tag_name\" field (missing_tag) — an unidentified object can never classify the deletion")
+                  if not isinstance(parsed.get("draft"), bool):
+                      unknown("HTTP 200 release object has an INVALID \"draft\" field (invalid_draft — not a boolean) — the release state cannot be established")
+                  if str(parsed.get("id")) != RELEASE_ID:
+                      unknown("HTTP 200 release object carries id " + str(parsed.get("id")) + ", not THIS run's draft " + RELEASE_ID + " (mismatch_id) — the object's identity cannot be established")
+                  if parsed.get("tag_name") != EXPECTED_TAG:
+                      unknown("HTTP 200 release object carries tag " + str(parsed.get("tag_name")) + ", not THIS run's tag " + EXPECTED_TAG + " (mismatch_tag) — the object's identity cannot be established")
+                  if parsed["draft"] is True:
+                      still_exists("a VALIDATED GitHub Release object (id " + RELEASE_ID + ", tag " + EXPECTED_TAG + ", draft true) proves the deletion did NOT succeed")
+                  unknown("HTTP 200 returned a release object that CONTRADICTS the expected cleanup state (published — expected the deleted draft " + RELEASE_ID + "/" + EXPECTED_TAG + ") — the deletion status cannot be established from a contradicting object")
+              unknown("unexpected HTTP " + str(status) + " for release " + RELEASE_ID + " — an authentication failure, authorization failure, rate limit, server error or ANY other unexpected status leaves the deletion status unestablished")
+          finally:
+              conn.close()
+          GY_READBACK_PY
+          readback_exit=$?
           set -e
-          if [ "$curl_exit" -ne 0 ]; then
-            echo "draft cleanup read-back FAILED (curl transport error, exit $curl_exit: $(cat "$readback_tmpdir/curl.err")): the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN — never claimed successful; OPERATOR INTERVENTION REQUIRED"; exit 1
-          fi
-          readback_size=$(wc -c < "$readback_body" 2>/dev/null || echo 0)
-          if [ "$readback_size" -gt 65536 ]; then
-            echo "draft cleanup read-back INCONCLUSIVE: response body exceeds the 65536-byte limit ($readback_size bytes) — oversized responses are never trusted; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
-          fi
-          if [ "$readback_size" -eq 0 ]; then
-            echo "draft cleanup read-back INCONCLUSIVE: empty response body (HTTP $code) — a response without a body cannot classify the deletion; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
-          fi
-          if ! jq -e 'type == "object"' "$readback_body" >/dev/null 2>&1; then
-            echo "draft cleanup read-back INCONCLUSIVE: response body (HTTP $code, $readback_size bytes) is NOT valid JSON — malformed, truncated or HTML responses are never trusted; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
-          fi
-          case "$code" in
-            404)
-              if ! jq -e '.message == "Not Found" and .status == "404"' "$readback_body" >/dev/null 2>&1; then
-                echo "draft cleanup read-back INCONCLUSIVE: HTTP 404 whose body is NOT the expected GitHub API Not Found structure — an invalid body can never confirm a deletion; the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1
-              fi
-              echo "verified: the un-published draft $DRAFT_RELEASE_ID (tag $TAG) was deleted (read-back HTTP 404 — deletion confirmed; the response body was validated as the exact GitHub API Not Found structure, $readback_size bytes); the stable reference and every published release were never touched" ;;
-            200)
-              release_class=$(jq -r --arg rid "$DRAFT_RELEASE_ID" --arg rtag "$TAG" '
-                if has("id") | not then "missing_id"
-                elif has("tag_name") | not then "missing_tag"
-                elif (.draft | type) != "boolean" then "invalid_draft"
-                elif ((.id | tostring) != $rid) then "mismatch_id"
-                elif (.tag_name != $rtag) then "mismatch_tag"
-                elif .draft == true then "exact_draft"
-                else "published"
-                end' "$readback_body") || { echo "draft cleanup read-back INCONCLUSIVE: HTTP 200 body could not be classified — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1; }
-              case "$release_class" in
-                exact_draft) echo "draft cleanup read-back FAILED: release $DRAFT_RELEASE_ID still EXISTS (HTTP 200) — a VALIDATED GitHub Release object (id $DRAFT_RELEASE_ID, tag $TAG, draft true) proves the deletion did NOT succeed; OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
-                published|missing_id|missing_tag|invalid_draft|mismatch_id|mismatch_tag) echo "draft cleanup read-back INCONCLUSIVE: HTTP 200 returned a release object that CONTRADICTS the expected cleanup state ($release_class — expected the deleted draft $DRAFT_RELEASE_ID/$TAG) — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
-                *) echo "draft cleanup read-back INCONCLUSIVE: unclassifiable HTTP 200 release object — the deletion status of release $DRAFT_RELEASE_ID is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
-              esac ;;
-            *) echo "draft cleanup read-back INCONCLUSIVE: unexpected HTTP $code for release $DRAFT_RELEASE_ID — the deletion status is UNKNOWN (never claimed successful); OPERATOR INTERVENTION REQUIRED"; exit 1 ;;
+          case "$readback_exit" in
+            0) : ;; # deletion CONFIRMED — the validated success verdict was printed by the read-back
+            *) exit "$readback_exit" ;; # still EXISTS (FAILED) or UNKNOWN — the classification and OPERATOR INTERVENTION REQUIRED were printed by the read-back
           esac
     outputs:
       versioned_tag: ${{ needs.publish.outputs.versioned_tag }}
