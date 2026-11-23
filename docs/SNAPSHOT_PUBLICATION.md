@@ -250,50 +250,108 @@ owner-provided token (evidence recorded in the PR remediation report):
 | Branch protection on `main` | **ABSENT** (`GET /branches/main/protection` → 404 "Branch not protected") | Push access to `main` = direct commit access; the workflow's `refs/heads/main` restriction limits dispatchers to people with push access, but no PR requirement is enforced for the branch itself |
 | Repository ruleset "enhancing indexer" (id 27244228, active) | Applies to `~DEFAULT_BRANCH` and `~ALL`; rules: deletion, non_fast_forward, code_quality, copilot_code_review; no bypass actors | `main` cannot be deleted or force-pushed, but the ruleset does NOT require pull requests and does NOT protect tags |
 | Tag-protection rulesets | **NONE** (the only ruleset targets branches) | Versioned snapshot tags can be created, updated or deleted by anyone with push access — tag immutability is NOT GitHub-enforced |
-| Immutable releases (GitHub feature) | **NOT VERIFIABLE** via the REST API (no endpoint exposes the setting; probing returned 404). Verifying it requires owner access to Settings → Releases or a write probe | The workflow must NOT assume assets are locked after upload |
+| Immutable releases (GitHub feature) | **UNKNOWN** (TWELFTH-ROUND CORRECTION, 2026-11-23: the authorized endpoint `GET /repos/<owner>/<repo>/immutable-releases` REQUIRES AUTHENTICATION — unauthenticated calls return HTTP 401 "Requires authentication" (confirmed from two independent network paths) / 403 rate-limit, and no authorized endpoint result has been obtained. An unauthenticated or under-privileged observation CANNOT distinguish "the setting is disabled" from "the setting is not visible to me" — the earlier "NOT VERIFIABLE / probing returned 404" wording was itself an over-claim and is corrected here) | The workflow must NOT assume assets are locked after upload — and must NOT assume they are not: the publication sequence must be made enforcement-compatible BEFORE the feature is ever switched on (§8.3) |
 | Releases / tags in the repository | **NONE exist** (no release, no tag) | The production stable reference is not yet bootstrapped; the first publication is the genuine first-publication path |
 
 ### What this means for the publication sequence
 
-1. **Immutability is a WORKFLOW-LEVEL convention here, not a
-   GitHub-enforced property.** The design is honest about this: releases
-   are created `--latest=false`, assets are never re-uploaded or
-   deleted, `--clobber` is never used, and any tag or release collision
-   fails closed BEFORE creation. Nothing in the workflow relies on
-   GitHub preventing an asset modification — it relies on the workflow
-   never issuing one, plus the auditability of the release history.
+1. **Immutability is a WORKFLOW-LEVEL convention here; GitHub-enforced
+   immutable-release status is UNKNOWN (never verified with an authorized
+   endpoint result).** The design is honest about both: releases are
+   created `--latest=false`, assets are never re-uploaded or deleted,
+   `--clobber` is never used, and any tag or release collision fails
+   closed BEFORE creation. Nothing in the workflow relies on GitHub
+   preventing an asset modification — it relies on the workflow never
+   issuing one, plus the auditability of the release history. The
+   absence of an observable tag-protection ruleset does NOT prove the
+   platform setting is disabled; only an authorized endpoint result
+   (HTTP 200 = enabled, HTTP 404 = not enabled) may settle it.
 2. **Tag collision handling is explicit three-way** (hardened in this
    remediation): `git ls-remote --exit-code` exit 2 = genuinely absent
    (proceed), exit 0 = exists (abort), ANY other exit = the gate itself
    failed (abort — never interpreted as "absent"). An existing RELEASE
    for the tag also aborts via `gh release view`.
-3. **Compatibility with GitHub's immutable-releases feature:** the
-   current sequence (create a published, empty release → upload assets)
-   is compatible with the CURRENT model but would FAIL once immutable
-   releases are enabled, because assets cannot be added to an already
-   published release under that feature. If the owner enables immutable
-   releases, the sequence MUST first be changed to draft-first (create
-   draft → upload → publish with explicit `make_latest=false` → verify →
-   promote), and the publish-time behavior (that un-drafting does not
-   silently move the latest designation) must be re-verified on the
-   rehearsal target first. **Do not enable immutable releases before
-   that change is implemented and rehearsed.** This is an owner action,
-   not something this PR does.
+3. **Compatibility with GitHub's immutable-releases feature (TWELFTH
+   ROUND — status, rehearsal, and the exact required change):** the
+   current production sequence (create a published, empty release →
+   upload assets to it) is compatible with the observed state — the
+   immutable-release status is UNKNOWN and no enforcement is verified —
+   but is INCOMPATIBLE with GitHub-enforced immutable releases: under
+   that feature, assets cannot be added to an already published release,
+   so the upload step would fail AFTER a release already existed. The
+   required draft-first sequence is therefore SPECIFIED here, REHEARSED
+   end-to-end by the rehearsal workflow as of the twelfth round (create
+   draft → upload BY RELEASE ID → verify draft assets → publish
+   `draft=false` + `make_latest=false` → verify → promote — see
+   docs/PUBLICATION_REHEARSAL.md §2), and its exact production patch is
+   PREPARED (validated locally: 431-test battery incl. the draft-first
+   readiness pins, typecheck, build, bundle, YAML parse, `bash -n`).
+   The production publisher on this branch is deliberately UNCHANGED:
+   with the enforcement status UNKNOWN, the change ships only together
+   with the owner's enablement decision, never speculatively. The
+   sequence the production patch implements:
+
+   1. create the versioned release as a DRAFT (`--latest=false --draft`,
+      `--target` pinned to the asserted commit);
+   2. upload all three assets to the draft BY RELEASE ID (GitHub REST,
+      verified 2026-11-23: "Get a release by tag name" serves PUBLISHED
+      releases only, and draft listings are visible only to push-access
+      users — every draft operation addresses the release by ID, never
+      by tag);
+   3. verify the draft assets: exact asset presence, recorded byte
+      lengths vs local bytes, download-back `sha256sum -c` digest belt,
+      and the provenance sidecar must name the release tag — all BEFORE
+      the immutable publish;
+   4. publish: `PATCH /releases/<id>` with `draft=false` and an explicit
+      `make_latest=false` (string — the API models true/false/legacy),
+      then read back the published state (draft flag + tag identity);
+   5. the read-only `verify-versioned` job re-verifies the PUBLISHED
+      release end-to-end (schema + completeness over fetched bytes) —
+      unchanged, and still the gate before activation (`needs:` chain;
+      a read-only token cannot see drafts, so this verification
+      deliberately runs AFTER publish);
+   6. only then the promote job activates the dedicated stable reference
+      (unchanged), followed by read-back verification.
+
+   Safety properties: any failure before the publish leaves an
+   un-published DRAFT (no immutable residue, no tag materialized — the
+   versioned tag is created at publish time from the pinned target), the
+   stable reference untouched, and the previous artifact serving. The
+   PAT-bearing step count becomes FIVE (the draft belt needs the PAT:
+   a draft is only readable with push access). **Do not enable immutable
+   releases before this change lands on the production workflow and is
+   rehearsed.** This is an owner decision, not something this PR does.
 4. **A failed or partial upload cannot leave an unusable promoted
    release:** the partial release is never designated latest (the
    roundtrip verification precedes promotion), so the previous
-   artifact keeps serving. The orphan versioned release remains visible
-   in the release history for inspection — that is by design (audit),
-   and it can be deleted by an operator without touching the stable
-   reference.
+   artifact keeps serving. Under the rehearsed draft-first sequence an
+   incomplete asset set is additionally refused on the DRAFT, before
+   the immutable publish (the rehearsal's partial-upload scenario
+   proves this end-to-end). The orphan versioned release remains
+   visible in the release history for inspection — that is by design
+   (audit), and it can be deleted by an operator without touching the
+   stable reference.
 
 ### Owner/admin actions identified (NOT performed by this PR)
 
 * Add a pull-request requirement (and required checks) to `main` via
   branch protection or a ruleset — the ruleset currently lacks a
   `pull_request` rule.
-* Decide whether to enable GitHub's immutable releases; if yes, the
-  draft-first sequence change above must land first.
+* Settle the immutable-release status with an AUTHORIZED endpoint result
+  (`GET /repos/GraveYield/grave-indexer/immutable-releases` with a
+  credential holding at least read access; HTTP 200 = enabled — inspect
+  and report `enabled` and `enforced_by_owner`; HTTP 404 = not enabled,
+  consistent with GitHub's documented endpoint behavior; HTTP 403 or any
+  other inconclusive response = still UNKNOWN). Until such a result is
+  recorded, the status remains UNKNOWN and must not be reported as
+  either enabled or disabled.
+* Decide whether to enable GitHub's immutable releases; the draft-first
+  production patch is prepared and validated (§8.3) and the rehearsal
+  workflow already rehearses the sequence — land the patch on the
+  production workflow and re-verify the publish-time latest-designation
+  behavior on the rehearsal target BEFORE switching the feature on
+  (the rehearsal dispatch itself remains blocked — see
+  docs/PUBLICATION_REHEARSAL.md §3).
 * Optionally add tag-protection rules for the
   `console-snapshot-prod-*` namespace so versioned snapshot tags become
   GitHub-enforced immutable.
@@ -405,7 +463,7 @@ survive only as non-production utilities and tests.
   | `generate` | `contents: read` (EXPLICIT) | YES (build + `publish-snapshot`/`verify-snapshot`) | `github.token` READ-ONLY (consumed implicitly by checkout/setup-node; no `GH_TOKEN` env anywhere); RPC secrets to the snapshot CLI only |
   | `verify` | `contents: read` (EXPLICIT) | YES (independent re-verification + builds the zero-dep release-ops bundle) | `github.token` READ-ONLY (implicit via checkout/setup-node only) |
   | `publish` | `contents: read` (EXPLICIT) | YES (checksum belt, provenance tag parse, collision gates, `stable-pointer-current` discovery over the DEDICATED ref) | `github.token` READ-ONLY, step-level env on the tag-collision gate, the belt-check GET and the discovery step ONLY — never the PAT |
-  | `release` | `contents: read` (EXPLICIT) | **NO** | `github.token` READ-ONLY, step-level env on the authenticated tag-collision gate ONLY; `GY_RELEASE_PAT` step-level env on the `gh release create/upload` mutation step ONLY |
+  | `release` | `contents: read` (EXPLICIT) | **NO** | `github.token` READ-ONLY, step-level env on the authenticated tag-collision gate ONLY; `GY_RELEASE_PAT` step-level env on the `gh release create/upload` mutation step ONLY (TWELFTH-ROUND NOTE: the prepared draft-first patch splits this into draft create+upload and draft-belt verify+publish steps — §8.3, §16.2) |
   | `verify-versioned` | `contents: read` (EXPLICIT) | YES (prebuilt zero-dep bundle, `--scope versioned` roundtrip) | `github.token` READ-ONLY, step-level env on the roundtrip gate ONLY (the repository is private: release assets 404 unauthenticated) — never the PAT |
   | `promote` | `contents: read` (EXPLICIT) | **NO** | `GY_RELEASE_PAT` step-level env on the stable-ref activation step (create annotated pointer tag object + atomic ref update) and the in-job rollback step ONLY; the pointer jq gate and read-back are token-free or READ-ONLY |
   | `verify-stable` | `contents: read` (EXPLICIT) | YES (reviewed commit's own verification CLI, `verify-stable --expected-tag` over the DEDICATED ref) | `github.token` READ-ONLY, step-level env on the gate step only |
@@ -531,7 +589,7 @@ never accessed while preparing this change.
 | Credential | Where it exists | What it can do |
 | --- | --- | --- |
 | `github.token` (automatic) | ALL EIGHT jobs — every job explicitly declares `permissions: contents: read` | READ-ONLY repository content, read API queries (release-by-tag belt check, git-ref tag gate, stable-ref and tag-object reads, authenticated asset fetches during verification, post-activation read-back, the rollback job's compare-before-rollback and read-back) |
-| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly FOUR steps: the `release` job's `gh release create/upload` step; the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication); the dedicated `rollback` job's single ref-mutation step (same two rollback cases, after a failed post-activation verification) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
+| `GY_RELEASE_PAT` (owner-provisioned fine-grained PAT) | STEP-level env of exactly FOUR steps: the `release` job's `gh release create/upload` step; the `promote` job's stable-ref activation step (create annotated pointer tag object + atomic ref update); the `promote` job's failure-path rollback step (re-create the previous pointer object + re-point the ref, or delete the ref on first publication); the dedicated `rollback` job's single ref-mutation step (same two rollback cases, after a failed post-activation verification). TWELFTH-ROUND NOTE: the prepared draft-first patch (§8.3, §16.2) would make this FIVE (release draft create+upload; release draft-belt verify+publish — the PAT is required there to READ the draft, since draft listings are visible only to push-access users) | GitHub release mutations AND git-data mutations of the dedicated stable reference (`git/tags`, `git/refs`) — nothing else |
 | `ACTIONS_RUNTIME_TOKEN` | Managed by GitHub for `actions/upload-artifact` / `actions/download-artifact` inside one workflow run | Run-scoped artifact transport only; not a `github.token` input |
 | `MAINNET_RPC_URL` / `DEVNET_RPC_URL` | `generate` job env (RPC access for snapshot generation) | RPC endpoints; no GitHub capability |
 
@@ -1020,15 +1078,15 @@ step, before checkout and any write operation):
    reference back, verify the annotated tag object and re-run
    `verify-stable`;
 10. NINTH-ROUND Finding 3 — a genuine post-activation failure-injection
-   scenario (`post-activation-failure`): after a VERIFIED activation, a
-   deliberate, controlled failure (explicit `exit 1`) triggers the SAME
-   `if: failure()` rollback gating production uses, including
-   compare-before-rollback; the restored state is proven by
-   `verify-stable` (previous pointer) or a genuine HTTP 404 (first
-   publication), and the four phases (publication → injected failure →
-   rollback → restored-state verification) are reported distinctly. The
-   job conclusion for this scenario is EXPECTED failure and is never
-   reported as a successful publication.
+    scenario (`post-activation-failure`): after a VERIFIED activation, a
+    deliberate, controlled failure (explicit `exit 1`) triggers the SAME
+    `if: failure()` rollback gating production uses, including
+    compare-before-rollback; the restored state is proven by
+    `verify-stable` (previous pointer) or a genuine HTTP 404 (first
+    publication), and the four phases (publication → injected failure →
+    rollback → restored-state verification) are reported distinctly. The
+    job conclusion for this scenario is EXPECTED failure and is never
+    reported as a successful publication.
 
 Credential boundary: the rehearsal uses the run's own `github.token`
 (which, by the hard guard, exists only inside the rehearsal repository)
@@ -1088,7 +1146,7 @@ mechanism:
 * §6/§7 no longer describe the repo-wide designation or `make_latest`
   as production mechanisms;
 * §10/§11 credential and job matrices now describe the eight-job graph
-  and the four PAT-bearing steps;
+  and the (then) four PAT-bearing steps;
 * §12.4 no longer presents the `releases/latest/...` URL as the stable
   URL or `gh release edit --latest` as promotion;
 * §13.3 documents both automated rollback paths;
@@ -1098,3 +1156,157 @@ mechanism:
   non-production utilities in the CLI help (they remain for tests and
   manual diagnostics only — the production workflow does not use
   them).
+
+## 16. Twelfth-round correction — immutable-release status UNKNOWN, draft-first readiness (specified + rehearsed + prepared patch), and rehearsal prerequisites
+
+Follow-up to the independent review requiring (a) the immutable-release
+status claim to be reconciled with the authorized endpoint semantics,
+and (b) the publisher to be prepared for GitHub-enforced immutable
+releases, plus an isolated rehearsal attempt. The approved architecture
+and every existing safeguard are unchanged; no validation was weakened.
+
+### 16.1 Immutable-release status: UNKNOWN (never "disabled")
+
+The former wording — "GitHub-enforced immutable releases are NOT
+enabled (verified: no tag-protection ruleset / immutable-release
+configuration)" — claimed a negative that was never verified. Evidence
+gathered 2026-11-23 (READ-ONLY; no repository setting was changed):
+
+* `GET /repos/GraveYield/grave-indexer/immutable-releases`, unauthenticated,
+  from two independent network paths → **HTTP 401 "Requires
+  authentication"** (and a third attempt → HTTP 403, IP rate-limit).
+  Both are INCONCLUSIVE responses: they cannot distinguish "the setting
+  is disabled" from "the setting is not visible to an unauthorized
+  caller".
+* No authorized credential was available to the task (and requesting or
+  exposing secrets in chat is forbidden), so the authorized 200/404
+  verdict could not be obtained.
+
+**Status: UNKNOWN.** Interpretation rule recorded in §8: HTTP 200 =
+enabled (report `enabled` and `enforced_by_owner`); HTTP 404 = not
+enabled (consistent with GitHub's documented endpoint behavior); HTTP
+403 / insufficient permissions / anything else inconclusive = UNKNOWN —
+never inferred to "disabled". Only an actor with authorized access can
+settle it (§8, owner actions). The reconciliation comment on the PR
+(2026-11-23) is preserved as the historical record of this correction.
+
+### 16.2 The publisher is PREPARED for enforcement: sequence specified, rehearsed, and a validated production patch recorded
+
+The production release sequence — create a PUBLISHED empty release, then
+upload assets to it — is incompatible with GitHub-enforced immutable
+releases (assets cannot be added to an already published release). The
+required draft-first sequence is fully specified in §8.3 and is now
+REHEARSED end-to-end by the rehearsal workflow's twelfth-round update
+(draft create → BY-ID asset upload → draft belt: presence + byte
+lengths + download-back `sha256sum -c` + provenance tag → publish PATCH
+`draft=false`, `make_latest=false` → read-only `verify-versioned` gate
+(unchanged, still the activation precondition) → dedicated-ref
+activation + read-back (unchanged)). The rehearsal's partial-upload
+scenario proves an incomplete asset set is refused on the DRAFT and
+never published. PUSH STATUS: the updated workflow file itself is
+validated and preserved in this change's working state, but it could
+NOT be pushed to this branch with the task's credential — see the
+exact prerequisite at the end of this subsection.
+
+The exact production patch that adopts the sequence was prepared and
+validated locally (a battery of 431 tests including the draft-first
+readiness pins, typecheck, build, bundle, YAML parse, `bash -n`) and is
+recorded alongside the remediation report for the owner. The production
+publisher on this branch is deliberately UNCHANGED: with the
+enforcement status UNKNOWN, the change ships only together with the
+owner's enablement decision, never speculatively — the currently
+published-first sequence is compatible with the observed state, and
+every rollback and last-known-good safeguard is unaffected.
+
+Key facts the prepared implementation relies on (GitHub REST, verified
+2026-11-23 from the official docs): "Get a release by tag name" serves
+PUBLISHED releases only, and draft listings are visible only to
+push-access users — therefore every draft operation addresses the
+release BY ID, and the draft belt necessarily carries the PAT (the only
+push-access credential in the workflow). The PAT-bearing step count
+would become FIVE (§11 note); no other credential boundary moves, no
+job grants write, and the belt step remains zero-custom-code (pinned
+`gh api`, `jq`, `sha256sum` invocations only).
+
+Safety properties of the prepared change: a partial upload fails on the
+DRAFT and never creates immutable residue; the versioned tag is
+materialized only at publish (from the pinned target commit);
+`--latest=false`/`make_latest=false` keep the repo-wide designation out
+of the path; the pointer still cannot move until the PUBLISHED release
+passes the full read-only verification.
+
+**Exact prerequisite — the workflow file must be pushed by an actor
+with `workflows` permission.** The twelfth-round update of
+`.github/workflows/rehearsal-publication.yml` (the draft-first `happy`
+and `partial-upload` scenarios, 105 changed lines, validated by the
+full offline battery) could not be pushed to this branch by the task's
+credential: GitHub refuses ANY workflow-file creation or update by a
+GitHub App without the `workflows` permission — `HTTP 403 "refusing to
+allow a GitHub App to create or update workflow
+.github/workflows/rehearsal-publication.yml without workflows
+permission"`, on both the git-trees path (`POST /git/trees`) and the
+contents path (`PUT /contents/...`). This is a GitHub platform rule,
+not a transient failure. Until a credential holding `workflows`
+permission (for example a user personal access token with the workflow
+scope) pushes that single file to this branch, the rehearsal workflow
+AS IT EXISTS ON THE REMOTE is the pre-twelfth-round version — the
+draft-first rehearsal scenarios exist in the validated working state
+only. The production publisher is UNAFFECTED: it is deliberately
+unchanged in both the local working state and the remote branch.
+
+### 16.3 The rehearsal was NOT dispatched — exact prerequisites
+
+Per the authorization boundary (do not dispatch unless the
+rehearsal-repository access, credential scope, and workflow target
+guard are verified), the isolated rehearsal against
+`GraveYield/grave-indexer-pub-rehearsal` was NOT executed. Verified
+prerequisite state (read-only probes, 2026-11-23):
+
+1. The rehearsal repository `GraveYield/grave-indexer-pub-rehearsal`
+   EXISTS but is **EMPTY** — no commits, no branches, no default branch,
+   no files. GitHub registers `workflow_dispatch` workflows only from a
+   repository's default branch, so the rehearsal workflow cannot be
+   dispatched there at all (it is also not yet merged into
+   `grave-indexer`'s default branch: PR #5 remains open and in draft,
+   as required).
+2. Dispatching additionally requires a credential with
+   `actions:write`/write access to the rehearsal repository; none was
+   available to the task, and none was requested or exposed.
+3. The workflow's own safety properties WERE verified by inspection and
+   structure tests: the hard repository-identity guard is the FIRST
+   step (before checkout and any write), the rehearsal uses only its
+   repository-scoped `github.token`, no production secret
+   (`GY_RELEASE_PAT` or otherwise) is referenced (pinned by
+   test/publishWorkflow.test.ts), and the rehearsal now exercises the
+   §8.3 draft-first sequence (§16.2) — while the production publisher
+   itself is deliberately UNCHANGED (UNKNOWN enforcement status; the
+   validated patch is recorded for the owner).
+
+What the owner must do (unchanged in substance, updated in facts):
+initialize the rehearsal repository (one commit) with this branch's
+workflow on its default branch (or grant a scoped credential), then
+dispatch once per scenario and record run IDs, summaries, and resulting
+repository state — docs/PUBLICATION_REHEARSAL.md §3. Additionally, push
+the validated twelfth-round rehearsal workflow file to this branch
+(requires a credential with `workflows` permission — see §16.2). Until
+then, no rehearsal result is claimed, and the workflow remains
+PREPARED — NOT EXECUTED.
+
+### 16.4 Validation (twelfth round)
+
+* `pnpm run test:offline`: 425 tests, 0 failures (the shipped branch
+  state; the prepared production patch was additionally validated
+  against a 431-test battery including the draft-first readiness pins
+  before being recorded separately).
+* `pnpm run typecheck`, `pnpm run build`, `pnpm run bundle:release-ops`:
+  pass.
+* All workflow YAMLs parse; every `run:` block passes `bash -n` (100
+  blocks across the four workflows on the shipped branch state).
+* Diff review: no production repository reference in rehearsal code, no
+  credential-scope change on the shipped state, no new workflow
+  triggers, and no remaining "NOT enabled" immutable-release claim.
+* NO publication or rehearsal workflow was dispatched; NO release, tag,
+  or stable reference was created, modified, or deleted in any
+  repository; NO repository setting, ruleset, or immutable-release
+  configuration was changed; NO Vercel/Console/blockchain state was
+  touched.
