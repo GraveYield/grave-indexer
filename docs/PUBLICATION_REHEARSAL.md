@@ -139,6 +139,23 @@ fail, verified live:
    `make_latest=false`, and gate the pointer activation on the
    read-only verification.
 
+**FOURTEENTH-ROUND UPDATE (2026-11-23):** the workflow-file push
+prerequisite is RESOLVED — the owner provided a fine-grained PAT and the
+thirteenth-round commit (which modifies this workflow file) was pushed
+to PR #5's branch successfully, proving the credential holds the
+`workflows` permission; the branch now carries the current draft-first
+version of this workflow. The REMAINING blocker, now verified live with
+its exact cause: this repository is still EMPTY, and that PAT does not
+cover it — `PUT .../contents/probe.txt` → HTTP 403 "Resource not
+accessible by personal access token" (refused; nothing was created) and
+`git push` → 403 "Permission ... denied". The same PAT holds
+admin/push on `grave-indexer`, so this is a token repository-selection
+gap, not a repository problem. Exact fix: add
+`grave-indexer-pub-rehearsal` to the token's repository access with
+Contents: read/write, Workflows: read/write, Actions: read/write, then
+perform owner steps 1–4 below. The rehearsal remains PREPARED — NOT
+EXECUTED; no result is claimed.
+
 Per the task's authorization boundary, dispatch was therefore skipped
 and the exact prerequisites are reported instead. Dispatching from this
 branch is also NOT possible: GitHub registers `workflow_dispatch`
@@ -195,17 +212,17 @@ or fail the run, and both rollback paths verify their own result) — but
 the owner should run the rehearsal above before the first production
 publication.
 
-Equally important, do NOT overstate other unverified claims: GitHub-
-enforced immutable-release status is **UNKNOWN** — it has never been
-verified with an authorized endpoint result (unauthenticated calls to
-`GET /repos/<owner>/<repo>/immutable-releases` return 401/403, which
-cannot distinguish "disabled" from "not visible"); immutability is a
-workflow-level convention, and the production publisher's current
-published-first sequence is compatible with the observed UNKNOWN state
-— the draft-first sequence required before enforcement is SPECIFIED
-(§8.3), REHEARSED by this workflow, and available as a validated
-production patch for the owner to adopt together with any enablement
-decision (docs/SNAPSHOT_PUBLICATION.md §8.3, §16). Enabling GitHub's
+Equally important, do NOT overstate other claims. GitHub-enforced
+immutable-release status is now SETTLED, not UNKNOWN (fourteenth round,
+2026-11-23): the authorized endpoint
+`GET /repos/GraveYield/grave-indexer/immutable-releases` returned HTTP
+200 with `{"enabled": false, "enforced_by_owner": false}` — the feature
+is NOT enabled (docs/SNAPSHOT_PUBLICATION.md §18). Immutability is a
+workflow-level convention, and as of the thirteenth round the
+production publisher on PR #5's branch IMPLEMENTS the draft-first
+sequence (docs/SNAPSHOT_PUBLICATION.md §8.3, §17), which this rehearsal
+exercises — the publisher is compatible with the feature disabled
+(current) and enabled (future owner decision). Enabling GitHub's
 immutable-releases feature is an owner decision, and the publish-time
 latest-designation behavior should be re-verified on the rehearsal
 target first. Production Console ingestion is NOT operational (the

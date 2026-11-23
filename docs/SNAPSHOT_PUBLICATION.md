@@ -250,22 +250,24 @@ owner-provided token (evidence recorded in the PR remediation report):
 | Branch protection on `main` | **ABSENT** (`GET /branches/main/protection` → 404 "Branch not protected") | Push access to `main` = direct commit access; the workflow's `refs/heads/main` restriction limits dispatchers to people with push access, but no PR requirement is enforced for the branch itself |
 | Repository ruleset "enhancing indexer" (id 27244228, active) | Applies to `~DEFAULT_BRANCH` and `~ALL`; rules: deletion, non_fast_forward, code_quality, copilot_code_review; no bypass actors | `main` cannot be deleted or force-pushed, but the ruleset does NOT require pull requests and does NOT protect tags |
 | Tag-protection rulesets | **NONE** (the only ruleset targets branches) | Versioned snapshot tags can be created, updated or deleted by anyone with push access — tag immutability is NOT GitHub-enforced |
-| Immutable releases (GitHub feature) | **UNKNOWN** (TWELFTH-ROUND CORRECTION, 2026-11-23: the authorized endpoint `GET /repos/<owner>/<repo>/immutable-releases` REQUIRES AUTHENTICATION — unauthenticated calls return HTTP 401 "Requires authentication" (confirmed from two independent network paths) / 403 rate-limit, and no authorized endpoint result has been obtained. An unauthenticated or under-privileged observation CANNOT distinguish "the setting is disabled" from "the setting is not visible to me" — the earlier "NOT VERIFIABLE / probing returned 404" wording was itself an over-claim and is corrected here) | The workflow must NOT assume assets are locked after upload — and must NOT assume they are not: the publication sequence must be made enforcement-compatible BEFORE the feature is ever switched on (§8.3) |
+| Immutable releases (GitHub feature) | **NOT enabled** (FOURTEENTH-ROUND RECONCILIATION, 2026-11-23: SETTLED with an AUTHORIZED endpoint result — `GET /repos/GraveYield/grave-indexer/immutable-releases` with the owner-provided credential returned **HTTP 200** with body `{"enabled": false, "enforced_by_owner": false}`; read-only query, no setting was changed. This supersedes the twelfth-round UNKNOWN: until then only unauthenticated 401/403 responses were available, which cannot distinguish "disabled" from "not visible to me") | The workflow must NOT assume assets are locked after upload — and must NOT assume they are not: the publication sequence must be enforcement-compatible BEFORE the feature is ever switched on; the draft-first sequence (§8.3, implemented in the production workflow as of the thirteenth round, §17) satisfies that requirement in BOTH states (§18) |
 | Releases / tags in the repository | **NONE exist** (no release, no tag) | The production stable reference is not yet bootstrapped; the first publication is the genuine first-publication path |
 
 ### What this means for the publication sequence
 
 1. **Immutability is a WORKFLOW-LEVEL convention here; GitHub-enforced
-   immutable-release status is UNKNOWN (never verified with an authorized
-   endpoint result).** The design is honest about both: releases are
-   created `--latest=false`, assets are never re-uploaded or deleted,
-   `--clobber` is never used, and any tag or release collision fails
-   closed BEFORE creation. Nothing in the workflow relies on GitHub
-   preventing an asset modification — it relies on the workflow never
-   issuing one, plus the auditability of the release history. The
-   absence of an observable tag-protection ruleset does NOT prove the
-   platform setting is disabled; only an authorized endpoint result
-   (HTTP 200 = enabled, HTTP 404 = not enabled) may settle it.
+   immutable releases are NOT enabled (FOURTEENTH ROUND: settled with an
+   authorized endpoint result — HTTP 200, `enabled: false`,
+   `enforced_by_owner: false`; see the §8 table and §18).** The design is
+   honest about both: releases are created `--latest=false`, assets are
+   never re-uploaded or deleted, `--clobber` is never used, and any tag
+   or release collision fails closed BEFORE creation. Nothing in the
+   workflow relies on GitHub preventing an asset modification — it
+   relies on the workflow never issuing one, plus the auditability of
+   the release history. The prior uncertainty is resolved: the
+   authorized endpoint result, not an unauthenticated probe, is what
+   settled it (§16.1 records the twelfth-round correction that made the
+   authorized result a hard requirement; §18 records the result).
 2. **Tag collision handling is explicit three-way** (hardened in this
    remediation): `git ls-remote --exit-code` exit 2 = genuinely absent
    (proceed), exit 0 = exists (abort), ANY other exit = the gate itself
@@ -341,21 +343,19 @@ owner-provided token (evidence recorded in the PR remediation report):
 * Add a pull-request requirement (and required checks) to `main` via
   branch protection or a ruleset — the ruleset currently lacks a
   `pull_request` rule.
-* Settle the immutable-release status with an AUTHORIZED endpoint result
-  (`GET /repos/GraveYield/grave-indexer/immutable-releases` with a
-  credential holding at least read access; HTTP 200 = enabled — inspect
-  and report `enabled` and `enforced_by_owner`; HTTP 404 = not enabled,
-  consistent with GitHub's documented endpoint behavior; HTTP 403 or any
-  other inconclusive response = still UNKNOWN). Until such a result is
-  recorded, the status remains UNKNOWN and must not be reported as
-  either enabled or disabled.
-* Decide whether to enable GitHub's immutable releases; the draft-first
-  production patch is prepared and validated (§8.3) and the rehearsal
-  workflow already rehearses the sequence — land the patch on the
-  production workflow and re-verify the publish-time latest-designation
-  behavior on the rehearsal target BEFORE switching the feature on
-  (the rehearsal dispatch itself remains blocked — see
-  docs/PUBLICATION_REHEARSAL.md §3).
+* ~~Settle the immutable-release status with an AUTHORIZED endpoint
+  result~~ — **DONE, fourteenth round (2026-11-23):** the authorized
+  query returned HTTP 200 with `{"enabled": false,
+  "enforced_by_owner": false}` — the feature is NOT enabled. Evidence
+  recorded in §18.
+* Decide whether to enable GitHub's immutable releases. The draft-first
+  sequence is now IMPLEMENTED in the production workflow on this branch
+  (thirteenth round, §17) and rehearsed by the rehearsal workflow, so
+  the publisher is compatible with the feature enabled AND disabled —
+  re-verify the publish-time latest-designation behavior on the
+  rehearsal target BEFORE switching the feature on (the rehearsal
+  dispatch itself remains blocked — see docs/PUBLICATION_REHEARSAL.md
+  §3 for the updated, exact prerequisites).
 * Optionally add tag-protection rules for the
   `console-snapshot-prod-*` namespace so versioned snapshot tags become
   GitHub-enforced immutable.
@@ -1194,6 +1194,15 @@ never inferred to "disabled". Only an actor with authorized access can
 settle it (§8, owner actions). The reconciliation comment on the PR
 (2026-11-23) is preserved as the historical record of this correction.
 
+> **FOURTEENTH-ROUND UPDATE (2026-11-23): SETTLED — NOT enabled.** The
+> owner provided an authorized credential; the endpoint was queried
+> READ-ONLY and returned **HTTP 200** with body `{"enabled": false,
+> "enforced_by_owner": false}`. The status is therefore NOT enabled,
+> with the endpoint reachable and reporting its state (not an inferred
+> negative from an unauthorized response). The UNKNOWN text above and
+> the twelfth-round reasoning are preserved as the historical record;
+> §18 records the evidence, and §17.3 is superseded by this result.
+
 ### 16.2 The publisher is PREPARED for enforcement: sequence specified, rehearsed, and a validated production patch recorded
 
 > **THIRTEENTH-ROUND UPDATE:** the draft-first sequence described here is
@@ -1385,6 +1394,11 @@ it. Everything else in the credential matrix (§11) is unchanged.
 
 ### 17.3 Immutable-release status (unchanged)
 
+> **SUPERSEDED, fourteenth round:** the authorized endpoint result
+> settles this as **NOT enabled** (HTTP 200, `enabled: false`,
+> `enforced_by_owner: false`) — see §16.1 and §18. The text below is
+> the historical thirteenth-round record.
+
 UNKNOWN. The authorized endpoint
 `GET /repos/GraveYield/grave-indexer/immutable-releases` still requires
 authentication; no authorized result is available to this task, and
@@ -1410,3 +1424,76 @@ disabled; enabling it remains an owner decision (§8, §16.1).
   repository; NO repository setting, ruleset, or immutable-release
   configuration was changed; NO Vercel/Console/blockchain state was
   touched.
+
+## 18. Fourteenth-round reconciliation — immutable-release status SETTLED (NOT enabled); rehearsal prerequisites updated (2026-11-23)
+
+Documentation-only round (no workflow or source change). Two material
+status updates, both evidenced, with every stale "UNKNOWN / prepared /
+blocked" claim reconciled in place (§8 table, §8 item 1, owner actions,
+§16.1, §17.3) while the historical per-round text is preserved.
+
+### 18.1 Immutable-release status: NOT enabled — authorized endpoint result
+
+* Evidence (READ-ONLY, 2026-11-23): `GET
+  /repos/GraveYield/grave-indexer/immutable-releases` with the
+  owner-provided authorized credential → **HTTP 200**, body
+  `{"enabled": false, "enforced_by_owner": false}`.
+* Per the interpretation rule recorded in §8/§16.1, a 200 response is
+  authoritative: the endpoint is reachable and REPORTS its state. The
+  reported state is `enabled: false` — the feature is NOT enabled, and
+  it is NOT enforced by the owner. This is not an inferred negative: it
+  is the endpoint's own answer to an authorized caller.
+* Consequences: (a) the workflow-level immutability convention remains
+  the ONLY immutability in effect — every existing safeguard
+  (compare-before-rollback, --clobber prohibition, collision gates,
+  never re-upload/delete assets, draft-first publish) is unchanged and
+  remains load-bearing; (b) the draft-first production sequence
+  implemented in the thirteenth round (§17) is compatible with the
+  feature disabled (current) AND enabled (future owner decision) — no
+  further publisher change is required before an enablement decision;
+  (c) the twelfth-round UNKNOWN record in §16.1/§17.3 is preserved as
+  history, superseded in place.
+
+### 18.2 Rehearsal: push prerequisite RESOLVED, new exact prerequisite recorded
+
+* RESOLVED: the twelfth-round workflow-push blocker (GitHub App without
+  the `workflows` permission → HTTP 403) is gone. The owner provided a
+  fine-grained PAT; the thirteenth-round commit (which MODIFIES
+  `.github/workflows/rehearsal-publication.yml` and
+  `.github/workflows/publish-console-snapshot.yml`) was pushed to this
+  branch successfully — GitHub accepted workflow-file changes through
+  that credential, proving the `workflows` permission is held. The
+  branch's rehearsal workflow is now the current draft-first version.
+* Still blocking, now with the exact cause verified live: the
+  rehearsal repository `GraveYield/grave-indexer-pub-rehearsal` remains
+  EMPTY (size 0, no default branch content), and the owner-provided
+  fine-grained PAT does NOT cover it:
+  - `PUT /repos/GraveYield/grave-indexer-pub-rehearsal/contents/probe.txt`
+    → HTTP 403 "Resource not accessible by personal access token"
+    (probe write REFUSED, nothing created — repo still size 0);
+  - `git push` over HTTPS → 403 "Permission to
+    GraveYield/grave-indexer-pub-rehearsal.git denied to sethoshi18".
+  The same PAT DOES hold admin/push on `grave-indexer` (proven by the
+  successful branch push). This is a token repository-selection /
+  permission-scope gap, NOT a repository-state problem.
+* Exact owner fix (owner settings, not this task's authority): edit the
+  fine-grained token (Settings → Developer settings → Fine-grained
+  tokens) to add `grave-indexer-pub-rehearsal` to its repository access
+  with Contents: read/write, Workflows: read/write, and Actions:
+  read/write; then initialize the rehearsal repository (one commit
+  carrying `rehearsal-publication.yml` + `docs/PUBLICATION_REHEARSAL.md`
+  + a README on `main`) and dispatch the five scenarios per
+  docs/PUBLICATION_REHEARSAL.md §3. NO rehearsal result is claimed;
+  the rehearsal remains PREPARED — NOT EXECUTED.
+
+### 18.3 Validation (fourteenth round)
+
+* Documentation-only change; the full offline battery was re-run on the
+  exact tree: `pnpm run test:offline`, `pnpm run typecheck`,
+  `pnpm run build`, `pnpm run bundle:release-ops` — all pass; all four
+  workflow YAMLs parse; every `run:` block passes `bash -n`.
+* No workflow content, source file, test, or repository setting was
+  changed by this round; NO publication or rehearsal workflow was
+  dispatched; NO release, tag, or stable reference was created,
+  modified, or deleted in ANY repository; NO Vercel/Console/blockchain
+  state was touched.
