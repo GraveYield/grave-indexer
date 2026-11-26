@@ -44,7 +44,7 @@ import {
 import { DEVNET_SCANNER_PROGRAM_ID, DEVNET_VAULT_PROGRAM_ID, type PipelineConfig } from "../src/config.js";
 import { buildAmmInfoSlice, synth } from "./fixtures.js";
 
-// ─── Seams ───────────────────────────────────────────────────────────────────
+// ─── Seams ───────────────────────────────────────────────────────────
 
 function protocolConfigBytes(): Uint8Array {
   // Exact layout from test/consoleSnapshotC1.test.ts (real Anchor shape):
@@ -165,6 +165,7 @@ function snapshotConfig(dataDir: string): PipelineConfig {
     vaultProgramId: DEVNET_VAULT_PROGRAM_ID,
     maxPoolsPerScan: 10,
     signatureScanLimit: 50,
+    enrichConcurrency: 4,
     discoveryStalenessSlots: 400,
     evidenceFreshnessSlots: 450,
     dataDir,
@@ -193,7 +194,7 @@ function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<
   });
 }
 
-// ─── Command-level RPC filter + completeness ─────────────────────────────────
+// ─── Command-level RPC filter + completeness ─────────────────────────────
 
 describe("cmdConsoleSnapshot — RPC-level M1 filter + completeness safeguards", () => {
   test("the command sends the verified pc_mint@432 WSOL memcmp filter in the RPC request", async () => {
@@ -298,7 +299,7 @@ describe("cmdConsoleSnapshot — RPC-level M1 filter + completeness safeguards",
   });
 });
 
-// ─── Publication staging + independent re-verification ───────────────────────
+// ─── Publication staging + independent re-verification ───────────────
 
 describe("cmdPublishSnapshot / cmdVerifySnapshot — staged publication gate", () => {
   test("a complete run stages artifact + provenance + checksum with accurate integrity", async () => {
