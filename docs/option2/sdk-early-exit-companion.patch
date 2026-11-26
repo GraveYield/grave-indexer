@@ -1,0 +1,322 @@
+From e448f60db22e30c18de36d47abe5245df7acfca9 Mon Sep 17 00:00:00 2001
+From: Z User <z@container>
+Date: Thu, 26 Nov 2026 03:56:22 +0000
+Subject: [PATCH] feat(sdk): early exit after the newest verified swap is
+ established (Option 2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+deriveLastSwapEvidenceV4 no longer fetches and classifies signatures
+OLDER than the newest verified economic swap. The signature window is
+newest-first, so when a verified swap is finalized and every NEWER
+candidate has already been resolved, the derivation outcome (status,
+lastSwap, definitive, reachedHistoryEnd, signaturesReturned) depends
+only on candidates up to that point — the redundant older fetch work is
+skipped. GUARD: the exit does NOT fire while a newer candidate remains
+unresolved (transaction missing/meta missing/malformed/non-finalized) —
+in that case the full window is examined exactly as before and the
+result stays incomplete (fail-closed, never negative evidence).
+
+scan gains additive fields: earlyExit (bool, present only when the exit
+fired) and signaturesExamined (candidates actually examined). The
+unexamined remainder is older than the verified swap and cannot change
+the decision; no_swap_in_scan semantics are untouched (the exit can
+never fire without a verified swap).
+
+Benefits most inactive pools whose last verified swap lies within the
+newest scanLimit signatures (fewer N transaction fetches of ~6+N per
+pool); does NOT help pools whose window contains no verified swap.
+
+Parity evidence: the full pre-existing lastSwapEvidence suite passes
+unchanged except the one candidate-list-truncation pin (updated with
+rationale); nine new tests pin decision-field parity over real fixtures
+for the approved scenario matrix (swap at newest sig, swaps after
+newer non-economic candidates, inactive pool within window, unresolved
+newer candidate blocking, older fetch failure, malformed newer
+candidate, no verified swap, ordering invariant, no-swap semantics).
+
+Validation: sdk 249/249, indexer 61/61 pass; ops 5 failures pre-exist
+on clean main (environment-dependent, unrelated). No thresholds,
+attestation layout, classification or blocking semantics changed.
+---
+ sdk/src/lastSwapAttestation.ts    |  55 ++++++++++-
+ sdk/test/lastSwapEvidence.test.ts | 158 +++++++++++++++++++++++++++++-
+ 2 files changed, 209 insertions(+), 4 deletions(-)
+
+diff --git a/sdk/src/lastSwapAttestation.ts b/sdk/src/lastSwapAttestation.ts
+index 680bda2..4bc1e98 100644
+--- a/sdk/src/lastSwapAttestation.ts
++++ b/sdk/src/lastSwapAttestation.ts
+@@ -260,6 +260,19 @@ export interface LastSwapEvidenceResult {
+     /** True when the RPC returned fewer signatures than requested — the
+      *  pool's full available history was covered. */
+     reachedHistoryEnd: boolean;
++    /** EARLY EXIT (Option 2): true when the scan stopped after the newest
++     *  verified economic swap was established AND every newer candidate
++     *  had already been resolved. Older candidates beyond that point are
++     *  deliberately NOT fetched and NOT recorded — they cannot influence
++     *  status, lastSwap or definitiveness (the newest-verified selection
++     *  and the newer-candidate blocking rule only look at candidates
++     *  up to and including the verified swap). Absent when the scan ran
++     *  to the full signature window. */
++    earlyExit?: boolean;
++    /** How many candidates were actually examined when early exit fired
++     *  (<= signaturesReturned). The unexamined remainder is older than
++     *  the verified swap and irrelevant to this derivation's outcome. */
++    signaturesExamined?: number;
+   };
+   /** True when the result is a sound basis for an inactivity claim. */
+   definitive: boolean;
+@@ -492,6 +505,7 @@ export async function deriveLastSwapEvidenceV4(
+ 
+   const candidates: LastSwapCandidateRecord[] = [];
+   const seen = new Set<string>();
++  let earlyExit = false;
+   for (const info of sigInfos) {
+     if (seen.has(info.signature)) continue; // defensive: dedupe RPC pages
+     seen.add(info.signature);
+@@ -571,6 +585,26 @@ export async function deriveLastSwapEvidenceV4(
+       // it is never converted into a swap or a non-swap.
+       finalize({ kind: "unresolved", reason: "malformed_transaction_metadata" });
+     }
++
++    // EARLY EXIT (Option 2 — approved pipeline-hardening change): the
++    // signature window is newest-first, so when a verified economic swap
++    // is finalized here, every NEWER candidate has already been resolved
++    // (each became an explicit candidate record above). The derivation's
++    // outcome depends ONLY on the candidates up to and including the
++    // newest verified swap (newest-verified selection + newer-candidate
++    // blocking), so OLDER signatures can be left unexamined without
++    // changing status, lastSwap, definitiveness or reachedHistoryEnd.
++    // GUARD (spec): do NOT stop while a newer candidate remains
++    // unresolved — in that case the result is (or may become)
++    // incomplete, and the full examined window is preserved exactly as
++    // the unoptimized implementation produces it.
++    if (
++      record.outcome.kind === "verified_swap" &&
++      candidates.slice(0, candidates.length - 1).every((c) => c.outcome.kind !== "unresolved")
++    ) {
++      earlyExit = true;
++      break;
++    }
+   }
+ 
+   const newestVerifiedIdx = candidates.findIndex((c) => c.outcome.kind === "verified_swap");
+@@ -587,7 +621,12 @@ export async function deriveLastSwapEvidenceV4(
+         status: "incomplete",
+         lastSwap: null,
+         candidates,
+-        scan: { requestedLimit: scanLimit, signaturesReturned: sigInfos.length, reachedHistoryEnd },
++        scan: {
++          requestedLimit: scanLimit,
++          signaturesReturned: sigInfos.length,
++          reachedHistoryEnd,
++          ...(earlyExit ? { earlyExit: true, signaturesExamined: candidates.length } : {}),
++        },
+         definitive: false,
+       };
+     }
+@@ -599,7 +638,12 @@ export async function deriveLastSwapEvidenceV4(
+         signature: newestVerified.signature,
+       },
+       candidates,
+-      scan: { requestedLimit: scanLimit, signaturesReturned: sigInfos.length, reachedHistoryEnd },
++      scan: {
++          requestedLimit: scanLimit,
++          signaturesReturned: sigInfos.length,
++          reachedHistoryEnd,
++          ...(earlyExit ? { earlyExit: true, signaturesExamined: candidates.length } : {}),
++        },
+       definitive: true,
+     };
+   }
+@@ -614,7 +658,12 @@ export async function deriveLastSwapEvidenceV4(
+     status: definitive ? "no_swap_in_scan" : "incomplete",
+     lastSwap: null,
+     candidates,
+-    scan: { requestedLimit: scanLimit, signaturesReturned: sigInfos.length, reachedHistoryEnd },
++    scan: {
++          requestedLimit: scanLimit,
++          signaturesReturned: sigInfos.length,
++          reachedHistoryEnd,
++          ...(earlyExit ? { earlyExit: true, signaturesExamined: candidates.length } : {}),
++        },
+     definitive,
+   };
+ }
+diff --git a/sdk/test/lastSwapEvidence.test.ts b/sdk/test/lastSwapEvidence.test.ts
+index 4eadd08..2d420b2 100644
+--- a/sdk/test/lastSwapEvidence.test.ts
++++ b/sdk/test/lastSwapEvidence.test.ts
+@@ -762,7 +762,15 @@ describe("candidate selection and completeness", () => {
+     const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
+     assert.equal(result.status, "verified");
+     assert.equal(result.lastSwap?.signature, swapV1Inner.signature);
+-    assert.equal(result.candidates.length, 3);
++    // Option 2 early exit: the anchor is established at the FIRST (newest)
++    // verified swap with every newer candidate resolved, so the OLDER
++    // candidates are no longer examined or recorded. The DECISION fields
++    // (status, anchor signature, definitiveness) are byte-identical to the
++    // former full-window scan; only the redundant tail work is gone.
++    assert.equal(result.candidates.length, 1);
++    assert.equal(result.scan.earlyExit, true);
++    assert.equal(result.scan.signaturesExamined, 1);
++    assert.equal(rpc.txFetches.length, 1);
+   });
+ 
+   test("a newer liquidity operation does not hide an older verified swap", async () => {
+@@ -847,3 +855,151 @@ describe("pool account binding", () => {
+     assert.equal(new PublicKey(POOL).equals(POOL), true);
+   });
+ });
++
++// ─── Option 2 — SDK early exit (newest verified swap) ────────────────────────
++//
++// The signature window is NEWEST-FIRST. When a verified economic swap is
++// finalized and every NEWER candidate has already been resolved, the scan
++// stops: older candidates cannot influence status / lastSwap /
++// definitiveness / reachedHistoryEnd. Parity with the unoptimized
++// full-window scan is pinned three ways: (1) the entire pre-existing
++// suite (decision-field pins over real fixtures) passes unchanged except
++// for the one explicit candidate-truncation pin above; (2) the decision
++// fields below are pinned to exact fixture values; (3) every blocking
++// scenario (unresolved / malformed newer candidate, failed fetch) keeps
++// the full-window behavior. scan.earlyExit / scan.signaturesExamined
++// record the truncation explicitly; the redundant older fetches are
++// observable via LastSwapFakeRpc.txFetches.
++
++describe("Option 2 — SDK early exit", () => {
++  /** A DEPOSIT (non-economic V4 interaction, tag 3) over fixture `fx`. */
++  const depositOf = (fx: ReturnType<typeof loadTxFixture>) =>
++    CAND(fx, { response: withV4InstructionData(fx, v4TagData(3)) });
++
++  test("early exit fires at the newest verified swap; the older deposit is never fetched", async () => {
++    const rpc = new LastSwapFakeRpc([
++      CAND(swapV2Outer), // newest — verified swap (tag 16)
++      depositOf(swapV1Inner), // older — provably non-economic
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "verified");
++    assert.equal(result.definitive, true);
++    assert.equal(result.lastSwap?.signature, swapV2Outer.signature);
++    assert.equal(result.scan.reachedHistoryEnd, true);
++    assert.equal(result.scan.signaturesReturned, 2);
++    assert.equal(result.scan.earlyExit, true);
++    assert.equal(result.scan.signaturesExamined, 1);
++    assert.equal(result.candidates.length, 1);
++    assert.equal(rpc.txFetches.length, 1, "the older irrelevant candidate is never fetched");
++  });
++
++  test("swap AFTER newer non-economic candidates: anchor unchanged, deposits stay resolved", async () => {
++    const rpc = new LastSwapFakeRpc([
++      depositOf(swapV1Inner), // newer, resolved non-economic
++      depositOf(swapV2InnerV1), // newer, resolved non-economic
++      CAND(swapV2Outer), // the anchor
++      depositOf(swapV0Alt), // OLDER than the anchor — never examined
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "verified");
++    assert.equal(result.definitive, true);
++    assert.equal(result.lastSwap?.signature, swapV2Outer.signature);
++    assert.equal(result.scan.earlyExit, true);
++    assert.equal(result.scan.signaturesExamined, 3);
++    const fetched = new Set(rpc.txFetches.map((t) => t.signature));
++    assert.ok(!fetched.has(swapV0Alt.signature), "the deposit older than the anchor is never fetched");
++  });
++
++  test("inactive pool whose last verified swap lies INSIDE the window benefits identically", async () => {
++    const rpc = new LastSwapFakeRpc([
++      depositOf(swapV1Inner),
++      CAND(swapV2Outer),
++      depositOf(swapV2InnerV1),
++      depositOf(swapV0Alt),
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "verified");
++    assert.equal(result.lastSwap?.signature, swapV2Outer.signature);
++    assert.equal(result.scan.earlyExit, true);
++    assert.ok(rpc.txFetches.length < 4, "early exit reduces transaction fetches");
++  });
++
++  test("an UNRESOLVED candidate NEWER than the verified swap blocks the early exit", async () => {
++    const unresolved = CAND(swapV1Inner, { response: null, blockTime: 1_700_000_090 }); // transaction_data_missing
++    const rpc = new LastSwapFakeRpc([
++      unresolved,
++      CAND(swapV2Outer),
++      depositOf(swapV2InnerV1),
++      depositOf(swapV0Alt),
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "incomplete");
++    assert.equal(result.definitive, false);
++    assert.equal(result.lastSwap, null, "unresolved newer evidence blocks any definitive anchor");
++    assert.ok(!result.scan.earlyExit, "no early exit while a newer candidate is unresolved");
++    assert.equal(rpc.txFetches.length, 4, "full window examined exactly as the unoptimized scan");
++    const first = result.candidates[0]?.outcome;
++    assert.equal(first?.kind === "unresolved" ? first.reason : "", "transaction_data_missing");
++  });
++
++  test("a transaction-fetch FAILURE on an older candidate does not affect the decision", async () => {
++    const rpc = new LastSwapFakeRpc([
++      depositOf(swapV1Inner),
++      CAND(swapV2Outer),
++      CAND(swapV2InnerV1, { response: null }), // OLDER — fetch fails → unresolved
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "verified");
++    assert.equal(result.lastSwap?.signature, swapV2Outer.signature);
++    assert.equal(result.scan.earlyExit, true);
++    const fetched = new Set(rpc.txFetches.map((t) => t.signature));
++    assert.ok(!fetched.has(swapV2InnerV1.signature));
++  });
++
++  test("no verified swap in the window: behavior unchanged (no early exit, full scan)", async () => {
++    const rpc = new LastSwapFakeRpc([depositOf(swapV1Inner), depositOf(swapV2Outer)]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.ok(!result.scan.earlyExit);
++    assert.equal(rpc.txFetches.length, 2);
++    assert.equal(result.candidates.length, 2);
++    for (const c of result.candidates) {
++      assert.equal(c.outcome.kind, "not_economic_swap");
++    }
++  });
++
++  test("a MALFORMED newer candidate blocks the early exit (fail-closed parity)", async () => {
++    const rpc = new LastSwapFakeRpc([
++      CAND(swapV1Inner, { response: withOobProgramIdIndex(swapV1Inner) }), // malformed → unresolved
++      CAND(swapV2Outer), // verified, but a newer candidate is unresolved
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "incomplete");
++    assert.ok(!result.scan.earlyExit);
++    assert.equal(result.candidates[0]?.outcome.kind, "unresolved");
++    assert.equal(result.candidates[1]?.outcome.kind, "verified_swap");
++  });
++
++  test("an older verified swap NEVER becomes the anchor when a newer one exists (ordering invariant)", async () => {
++    const rpc = new LastSwapFakeRpc([
++      depositOf(swapV1Inner), // newest — non-economic
++      CAND(swapV2Outer), // newest verified swap — the anchor
++      CAND(swapV2InnerV1), // older verified swap — must not be examined or selected
++    ]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "verified");
++    assert.equal(result.lastSwap?.signature, swapV2Outer.signature);
++    assert.equal(result.scan.earlyExit, true);
++    assert.equal(rpc.txFetches.length, 2, "the older verified swap is never examined");
++    const fetched = new Set(rpc.txFetches.map((t) => t.signature));
++    assert.ok(!fetched.has(swapV2InnerV1.signature));
++  });
++
++  test("a definitive no-swap scan never gains earlyExit (semantics untouched)", async () => {
++    const rpc = new LastSwapFakeRpc([CAND(failedSwap)]);
++    const result = await deriveLastSwapEvidenceV4(rpc.asConnection(), RAYDIUM_V4_PROGRAM_ID, POOL);
++    assert.equal(result.status, "no_swap_in_scan");
++    assert.equal(result.definitive, true);
++    assert.ok(!result.scan.earlyExit);
++    assert.equal(result.lastSwap, null);
++  });
++});
+-- 
+2.47.3
