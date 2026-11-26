@@ -38,13 +38,19 @@ interface FakePage {
 }
 
 /** A stateful gPA-V2 fake: pages served in sequence; the cursor is the
- *  base58 sentinel of the next page index (page-1..N, then null). */
+ *  base58 sentinel of the next page index (page-1..N, then null). The
+ *  getSlot bracket endpoint returns 424_242 — deliberately DISTINCT from
+ *  every per-page context slot so tests can pin the bracket/window
+ *  separation. */
 function paginatedFetch(pages: FakePage[], log?: Array<{ cursor: string | null; limit: number }>): typeof fetch {
   return (async (url: string | URL, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as {
       method: string;
       params: [string, Record<string, unknown>];
     };
+    if (body.method === "getSlot") {
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 424_242 }), { status: 200 });
+    }
     if (body.method !== "getProgramAccountsV2") {
       return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } }), { status: 200 });
     }
@@ -268,5 +274,146 @@ describe("paginatedDiscovery — GpaV2Page shape (type-level sanity)", () => {
   test("a page object carries cursor + slot fields", () => {
     const page: GpaV2Page = { accounts: [], paginationKey: null, contextSlot: 1 };
     assert.equal(page.contextSlot, 1);
+  });
+});
+
+// ─── Option 2 continuation: operator work cap (--max-pools) ──────────────
+
+describe("paginatedDiscovery — operator work cap (--max-pools)", () => {
+  test("the cap stops enumeration MID-PAGE: no account is parsed beyond the cap, no further page is fetched", async () => {
+    const log: Array<{ cursor: string | null; limit: number }> = [];
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xd1, 0xd2, 0xd3]), nextCursor: "page-1", contextSlot: 10 },
+      { accounts: accountsOf([0xd4]), nextCursor: null, contextSlot: 11 },
+    ], log), { maxPools: 2 }));
+    // Exactly the capped number of pools parsed — never more.
+    assert.equal(run.stats.parsedPools, 2);
+    // The third account on page 0 was received but never parsed.
+    assert.equal(run.stats.rawAccounts, 3);
+    assert.equal(run.stats.iteratedAccounts, 2);
+    // The second page was NEVER fetched (the run stopped mid-page).
+    assert.equal(log.length, 1);
+    assert.equal(run.stats.pageRequests, 1);
+    // Explicit incomplete verdict naming the cap — a work cap is not
+    // evidence of corpus completeness.
+    assert.equal(run.completeness.status, "operator-cap-reached");
+    assert.equal(run.completeness.provablyComplete, false);
+    assert.ok(run.completeness.detail.includes("--max-pools 2"));
+    assert.ok(run.completeness.detail.includes("NOT fully enumerated"));
+    assert.ok(run.completeness.detail.includes("a work cap is not evidence of corpus completeness"));
+    assert.equal(run.stats.truncated, true);
+  });
+
+  test("the cap landing exactly on a clean provider end is NOT a truncation (classic parity)", async () => {
+    const log: Array<{ cursor: string | null; limit: number }> = [];
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xe1, 0xe2]), nextCursor: "page-1", contextSlot: 20 },
+      // Empty final page: accepts no pools, so probing the end never
+      // exceeds the cap; the provider signals a clean end.
+      { accounts: [], nextCursor: null, contextSlot: 21 },
+    ], log), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2);
+    assert.equal(log.length, 2, "the empty end page IS fetched (completeness determination, not pool processing)");
+    assert.equal(run.completeness.status, "provider-guarantees-unverified");
+    assert.ok(run.completeness.detail.includes("bounded observation window"));
+    assert.equal(run.records.length, 2);
+  });
+
+  test("a NONEMPTY page while the cap is full fails closed WITHOUT parsing beyond the cap", async () => {
+    const log: Array<{ cursor: string | null; limit: number }> = [];
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xf1, 0xf2]), nextCursor: "page-1", contextSlot: 30 },
+      { accounts: accountsOf([0xf3]), nextCursor: null, contextSlot: 31 },
+    ], log), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2, "the third pool was never parsed");
+    assert.equal(run.completeness.status, "operator-cap-reached");
+    assert.equal(run.completeness.provablyComplete, false);
+    assert.equal(log.length, 2, "the probe page WAS fetched to determine the end semantics");
+    assert.equal(run.stats.rawAccounts, 3, "the extra account is honestly counted as received");
+    assert.equal(run.stats.iteratedAccounts, 2);
+  });
+
+  test("maxPools must be a positive integer", async () => {
+    await assert.rejects(
+      discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([]), { maxPools: 0 })),
+      /maxPools/,
+    );
+    await assert.rejects(
+      discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([]), { maxPools: 1.5 })),
+      /maxPools/,
+    );
+  });
+
+  test("an undefined cap preserves the previous unbounded behavior", async () => {
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xf5, 0xf6]), nextCursor: "page-1", contextSlot: 40 },
+      { accounts: [], nextCursor: null, contextSlot: 41 },
+    ])));
+    assert.equal(run.stats.parsedPools, 2);
+    assert.equal(run.completeness.status, "provider-guarantees-unverified");
+  });
+});
+
+// ─── Option 2 continuation: slot brackets vs observation window ──────────
+
+describe("paginatedDiscovery — slot brackets (classic parity) vs observation window", () => {
+  test("stats carry GENUINE getSlot brackets, distinct from the per-page context-slot window", async () => {
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xf7]), nextCursor: "page-1", contextSlot: 900 },
+      { accounts: [], nextCursor: null, contextSlot: 902 },
+    ])));
+    // The fake's getSlot endpoint answers 424_242 — deliberately different
+    // from every per-page context slot. The run's bracket fields carry the
+    // BRACKET (not the window min/max — the historical conflation is gone).
+    assert.equal(run.stats.slotLowerBound, 424_242);
+    assert.equal(run.stats.slotUpperBound, 424_242);
+    // The bounded observation window keeps its own per-page min/max.
+    assert.deepEqual([run.observationWindow.slotMin, run.observationWindow.slotMax], [900, 902]);
+    // Record provenance carries the brackets too (schema-v2 semantics).
+    for (const record of run.records) {
+      assert.equal(record.provenance.slotLowerBound, 424_242);
+      assert.equal(record.provenance.slotUpperBound, 424_242);
+    }
+  });
+
+  test("an opening bracket failure aborts the run (classic parity: the opening getSlot is mandatory)", async () => {
+    const failing = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method: string };
+      if (body.method === "getSlot") {
+        // A retryable in-band server error (-32603): the transport retries
+        // within the budget and then fails with a TYPED exhausted error —
+        // the run aborts with an explicit failure, never a fake bracket.
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "boom" } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { accounts: [], paginationKey: null } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      discoverRaydiumV4PoolsPaginated(runOpts(failing)),
+      /retry budget exhausted/,
+    );
+  });
+
+  test("a closing bracket failure is recorded honestly (0 = unavailable) without discarding the pages", async () => {
+    let getSlotCalls = 0;
+    const flaky = (async (_url: string | URL, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { method: string };
+      if (body.method === "getSlot") {
+        getSlotCalls++;
+        if (getSlotCalls >= 2) {
+          return new Response("not json", { status: 200 });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: 424_242 }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: { context: { slot: 5 }, value: { accounts: accountsOf([0xf8]).map((a) => ({ pubkey: a.pubkey, account: { data: [a.base64, "base64"] } })), paginationKey: null } } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(flaky));
+    assert.equal(run.stats.slotLowerBound, 424_242);
+    assert.equal(run.stats.slotUpperBound, null, "the closing bracket is honestly null (unavailable), never fabricated");
+    assert.equal(run.records.length, 1);
+    assert.equal(run.records[0]!.provenance.slotUpperBound, 0, "the record carries 0 = bracket unavailable (established convention)");
+    assert.equal(run.records[0]!.provenance.slotLowerBound, 424_242);
   });
 });

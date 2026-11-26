@@ -48,7 +48,7 @@ import {
   type DiscoveredPoolRecord,
 } from "./discovery.js";
 import { accountFingerprint, endpointKindFor, type Cluster, type EndpointKind } from "./provenance.js";
-import { rpcJsonRequest, type RpcTransportOptions } from "./rpcTransport.js";
+import { governed, rpcJsonRequest, type RpcTransportOptions } from "./rpcTransport.js";
 
 /** The paginated RPC method this adapter speaks. */
 export const GPA_V2_METHOD = "getProgramAccountsV2";
@@ -94,6 +94,8 @@ export interface PageLedgerEntry {
 export type PaginationCompletenessStatus =
   | /** every matching account was received and the provider signaled a clean end */
     "complete"
+  | /** the operator work cap (--max-pools) stopped enumeration before a provider-signaled end */
+    "operator-cap-reached"
   | /** the page budget was exhausted before a provider-signaled end */
     "page-budget-exhausted"
   | /** a nonempty page returned a null cursor — end semantics ambiguous */
@@ -157,6 +159,17 @@ export interface PaginatedDiscoveryOptions {
   pageLimit?: number;
   /** Hard page budget — exhaustion is reported, never hidden. Default 200. */
   maxPages?: number;
+  /** OPERATOR WORK CAP (Option 2 — ``--max-pools`` propagation). Bounds
+   *  the number of PARSED pool records the run may ACCEPT — the SAME
+   *  semantics as classic `DiscoverOptions.maxPools` (parsed-pool count,
+   *  NOT raw accounts and NOT post-sourcing accepted pools). When the cap
+   *  is full and any further matching account appears (on the current
+   *  page or any later page), enumeration STOPS and the run is reported
+   *  `operator-cap-reached` (incomplete): a work cap is not evidence of
+   *  corpus completeness. Empty pages after the cap is full only
+   *  determine whether the provider signals a clean end (they accept no
+   *  pools, so they never exceed the cap). Undefined = unbounded. */
+  maxPools?: number;
   /** Extra RPC-level filters (e.g. the M1 WSOL quote-side memcmp). */
   rpcFilters?: unknown[];
   /** Transport options (retry/backoff/deadline; injectable for tests). */
@@ -222,23 +235,25 @@ export async function probePaginationCapability(
   const kind = endpointKindFor(rpcUrl);
   let raw: unknown;
   try {
-    raw = await rpcJsonRequest(
-      rpcUrl,
-      {
-        jsonrpc: "2.0",
-        id: 1,
-        method: GPA_V2_METHOD,
-        params: [
-          programId.toBase58(),
-          {
-            encoding: "base64",
-            filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...(opts?.rpcFilters ?? [])],
-            limit: 1,
-            withContext: true,
-          },
-        ],
-      },
-      opts?.transport,
+    raw = await governed(kind, () =>
+      rpcJsonRequest(
+        rpcUrl,
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: GPA_V2_METHOD,
+          params: [
+            programId.toBase58(),
+            {
+              encoding: "base64",
+              filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...(opts?.rpcFilters ?? [])],
+              limit: 1,
+              withContext: true,
+            },
+          ],
+        },
+        { ...opts?.transport, retryJsonRpcErrors: true },
+      ),
     );
   } catch (err) {
     return {
@@ -273,7 +288,9 @@ export async function probePaginationCapability(
 // Paginated enumeration
 // ---------------------------------------------------------------------
 
-/** Fetch ONE page. Throws typed transport errors (caller classifies). */
+/** Fetch ONE page. Throws typed transport errors (caller classifies).
+ *  Rate-governed: pages share the process-global provider budget with
+ *  enrichment and activity traffic (Option 2 — consistent governance). */
 async function fetchGpaV2Page(
   rpcUrl: string,
   programId: PublicKey,
@@ -281,26 +298,30 @@ async function fetchGpaV2Page(
   opts: PaginatedDiscoveryOptions,
   pageLimit: number,
 ): Promise<GpaV2Page> {
-  const raw = await rpcJsonRequest(
-    rpcUrl,
-    {
-      jsonrpc: "2.0",
-      id: 1,
-      method: GPA_V2_METHOD,
-      params: [
-        programId.toBase58(),
-        {
-          encoding: "base64",
-          filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...(opts.rpcFilters ?? [])],
-          dataSlice: { offset: DISCOVERY_SLICE.offset, length: DISCOVERY_SLICE.length },
-          limit: pageLimit,
-          commitment: "finalized",
-          withContext: true,
-          ...(cursor !== null ? { paginationKey: cursor } : {}),
-        },
-      ],
-    },
-    opts.transport,
+  const raw = await governed(endpointKindFor(rpcUrl), () =>
+    rpcJsonRequest(
+      rpcUrl,
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: GPA_V2_METHOD,
+        params: [
+          programId.toBase58(),
+          {
+            encoding: "base64",
+            filters: [{ dataSize: RAYDIUM_V4_AMM_INFO_SIZE }, ...(opts.rpcFilters ?? [])],
+            dataSlice: { offset: DISCOVERY_SLICE.offset, length: DISCOVERY_SLICE.length },
+            limit: pageLimit,
+            commitment: "finalized",
+            withContext: true,
+            ...(cursor !== null ? { paginationKey: cursor } : {}),
+          },
+        ],
+      },
+      // In-band JSON-RPC errors (HTTP 200 + error object) are classified
+      // and retried within the same bounded budget as HTTP-level failures.
+      { ...opts.transport, retryJsonRpcErrors: true },
+    ),
   );
   const envelope = raw as { error?: unknown; result?: unknown } | null;
   if (envelope === null || typeof envelope !== "object") {
@@ -326,6 +347,37 @@ function parseSliceAccount(
   } catch {
     return null;
   }
+}
+
+/**
+ * Slot bracket (classic-parity provenance): a getSlot taken immediately
+ * BEFORE the first page request and one taken immediately AFTER the last
+ * one — the SAME bounded-bracket semantics as the classic path's
+ * `slotLowerBound`/`slotUpperBound`. These are DISTINCT from the
+ * per-page observation-window min/max (`observationWindow.slotMin/Max`):
+ * a bracket is a wall-clock slot reading around the WHOLE run, the
+ * window is the range of provider CONTEXT slots across pages. The two
+ * concepts are never mapped onto each other. Rate-governed like pages.
+ * Returns null only for the CLOSING bracket when the closing getSlot
+ * fails or is malformed (recorded honestly as unavailable); the OPENING
+ * bracket is mandatory — without it the run has no provenance anchor and
+ * throws, exactly like the classic path's getSlot would.
+ */
+async function rpcSlotBracket(rpcUrl: string, transport: RpcTransportOptions | undefined): Promise<number | null> {
+  const json = await governed(endpointKindFor(rpcUrl), () =>
+    rpcJsonRequest(
+      rpcUrl,
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getSlot",
+        params: [{ commitment: "confirmed" }],
+      },
+      { ...transport, retryJsonRpcErrors: true },
+    ),
+  );
+  const result = (json as { result?: unknown } | null)?.result;
+  return typeof result === "number" && Number.isSafeInteger(result) ? result : null;
 }
 
 /**
@@ -357,6 +409,22 @@ export async function discoverRaydiumV4PoolsPaginated(
   if (!Number.isInteger(maxPages) || maxPages < 1) {
     throw new Error(`maxPages must be a positive integer, got ${maxPages}`);
   }
+  if (opts.maxPools !== undefined && (!Number.isInteger(opts.maxPools) || opts.maxPools < 1)) {
+    throw new Error(`maxPools must be a positive integer, got ${opts.maxPools}`);
+  }
+  const maxPools = opts.maxPools;
+
+  // Classic-parity slot bracket around the WHOLE enumeration (distinct
+  // from the per-page observation window). The opening bracket is
+  // mandatory: without it the run has no provenance anchor — same
+  // contract as the classic path, whose opening getSlot failure aborts
+  // the run.
+  const slotLowerBound = await rpcSlotBracket(opts.rpcUrl, opts.transport);
+  if (slotLowerBound === null) {
+    throw new Error(
+      `paginated discovery could not take its OPENING slot bracket (getSlot) on the ${endpointKind} endpoint — run aborted (classic parity: an opening getSlot failure aborts the run)`,
+    );
+  }
 
   const ledger: PageLedgerEntry[] = [];
   const records = new Map<string, DiscoveredPoolRecord>();
@@ -387,6 +455,15 @@ export async function discoverRaydiumV4PoolsPaginated(
       };
       break enumeration;
     }
+
+    // Work cap at a page boundary: NO pre-fetch break. When the cap is
+    // full, further page requests are issued ONLY to determine whether
+    // the provider signals a clean end — an EMPTY page accepts no pools,
+    // so it never exceeds the cap (classic parity: a cap landing exactly
+    // on the last accepted pool is NOT a truncation). The first NONEMPTY
+    // page trips the mid-page cap check below → `operator-cap-reached`
+    // (fail closed: unaccepted matching accounts exist). The page budget
+    // still bounds this probing exactly like enumeration.
 
     const pageStart = Date.now();
     let page: GpaV2Page;
@@ -437,6 +514,22 @@ export async function discoverRaydiumV4PoolsPaginated(
 
     for (const raw of page.accounts) {
       rawAccounts++;
+      // Work cap MID-PAGE: an account on this page cannot be accepted
+      // without exceeding the operator's configured limit. Stop
+      // IMMEDIATELY — never silently process beyond the cap — and report
+      // the run incomplete (`operator-cap-reached`).
+      if (maxPools !== undefined && parsedPools >= maxPools) {
+        completeness = {
+          status: "operator-cap-reached",
+          provablyComplete: false,
+          detail:
+            `the operator work cap (--max-pools ${maxPools}) stopped enumeration after ${parsedPools} parsed pool(s) ` +
+            `and ${iteratedAccounts} of ${rawAccounts} raw account(s) — ${rawAccounts - iteratedAccounts} account(s) on page ` +
+            `${ledger.length - 1} and any later page(s) were never parsed; the (filtered) account set is NOT fully enumerated: ` +
+            `a work cap is not evidence of corpus completeness`,
+        };
+        break enumeration;
+      }
       iteratedAccounts++;
       if (seen.has(raw.pubkey)) {
         duplicatesAcrossPages++;
@@ -493,8 +586,10 @@ export async function discoverRaydiumV4PoolsPaginated(
           source: "raydium-v4-gpa",
           cluster: opts.cluster,
           endpointKind,
-          slotLowerBound: slotMin ?? 0,
-          slotUpperBound: slotMax ?? 0,
+          // Genuine classic-parity slot BRACKETS around the whole run —
+          // NOT the observation-window min/max (never mapped across).
+          slotLowerBound: slotLowerBound,
+          slotUpperBound: 0, // filled from the closing bracket below
           fetchedAtUnixMs: startedAt,
         },
       });
@@ -542,6 +637,18 @@ export async function discoverRaydiumV4PoolsPaginated(
     cursor = page.paginationKey;
   }
 
+  // Closing slot bracket (classic parity). Failure here is recorded
+  // honestly (null → "unavailable") rather than discarding the received
+  // pages; consumers see 0 = unavailable (the established convention).
+  const slotUpperBound = await rpcSlotBracket(opts.rpcUrl, opts.transport).catch(
+    () => null,
+  );
+  if (slotUpperBound !== null) {
+    for (const record of records.values()) {
+      record.provenance.slotUpperBound = slotUpperBound;
+    }
+  }
+
   const durationMs = Date.now() - startedAt;
   if (completeness === null) {
     // Unreachable in the current loop structure; defensive.
@@ -584,8 +691,10 @@ export async function discoverRaydiumV4PoolsPaginated(
       durationMs,
       iteratedAccounts,
       truncated: !final.provablyComplete,
-      slotLowerBound: slotMin,
-      slotUpperBound: slotMax,
+      // Classic-parity BRACKETS (getSlot before/after the run) — kept
+      // semantically DISTINCT from the observation-window min/max below.
+      slotLowerBound,
+      slotUpperBound,
     },
     ledger,
     completeness: final,
