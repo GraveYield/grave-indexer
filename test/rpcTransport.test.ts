@@ -303,6 +303,75 @@ describe("rpcTransport — rate governor + bounded concurrency", () => {
     resetGovernors();
   });
 
+  test("actual spacing holds when an event-loop stall makes multiple reserved wake-ups OVERDUE together (delayed-wake regression)", async () => {
+    resetGovernors();
+    // A clock that can STALL: `stallTo(to)` jumps straight to `to` and
+    // fires EVERY timer that became due on the way, all AT the late time
+    // `to`. This is exactly what a real event loop does under load: it
+    // does not honor each timer's deadline — overdue timers release
+    // together. A governor that only trusts its reservations would let
+    // all of them issue simultaneously.
+    let t = 0;
+    const pending: Array<{ wake: number; resolve: () => void }> = [];
+    const now = (): number => t;
+    const sleep = (ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        pending.push({ wake: t + ms, resolve });
+      });
+    const stallTo = async (to: number): Promise<void> => {
+      if (to > t) t = to;
+      const due = pending.filter((p) => p.wake <= t);
+      for (const d of due) {
+        const i = pending.indexOf(d);
+        pending.splice(i, 1);
+      }
+      for (const d of due) d.resolve();
+      await new Promise<void>((r) => setImmediate(r));
+    };
+
+    const starts: number[] = []; // actual operation-START times
+    const jobs = Array.from({ length: 3 }, () =>
+      governed(
+        "public-rpc",
+        async () => {
+          starts.push(now());
+        },
+        { minIntervalMs: 50, maxInFlight: 8 },
+        now,
+        sleep,
+      ),
+    );
+
+    // The callers reserve staggered wake-ups at t=0 (50/100 ms — an
+    // implementation detail, not asserted); the first caller has nothing
+    // to wait for and issues immediately. Let those microtasks settle.
+    await new Promise<void>((r) => setImmediate(r));
+    assert.equal(starts.length, 1, "the first caller issues immediately (no prior issuance)");
+    // Then ONE stall jumps the clock from 0 to 120: the timers reserved
+    // for 50 and 100 both become overdue and release TOGETHER. The
+    // governor must re-check spacing against ACTUAL issuance times, not
+    // let both through.
+    await stallTo(120);
+    assert.equal(starts.length, 2, "exactly ONE of the two overdue callers may issue after the stall");
+    assert.equal(starts[1], 120, "the overdue caller issues at the (late) wake time");
+    // Drain the rest of the schedule (re-claims at 170, ...).
+    while (starts.length < jobs.length && pending.length > 0) {
+      const next = Math.min(...pending.map((p) => p.wake));
+      await stallTo(next);
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    await Promise.all(jobs);
+    assert.equal(starts.length, 3, "all callers eventually issued");
+    for (let i = 1; i < starts.length; i++) {
+      assert.ok(
+        starts[i]! - starts[i - 1]! >= 50,
+        `ACTUAL starts must stay >= 50 ms apart after a delayed wake (got ${starts[i - 1]} -> ${starts[i]})`,
+      );
+    }
+    assert.equal(governorInFlight("public-rpc"), 0, "in-flight returns to zero");
+    resetGovernors();
+  });
+
   test("a rejected governed call does not block later queued callers (concurrent + spaced)", async () => {
     resetGovernors();
     const vc = virtualClock();

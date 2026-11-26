@@ -385,20 +385,28 @@ const PROVIDER_MIN_INTERVAL_MS: Record<EndpointKind, number> = {
 };
 
 interface GovernorState {
-  lastIssuedAtMs: number;
+  /** RESERVATION bookkeeping: the latest RESERVED (possibly still future)
+   *  issuance instant. Used only to stagger callers' initial wake-ups;
+   *  spacing is NEVER enforced against this value (see claimIssuance). */
+  lastReservedAtMs: number;
+  hasReserved: boolean;
+  /** ACTUAL issuance: the real start time of the most recent operation
+   *  handed to `fn`. Spacing is enforced against THIS value, never
+   *  against reservations — a delayed wake-up must re-queue, not issue. */
+  lastActualIssuedAtMs: number;
   hasIssued: boolean;
   /** Semaphore: currently in-flight requests. */
   inFlight: number;
   waiters: Array<{ resolve: () => void; cancel: () => void }>;
-  /** Serialized RESERVATION chain: exactly one caller at a time computes
-   *  its issuance schedule (wait + reserved issuance instant) and records
-   *  the reservation in the shared state. Without this, two concurrent
-   *  callers could both read the same `lastIssuedAtMs`, compute the SAME
-   *  remaining wait, sleep together and wake together — issuing at the
-   *  same instant despite a nonzero `minIntervalMs` (thundering herd).
-   *  The lock only guards the SYNCHRONOUS reservation computation; the
-   *  wait itself happens outside it, so a slow or failing caller never
-   *  blocks other callers' scheduling. */
+  /** Serialized chain for the two SHORT synchronous critical sections:
+   *  (a) computing + recording a reservation, and (b) claiming an actual
+   *  issuance instant. Without (a), two concurrent callers could both
+   *  read the same state, compute the SAME remaining wait, sleep
+   *  together and wake together (thundering herd). Without (b), callers
+   *  whose timers all became overdue during an event-loop stall would
+   *  wake together and issue together (see the delayed-wake regression
+   *  test). The lock is never held across a sleep or `fn`, so a slow or
+   *  failing caller never blocks other callers' scheduling. */
   scheduleLock: Promise<void>;
 }
 
@@ -442,10 +450,78 @@ export function resolveGovernorOptions(
 function governorState(kind: string): GovernorState {
   let s = GOVERNORS.get(kind);
   if (!s) {
-    s = { lastIssuedAtMs: 0, hasIssued: false, inFlight: 0, waiters: [], scheduleLock: Promise.resolve() };
+    s = {
+      lastReservedAtMs: 0,
+      hasReserved: false,
+      lastActualIssuedAtMs: 0,
+      hasIssued: false,
+      inFlight: 0,
+      waiters: [],
+      scheduleLock: Promise.resolve(),
+    };
     GOVERNORS.set(kind, s);
   }
   return s;
+}
+
+/** Run `critical` as the exclusive holder of the governor's scheduleLock.
+ *  The chain is joined BEFORE any await (so ordering matches arrival) and
+ *  released in a `finally` even if the injected clock throws. `critical`
+ *  must stay synchronous-ish: it may read the clock, but it must NOT
+ *  sleep or run `fn` while holding the chain. */
+async function withScheduleLock<T>(state: GovernorState, critical: () => T): Promise<T> {
+  let releaseSchedule: () => void = () => {};
+  const prevSchedule = state.scheduleLock;
+  state.scheduleLock = new Promise<void>((resolve) => {
+    releaseSchedule = resolve;
+  });
+  try {
+    await prevSchedule;
+    return critical();
+  } finally {
+    releaseSchedule();
+  }
+}
+
+/** Phase 1 — RESERVE (serialized): compute this caller's initial wait
+ *  from the reservation chain and atomically reserve the next staggered
+ *  instant. Two concurrent callers can never reserve the same instant.
+ *  Returns the ms to sleep before the claim phase (0 = issue attempt
+ *  now). Reservations only STAGGER wake-ups; they never authorize an
+ *  issuance by themselves. */
+function reserveIssuance(state: GovernorState, minIntervalMs: number, now: () => number): Promise<number> {
+  return withScheduleLock(state, () => {
+    const t = now();
+    let waitMs = 0;
+    if (state.hasReserved) {
+      const earliest = state.lastReservedAtMs + minIntervalMs;
+      if (t < earliest) waitMs = earliest - t;
+    }
+    state.hasReserved = true;
+    state.lastReservedAtMs = t + waitMs;
+    return waitMs;
+  });
+}
+
+/** Phase 3 — CLAIM (serialized): re-check spacing against ACTUAL issuance
+ *  times at wake-up. Returns 0 when the caller may issue NOW (its actual
+ *  start is then recorded as `lastActualIssuedAtMs`); otherwise returns
+ *  the remaining ms to sleep, after which the caller must claim AGAIN.
+ *  This is what guarantees spacing when reality diverges from the
+ *  schedule: an event-loop stall can make several reserved timers
+ *  overdue simultaneously, and only one of them may pass this gate per
+ *  `minIntervalMs` window — the others re-queue with the remaining wait. */
+function claimIssuance(state: GovernorState, minIntervalMs: number, now: () => number): Promise<number> {
+  return withScheduleLock(state, () => {
+    const t = now();
+    if (state.hasIssued) {
+      const earliest = state.lastActualIssuedAtMs + minIntervalMs;
+      if (t < earliest) return earliest - t;
+    }
+    state.hasIssued = true;
+    state.lastActualIssuedAtMs = t;
+    return 0;
+  });
 }
 
 function acquireSlot(state: GovernorState, maxInFlight: number): Promise<void> {
@@ -482,32 +558,41 @@ export function governorInFlight(endpointKind: EndpointKind): number {
 
 /**
  * Issue `fn` under the rate governor for `endpointKind`: bounded
- * concurrency (max in-flight) + minimum spacing between issuances.
- * Rejections propagate; the slot is always released.
+ * concurrency (max in-flight) + minimum spacing between ACTUAL request
+ * starts. Rejections propagate; the slot is always released.
  *
- * CONCURRENCY-SAFE ISSUANCE SCHEDULING: the wait computation is a
- * two-phase RESERVE-THEN-WAIT protocol.
+ * CONCURRENCY-SAFE ISSUANCE SCHEDULING is a three-phase protocol:
  *
- *   Phase 1 (serialized by `state.scheduleLock`, purely synchronous):
- *   the caller reads `lastIssuedAtMs`, computes its earliest permitted
- *   issuance instant, and atomically RESERVES that instant by advancing
- *   `lastIssuedAtMs` to it. Because the reservation is serialized, two
- *   concurrent callers can never reserve the same issuance instant —
- *   each receives a distinct reservation at least `minIntervalMs` after
- *   the previous one.
+ *   Phase 1 — RESERVE (serialized by `state.scheduleLock`, purely
+ *   synchronous): the caller reads the reservation chain, computes its
+ *   earliest permitted issuance instant, and atomically RESERVES that
+ *   instant. Because the reservation is serialized, two concurrent
+ *   callers can never reserve the same instant — each receives a
+ *   distinct, staggered wake-up target.
  *
- *   Phase 2 (outside the lock): the caller sleeps until ITS reserved
- *   instant and issues. Actual request-start times are therefore
- *   separated by at least `minIntervalMs` (subject only to normal
- *   clock/timer resolution: a wake may overshoot its instant, never
- *   undershoot it).
+ *   Phase 2 — WAIT (outside the lock): the caller sleeps until its
+ *   reserved instant. This staggers callers so they do not all contend
+ *   for the claim gate at once.
  *
- * The lock is released immediately after the synchronous reservation —
- * never held across the sleep or `fn` — so a slow or failing caller
- * cannot block other callers' scheduling. `minIntervalMs = 0` makes the
- * reservation instantaneous and preserves the previous pure-semaphore
- * behavior (bounded only by `maxInFlight`). Endpoint-kind isolation and
- * process-global sharing are unchanged (state is keyed by kind).
+ *   Phase 3 — CLAIM (serialized again): after waking, the caller
+ *   re-checks spacing against ACTUAL issuance times (`lastActualIssued-
+ *   AtMs`) before issuing. If reality diverged from the schedule — e.g.
+ *   an event-loop stall made several reserved timers overdue
+ *   simultaneously — exactly ONE overdue caller passes the gate per
+ *   `minIntervalMs` window; the others receive the remaining wait and
+ *   re-claim after sleeping. Reservations never authorize an issuance:
+ *   only a successful claim does, and a claim records the ACTUAL start
+ *   time. Spacing therefore holds between real request starts, not just
+ *   between scheduled ones.
+ *
+ * The lock is never held across a sleep or `fn` — a slow or failing
+ * caller cannot block other callers' scheduling or claims. A rejection
+ * from `fn` propagates after its slot is released and leaves the spacing
+ * state untouched, so an early failure cannot permanently block later
+ * callers. `minIntervalMs = 0` makes both reservation and claim instantaneous,
+ * preserving the pure-semaphore behavior (bounded only by
+ * `maxInFlight`). Endpoint-kind isolation and process-global sharing
+ * are unchanged (state is keyed by kind).
  */
 export async function governed<T>(
   endpointKind: EndpointKind,
@@ -519,35 +604,18 @@ export async function governed<T>(
   const { minIntervalMs, maxInFlight } = resolveGovernorOptions(endpointKind, opts);
   const state = governorState(endpointKind);
   const slot = await acquireSlot(state, maxInFlight);
-  // Phase 1 — serialized reservation. The chain lock is taken BEFORE any
-  // await so reservation order matches arrival order, and the lock is
-  // released in a `finally` even if the injected clock throws.
-  let releaseSchedule: () => void = () => {};
-  const prevSchedule = state.scheduleLock;
-  state.scheduleLock = new Promise<void>((resolve) => {
-    releaseSchedule = resolve;
-  });
-  let waitMs = 0;
   try {
-    await prevSchedule;
-    const t = now();
-    if (state.hasIssued) {
-      const earliest = state.lastIssuedAtMs + minIntervalMs;
-      if (t < earliest) waitMs = earliest - t;
-    }
-    state.hasIssued = true;
-    // RESERVE the issuance instant (it may still be in the future):
-    // later callers schedule relative to this reservation, not to the
-    // (jittery) actual wake time, so spacing is never eroded by
-    // concurrent callers waking together.
-    state.lastIssuedAtMs = t + waitMs;
-  } finally {
-    releaseSchedule();
-  }
-  // Phase 2 — wait outside the lock, then issue.
-  try {
-    if (waitMs > 0) {
-      await sleep(waitMs);
+    // Phase 1 — RESERVE a staggered wake-up target (serialized).
+    let waitMs = await reserveIssuance(state, minIntervalMs, now);
+    // Phases 2+3 — WAIT, then CLAIM against actual issuance times.
+    // A claim that finds itself too early returns the remaining wait;
+    // the caller sleeps and re-claims until it passes the gate.
+    for (;;) {
+      if (waitMs > 0) {
+        await sleep(waitMs);
+      }
+      waitMs = await claimIssuance(state, minIntervalMs, now);
+      if (waitMs === 0) break;
     }
     return await fn();
   } finally {
