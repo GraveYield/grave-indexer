@@ -202,7 +202,21 @@ export class ActivityIndexerLive {
   async indexActivity(
     connection: Connection,
     poolAddress: PublicKey,
-    opts?: { scanLimit?: number; forceRefresh?: boolean },
+    opts?: {
+      scanLimit?: number;
+      forceRefresh?: boolean;
+      /** KNOWN vault addresses from discovery — Option 2 vault passthrough.
+       *  When both are provided, the SDK derivation SKIPS its redundant
+       *  per-pool AmmInfo fetch (`fetchV4Pool`): the vaults were already
+       *  parsed from the same authoritative source (the pool's own
+       *  account data) during discovery. Identity/ownership validation
+       *  inside the SDK classification is unchanged — the vaults are
+       *  used for the same opposite-direction corroboration they would
+       *  have been fetched for, never trusted beyond that. When omitted,
+       *  behavior is byte-identical to the previous implementation. */
+      coinVault?: PublicKey;
+      pcVault?: PublicKey;
+    },
   ): Promise<ActivityEvidence> {
     const key = poolAddress.toBase58();
     const now = Date.now();
@@ -215,6 +229,12 @@ export class ActivityIndexerLive {
 
     const result = await deriveLastSwapEvidenceV4(connection, RAYDIUM_V4_PROGRAM_ID, poolAddress, {
       scanLimit,
+      // Vault passthrough (Option 2 — Part 1 item A): only when BOTH
+      // vaults are known; a single vault still triggers the authoritative
+      // on-chain fetch for the pair (the SDK requires both or neither).
+      ...(opts?.coinVault !== undefined && opts?.pcVault !== undefined
+        ? { coinVault: opts.coinVault, pcVault: opts.pcVault }
+        : {}),
     });
 
     const buildEvidence = (): ActivityEvidence => ({
