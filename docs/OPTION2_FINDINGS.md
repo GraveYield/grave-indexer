@@ -1,8 +1,9 @@
 # Option 2 — Paginated discovery + staged enrichment: findings, semantics and owner decisions
 
 Status: implemented on `feat/option2-pipeline-hardening` (this branch). All changes verified
-against the full offline battery (`test:offline` 612/612) and `tsconfig.typecheck.json`.
-No release, tag, stable pointer, deployment or blockchain state was touched.
+against the full offline battery (`test:offline` 643/643 — see §11.6) and
+`tsconfig.typecheck.json`. No release, tag, stable pointer, deployment or blockchain
+state was touched.
 
 The companion SDK change (early exit in `deriveLastSwapEvidenceV4`) lives in
 `GraveYield/graveyield-protocol` — see §7 for its delivery form and the owner decision it needs.
@@ -226,3 +227,146 @@ surface exists.
   concurrent executions at `maxInFlight=3` (measured, deterministic clock tests).
 * Mainnet end-to-end figures (561,483-account corpus, 429 behavior, wall-clock) are
   EXPLICITLY NOT measured here — see D-2.
+
+## 11. Continuation session (2026-11-26) — completed Part 2 items 1-4 + verified item 5
+
+The second session continued this branch from `d7fe8f1`. Live state re-verified first:
+PR #6 open, head `d7fe8f1`, base `main` = `8fc81bf8281e`, 10 commits / 16 files, CI
+run `45767560405` 2/2 green — all matching the inherited context. Baseline re-run by
+this session before any edit: `test:offline` **612/612** + typecheck pass. One
+important difference from the inherited context was found: the SDK companion branch
+had been REBASED onto protocol `main` = `0fd4abb`; its head is now `3116812` and the
+inherited SHA `e448f60` no longer exists. Content parity was verified independently:
+the branch diff over `main` has the same file pair and blob hashes as the
+`docs/option2/sdk-early-exit-companion.patch` mirror, and the full SDK suite passes
+on the branch head (249/249, typecheck pass — re-run by this session).
+
+### 11.1 Work cap (Part 2 item 1) — IMPLEMENTED
+
+`PaginatedDiscoveryOptions.maxPools` now propagates the operator's `--max-pools` into
+paginated discovery from `cmdConsoleSnapshot`. Semantics defined precisely: the cap
+bounds **parsed pool records** — the same definition as classic `maxPools` (not raw
+accounts, not post-sourcing accepted pools). Enforcement:
+
+* MID-PAGE: enumeration stops at the cap boundary inside the parse loop — no account
+  beyond the cap is parsed, and the run stops fetching pages immediately (verified by
+  tests: the next page is never requested).
+* PAGE BOUNDARY: when the cap is full, further page requests are issued ONLY to
+  determine whether the provider signals a clean end — an empty page accepts no pools
+  (classic parity: a cap landing exactly on the last pool is NOT a truncation); the
+  first NONEMPTY page proves unaccepted matching accounts exist.
+* New fail-closed completeness status `operator-cap-reached`; the CLI emits the
+  `--max-pools` completeness message ONLY when the cap actually stopped iteration
+  (classic paths unchanged byte-for-byte; paginated runs stopped by a page budget,
+  transport failure or end-ambiguity keep their SPECIFIC verdicts — never a
+  misleading cap message). A work cap is never evidence of corpus completeness.
+
+### 11.2 Provenance preservation (Part 2 item 2) — IMPLEMENTED (schema-v2 unchanged)
+
+* **Slot-bracket conflation REMOVED.** The paginated run previously mapped the
+  observation-window min/max into the classic `slotLowerBound`/`slotUpperBound`
+  fields. The run now takes GENUINE `getSlot` brackets immediately before the first
+  page and after the last one (classic parity): the artifact's bracket fields carry
+  brackets again; the per-page window (`slotMin`/`slotMax`, `pagesWithSlot`/
+  `pagesWithoutSlot`) stays a separate concept. Opening bracket is mandatory (failure
+  aborts the run, like classic); closing bracket unavailability is recorded honestly
+  (null in the sidecar, 0 = unavailable in record provenance — the established
+  convention).
+* **Internal sidecar** `data/discovery-provenance.json` (schemaVersion 1, written for
+  every paginated run): provider identity (method, endpoint KIND, commitment
+  `finalized`, `withContext`), the exact RPC filter configuration, the work cap and
+  its semantics, the slot brackets, the bounded observation window, the fail-closed
+  completeness verdict, run accounting (pages, cursors, duplicates, parse counters)
+  and the full per-page ledger (cursor sent/received, page sizes, per-page context
+  slots, latencies). Secret-free: endpoint KIND only, never the URL (pinned by test).
+* Schema-v2 artifact, strict parser, Console behavior and publication pipeline are
+  UNTOUCHED — the richer provenance lives in the internal report only. Embedding it
+  in the artifact remains owner decision D-3 (schema-v3).
+
+### 11.3 In-band JSON-RPC errors + consistent rate governance (Part 2 item 3) — IMPLEMENTED
+
+* `rpcJsonRequest` gains opt-in `retryJsonRpcErrors`: an HTTP-success body carrying
+  `{ error }` is classified — RETRYABLE: JSON-RPC server-error range
+  `-32000..-32099` (incl. `-32005`), internal `-32603`, plus a message guard for
+  non-standard rate-limit errors ("rate limit", "too many requests", …);
+  PERMANENT: `-32700`/`-32600`/`-32601`/`-32602`, and ANY unknown code (never
+  guessed retryable). Retryable in-band errors retry within the SAME bounded
+  budget/deadline as HTTP failures (shared attempt counter; Retry-After honored even
+  on a 200); permanent ones fail immediately as the typed `JsonRpcPermanentError`;
+  exhaustion stays the typed `RpcRetryExhaustedError`. A failed call never becomes a
+  fake success, a zero balance or negative evidence. Enabled on every single-response
+  production call: classic gPA fetch, V2 probe, V2 pages, bracket getSlots. Batch
+  arrays keep per-item validation (an in-band error of ONE item is that item's
+  unresolved outcome).
+* **Governance coverage is now consistent across the workload**: classic discovery
+  (`fetchProgramAccountsRaw` production path), paginated probe/pages/brackets, and
+  enrichment batches share the process-global governor as before; NEW: the SDK
+  activity derivation's signature retrieval and transaction retrieval (plus the
+  collect path's identity fetch) now run under the same governor via
+  `src/governedConnection.ts` — a Proxy that routes the SDK's explicit RPC surface
+  through `governed()` without touching the SDK. Injected test seams stay raw so
+  faked-RPC suites remain deterministic; production paths are governed.
+
+### 11.4 Cross-pool batching (Part 2 item 4) — IMPLEMENTED where support is established
+
+* **Implemented**: production enrichment groups `DEFAULT_POOLS_PER_BATCH` = 5 pools'
+  four token reads (2 × `getTokenAccountBalance`, 2 × `getTokenSupply`) into ONE
+  JSON-RPC array per request (5 × 4 = 20 = the conservative `DEFAULT_BATCH_MAX_ITEMS`
+  bound; provider batch-size limits must still be probed before raising — D-2). The
+  read METHODS are unchanged, so the produced evidence values are identical to the
+  per-pool path; only transport grouping changed. Per-pool extraction isolates
+  failures per pool; an envelope-level failure fails the whole group closed with the
+  typed detail. Logical RPC operations are UNCHANGED (4 per pool) — only the HTTP
+  request count drops (N/4 → N/20 for the balance/supply stage). Both counters are
+  reported separately per the Option 2 measurement contract.
+* **Investigated, deliberately NOT implemented** (provider support NOT established):
+  * `getMultipleAccounts` consolidation of vault/mint reads — universally specified,
+    but switching evidence-producing read methods (and jsonParsed decoding) requires
+    a live parity probe against the configured provider before its values may feed
+    eligibility. Design documented in `src/enrichBatch.ts`; activation is owner
+    decision D-5.
+  * `getTransaction` batching — provider behavior for transaction payloads inside
+    JSON-RPC arrays is not documented; transaction fetches remain per-signature on
+    the SDK-owned path. A missing batch response must remain unresolved — never a
+    negative result; until support is probed, this stays unimplemented.
+
+### 11.5 SDK early exit (Part 2 item 5) — VERIFIED; PR opening BLOCKED by token scope
+
+* The companion branch
+  `GraveYield/graveyield-protocol:feat/sdk-early-exit-newest-verified-swap`
+  (head `3116812`, on top of protocol `main` = `0fd4abb`) carries the complete,
+  spec-compliant change: guarded exit (never while a newer candidate is unresolved,
+  never without a verified swap), preserved three-state model and newest-verified
+  anchor, additive `scan.earlyExit`/`scan.signaturesExamined` metadata. This session
+  re-ran on the actual branch head: **SDK suite 249/249 + typecheck pass**.
+* The indexer battery passes against the ACTUAL pinned submodule commit (`2a8aac1`)
+  — the pin is UNCHANGED (the change is not merged; integration stays owner decision
+  D-1).
+* **Owner action required (permission gap, not a design gap):** the credentials
+  available to this session can push to `grave-indexer` but NOT to
+  `graveyield-protocol` (push → 403; PR creation → "Resource not accessible by
+  personal access token"). The companion PR therefore CANNOT be opened by this
+  session. An owner/authorized token must open the PR from
+  `feat/sdk-early-exit-newest-verified-swap` → `main` (the PR body draft is included
+  in this session's report); the patch mirror `docs/option2/sdk-early-exit-companion.patch`
+  remains the apply-ready equivalent.
+
+### 11.6 Updated verification totals (this session, actual runs)
+
+* Indexer offline battery: **643/643 pass** (`pnpm run test:offline`) — 612 inherited
+  + 31 new regression tests (work cap, bracket/window separation, in-band JSON-RPC
+  classification/retry/exhaustion, grouped-batch validation matrix, governed
+  connection, CLI-level paginated cap + sidecar pins).
+* Indexer typecheck (`tsconfig.typecheck.json`): pass.
+* SDK suite on the companion branch head: 249/249 + typecheck pass.
+* No production publication, deployment, stable pointer change or blockchain write.
+
+### 11.7 Owner decision table (updated)
+
+| # | decision | why it is not taken unilaterally |
+| --- | --- | --- |
+| D-1 | Merge the companion SDK PR (branch `feat/sdk-early-exit-newest-verified-swap`, head `3116812`; patch mirror: `docs/option2/sdk-early-exit-companion.patch`) — AND grant the engineering token write access to `graveyield-protocol` (or open the PR yourself; body draft in the session report) | cross-repo change; this session's token cannot create it; changes vendor pin timing |
+| D-2 | Provide a Helius (or equivalent) endpoint + credentials for the §1 probe; approve a bounded Mainnet measurement run (also required before raising `DEFAULT_POOLS_PER_BATCH`/batch-size limits) | completeness guarantees must be verified LIVE; large Mainnet loads are out of scope |
+| D-3 | Approve a schema-v3 that embeds the bounded observation window + page ledger in console snapshots (until then: internal sidecar only) | schema bump touches producer/verifier/console |
+| D-4 | Decide whether to activate the client-side C3/C4 funnel (§6) | product + schema decision; requires measurement first |
+| D-5 | Decide whether to activate `getMultipleAccounts` cross-pool consolidation for vault/mint reads (design in `src/enrichBatch.ts` + this §11.4) — requires a live value-parity probe first | changes which RPC method produces evidence facts |
