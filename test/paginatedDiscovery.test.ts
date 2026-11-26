@@ -280,7 +280,7 @@ describe("paginatedDiscovery — GpaV2Page shape (type-level sanity)", () => {
 // ─── Option 2 continuation: operator work cap (--max-pools) ──────────────
 
 describe("paginatedDiscovery — operator work cap (--max-pools)", () => {
-  test("the cap stops enumeration MID-PAGE: no account is parsed beyond the cap, no further page is fetched", async () => {
+  test("the cap stops enumeration MID-PAGE when a NEW pool would exceed it: never accepted beyond the cap, no further page is fetched", async () => {
     const log: Array<{ cursor: string | null; limit: number }> = [];
     const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
       { accounts: accountsOf([0xd1, 0xd2, 0xd3]), nextCursor: "page-1", contextSlot: 10 },
@@ -288,9 +288,10 @@ describe("paginatedDiscovery — operator work cap (--max-pools)", () => {
     ], log), { maxPools: 2 }));
     // Exactly the capped number of pools parsed — never more.
     assert.equal(run.stats.parsedPools, 2);
-    // The third account on page 0 was received but never parsed.
+    // The third account on page 0 was received, iterated AND parsed
+    // (that is how the run KNOWS it is a new pool) — but never ACCEPTED.
     assert.equal(run.stats.rawAccounts, 3);
-    assert.equal(run.stats.iteratedAccounts, 2);
+    assert.equal(run.stats.iteratedAccounts, 3);
     // The second page was NEVER fetched (the run stopped mid-page).
     assert.equal(log.length, 1);
     assert.equal(run.stats.pageRequests, 1);
@@ -319,18 +320,96 @@ describe("paginatedDiscovery — operator work cap (--max-pools)", () => {
     assert.equal(run.records.length, 2);
   });
 
-  test("a NONEMPTY page while the cap is full fails closed WITHOUT parsing beyond the cap", async () => {
+  test("a NONEMPTY page whose account is a NEW pool while the cap is full fails closed WITHOUT accepting beyond the cap", async () => {
     const log: Array<{ cursor: string | null; limit: number }> = [];
     const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
       { accounts: accountsOf([0xf1, 0xf2]), nextCursor: "page-1", contextSlot: 30 },
       { accounts: accountsOf([0xf3]), nextCursor: null, contextSlot: 31 },
     ], log), { maxPools: 2 }));
-    assert.equal(run.stats.parsedPools, 2, "the third pool was never parsed");
+    assert.equal(run.stats.parsedPools, 2, "the third pool was never accepted");
     assert.equal(run.completeness.status, "operator-cap-reached");
     assert.equal(run.completeness.provablyComplete, false);
     assert.equal(log.length, 2, "the probe page WAS fetched to determine the end semantics");
     assert.equal(run.stats.rawAccounts, 3, "the extra account is honestly counted as received");
-    assert.equal(run.stats.iteratedAccounts, 2);
+    assert.equal(run.stats.iteratedAccounts, 3, "the cap-tripping account is iterated (and parsed, but not accepted)");
+  });
+
+  // ── Cap ordering regression (final-review Finding 2): the cap bounds
+  // PARSED-POOL additions, not raw accounts. A duplicate, malformed or
+  // invalid-address account after the cap is full can never add a parsed
+  // pool, so it must NEVER trigger "operator-cap-reached".
+
+  test("a duplicate after the cap is full does NOT falsely report operator-cap-reached (same page)", async () => {
+    const dup = { pubkey: synth(0xc1).toBase58(), base64: sliceAccount(0xc1) };
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: [...accountsOf([0xc1, 0xc2]), dup], nextCursor: "page-1", contextSlot: 10 },
+      { accounts: [], nextCursor: null, contextSlot: 11 },
+    ]), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2, "the duplicate consumed no cap capacity");
+    assert.equal(run.stats.duplicatesInBatch, 1, "the duplicate is counted, never re-parsed");
+    assert.equal(run.stats.iteratedAccounts, 3, "all three accounts were examined");
+    assert.equal(run.completeness.status, "provider-guarantees-unverified", "clean end — NOT a cap truncation");
+    assert.equal(run.completeness.provablyComplete, false);
+    assert.equal(run.records.length, 2);
+    assert.notEqual(run.completeness.status, "operator-cap-reached");
+  });
+
+  test("a malformed account after the cap is full does NOT falsely report operator-cap-reached", async () => {
+    // Distinct VALID pubkey with a wrong-length payload: it must reach the
+    // data-length check (not be caught as a duplicate) and fail parsing.
+    const malformed = { pubkey: synth(0xd0).toBase58(), base64: Buffer.alloc(17).toString("base64") };
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: [...accountsOf([0xc3, 0xc4]), malformed], nextCursor: "page-1", contextSlot: 10 },
+      { accounts: [], nextCursor: null, contextSlot: 11 },
+    ]), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2, "the malformed account consumed no cap capacity");
+    assert.equal(run.stats.malformedSkipped, 1, "parse-error accounting is preserved");
+    assert.equal(run.completeness.status, "provider-guarantees-unverified");
+    assert.notEqual(run.completeness.status, "operator-cap-reached");
+  });
+
+  test("an INVALID ADDRESS after the cap is full does NOT falsely report operator-cap-reached", async () => {
+    const invalid = { pubkey: "not-a-valid-pubkey!!", base64: sliceAccount(0xc5) };
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: [...accountsOf([0xc6, 0xc7]), invalid], nextCursor: "page-1", contextSlot: 10 },
+      { accounts: [], nextCursor: null, contextSlot: 11 },
+    ]), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2, "the invalid address consumed no cap capacity");
+    assert.equal(run.stats.malformedSkipped, 1, "address-validation accounting is preserved");
+    assert.equal(run.completeness.status, "provider-guarantees-unverified");
+    assert.notEqual(run.completeness.status, "operator-cap-reached");
+  });
+
+  test("non-contributing accounts after the cap do NOT trip it ACROSS page boundaries (clean end still detected)", async () => {
+    const dup = { pubkey: synth(0xc8).toBase58(), base64: sliceAccount(0xc8) };
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xc8, 0xc9]), nextCursor: "page-1", contextSlot: 10 },
+      { accounts: [dup, { pubkey: synth(0xca).toBase58(), base64: Buffer.alloc(17).toString("base64") }, { pubkey: "still-not-valid!!", base64: sliceAccount(0xcb) }], nextCursor: "page-2", contextSlot: 11 },
+      { accounts: [], nextCursor: null, contextSlot: 12 },
+    ]), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2);
+    assert.equal(run.stats.duplicatesInBatch, 1);
+    assert.equal(run.stats.malformedSkipped, 2);
+    assert.equal(run.stats.pageRequests, 3, "all three pages were probed");
+    assert.equal(run.completeness.status, "provider-guarantees-unverified", "the clean provider end is still honored");
+    assert.notEqual(run.completeness.status, "operator-cap-reached");
+  });
+
+  test("a genuinely NEW parseable pool after the cap (behind a non-contributing page) DOES report operator-cap-reached across pages", async () => {
+    const dup = { pubkey: synth(0xcc).toBase58(), base64: sliceAccount(0xcc) };
+    const log: Array<{ cursor: string | null; limit: number }> = [];
+    const run = await discoverRaydiumV4PoolsPaginated(runOpts(paginatedFetch([
+      { accounts: accountsOf([0xcc, 0xcd]), nextCursor: "page-1", contextSlot: 10 },
+      { accounts: [dup], nextCursor: "page-2", contextSlot: 11 },
+      { accounts: accountsOf([0xce]), nextCursor: "page-3", contextSlot: 12 },
+      { accounts: [], nextCursor: null, contextSlot: 13 },
+    ], log), { maxPools: 2 }));
+    assert.equal(run.stats.parsedPools, 2, "the pool beyond the cap was not accepted");
+    assert.equal(run.completeness.status, "operator-cap-reached", "a genuine additional pool fails closed");
+    assert.equal(run.completeness.provablyComplete, false);
+    assert.equal(run.stats.truncated, true);
+    assert.equal(log.length, 3, "enumeration stopped on page 3 — the end page was never fetched");
+    assert.equal(run.stats.pageRequests, 3);
   });
 
   test("maxPools must be a positive integer", async () => {

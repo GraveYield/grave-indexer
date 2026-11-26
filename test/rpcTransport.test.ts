@@ -231,6 +231,165 @@ describe("rpcTransport — rate governor + bounded concurrency", () => {
     resetGovernors();
   });
 
+  // ── Concurrency-safe issuance scheduling (reservation regression) ──────
+  //
+  // The tests above use an INSTANT sleep, which serializes callers by
+  // accident (each microtask completes before the next starts) and can
+  // never expose the thundering herd. The virtual clock below models a
+  // REAL event loop: sleeps scheduled concurrently wake TOGETHER when
+  // their deadline arrives — exactly the failure mode of a governor
+  // whose callers independently compute the same remaining wait.
+
+  /** Virtual clock: deterministic, and concurrent sleeps wake together. */
+  function virtualClock() {
+    let t = 0;
+    let pending: Array<{ wake: number; resolve: () => void }> = [];
+    return {
+      now: (): number => t,
+      sleep: (ms: number): Promise<void> =>
+        new Promise<void>((resolve) => {
+          pending.push({ wake: t + ms, resolve });
+        }),
+      /** Advance to the next wake time, fire EVERY timer due at that
+       *  instant (real event-loop semantics), and let the woken
+       *  continuations settle before the next step. */
+      async pump(): Promise<void> {
+        while (pending.length > 0) {
+          const next = Math.min(...pending.map((p) => p.wake));
+          t = Math.max(t, next);
+          const due = pending.filter((p) => p.wake <= t);
+          pending = pending.filter((p) => p.wake > t);
+          for (const d of due) d.resolve();
+          await new Promise<void>((r) => setImmediate(r));
+        }
+      },
+    };
+  }
+
+  /** Drain the virtual schedule to completion (all timers + continuations). */
+  async function runVirtual(vc: ReturnType<typeof virtualClock>): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      await vc.pump();
+      await new Promise<void>((r) => setImmediate(r));
+    }
+    await vc.pump();
+  }
+
+  test("concurrent governed calls are ISSUANCE-SPACED by minIntervalMs (thundering-herd regression)", async () => {
+    resetGovernors();
+    const vc = virtualClock();
+    const starts: number[] = []; // actual operation-START times, not promise-creation times
+    const jobs = Array.from({ length: 5 }, () =>
+      governed(
+        "public-rpc",
+        async () => {
+          starts.push(vc.now());
+        },
+        { minIntervalMs: 50, maxInFlight: 8 },
+        vc.now,
+        vc.sleep,
+      ),
+    );
+    await runVirtual(vc);
+    await Promise.all(jobs);
+    assert.equal(starts.length, 5, "all concurrent calls completed");
+    for (let i = 1; i < starts.length; i++) {
+      assert.ok(
+        starts[i]! - starts[i - 1]! >= 50,
+        `consecutive issuances must be >= 50 ms apart (got ${starts[i - 1]} -> ${starts[i]})`,
+      );
+    }
+    assert.equal(governorInFlight("public-rpc"), 0, "in-flight returns to zero");
+    resetGovernors();
+  });
+
+  test("a rejected governed call does not block later queued callers (concurrent + spaced)", async () => {
+    resetGovernors();
+    const vc = virtualClock();
+    const starts: number[] = [];
+    const failing = governed(
+      "private-rpc",
+      async () => {
+        starts.push(vc.now());
+        throw new Error("boom");
+      },
+      { minIntervalMs: 40, maxInFlight: 1 },
+      vc.now,
+      vc.sleep,
+    );
+    const ok1 = governed(
+      "private-rpc",
+      async () => {
+        starts.push(vc.now());
+        return 1;
+      },
+      { minIntervalMs: 40, maxInFlight: 1 },
+      vc.now,
+      vc.sleep,
+    );
+    const ok2 = governed(
+      "private-rpc",
+      async () => {
+        starts.push(vc.now());
+        return 2;
+      },
+      { minIntervalMs: 40, maxInFlight: 1 },
+      vc.now,
+      vc.sleep,
+    );
+    // Pump the virtual schedule CONCURRENTLY with the assertions: ok1/ok2
+    // are blocked on virtual timers while `failing` rejects immediately.
+    const settled = Promise.all([ok1, ok2]);
+    const draining = runVirtual(vc);
+    await assert.rejects(failing, /boom/, "the rejection propagates");
+    const results = await settled;
+    assert.deepEqual(results, [1, 2], "later queued calls proceed after the failure");
+    assert.equal(starts.length, 3);
+    for (let i = 1; i < starts.length; i++) {
+      assert.ok(starts[i]! - starts[i - 1]! >= 40, `spacing held across the failure (got ${starts[i - 1]} -> ${starts[i]})`);
+    }
+    assert.equal(governorInFlight("private-rpc"), 0);
+    await draining;
+    resetGovernors();
+  });
+
+  test("maxInFlight remains enforced while issuance spacing is active", async () => {
+    resetGovernors();
+    const vc = virtualClock();
+    const starts: number[] = [];
+    let inFlight = 0;
+    let peak = 0;
+    let releaseGate: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const jobs = Array.from({ length: 4 }, () =>
+      governed(
+        "public-rpc",
+        async () => {
+          starts.push(vc.now());
+          inFlight++;
+          peak = Math.max(peak, inFlight);
+          if (inFlight === 2) releaseGate(); // open once both slots are occupied
+          await gate;
+          inFlight--;
+        },
+        { minIntervalMs: 30, maxInFlight: 2 },
+        vc.now,
+        vc.sleep,
+      ),
+    );
+    await runVirtual(vc);
+    await Promise.all(jobs);
+    assert.equal(peak, 2, "in-flight never exceeds maxInFlight even with spacing active");
+    assert.equal(starts.length, 4, "all calls completed");
+    for (let i = 1; i < starts.length; i++) {
+      assert.ok(starts[i]! - starts[i - 1]! >= 30, `spacing held under the concurrency limit (got ${starts[i - 1]} -> ${starts[i]})`);
+    }
+    assert.equal(governorInFlight("public-rpc"), 0);
+    resetGovernors();
+  });
+
   test("mapWithConcurrency preserves INPUT order regardless of completion order", async () => {
     const items = [30, 10, 50, 20, 40];
     const out = await mapWithConcurrency(items, 3, async (ms, i) => {

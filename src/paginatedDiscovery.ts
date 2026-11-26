@@ -458,12 +458,15 @@ export async function discoverRaydiumV4PoolsPaginated(
 
     // Work cap at a page boundary: NO pre-fetch break. When the cap is
     // full, further page requests are issued ONLY to determine whether
-    // the provider signals a clean end — an EMPTY page accepts no pools,
-    // so it never exceeds the cap (classic parity: a cap landing exactly
-    // on the last accepted pool is NOT a truncation). The first NONEMPTY
-    // page trips the mid-page cap check below → `operator-cap-reached`
-    // (fail closed: unaccepted matching accounts exist). The page budget
-    // still bounds this probing exactly like enumeration.
+    // the provider signals a clean end — the boundary probe must not
+    // mistake non-contributing traffic (duplicates, malformed records,
+    // invalid addresses — none of which can add a parsed pool) for a
+    // genuine cap overflow. The first account that would ACTUALLY add a
+    // new parsed pool beyond the cap trips the in-loop cap check below →
+    // `operator-cap-reached` (fail closed: unaccepted matching pools
+    // exist). An empty page never exceeds the cap (classic parity: a cap
+    // landing exactly on the last accepted pool is NOT a truncation). The
+    // page budget still bounds this probing exactly like enumeration.
 
     const pageStart = Date.now();
     let page: GpaV2Page;
@@ -514,22 +517,6 @@ export async function discoverRaydiumV4PoolsPaginated(
 
     for (const raw of page.accounts) {
       rawAccounts++;
-      // Work cap MID-PAGE: an account on this page cannot be accepted
-      // without exceeding the operator's configured limit. Stop
-      // IMMEDIATELY — never silently process beyond the cap — and report
-      // the run incomplete (`operator-cap-reached`).
-      if (maxPools !== undefined && parsedPools >= maxPools) {
-        completeness = {
-          status: "operator-cap-reached",
-          provablyComplete: false,
-          detail:
-            `the operator work cap (--max-pools ${maxPools}) stopped enumeration after ${parsedPools} parsed pool(s) ` +
-            `and ${iteratedAccounts} of ${rawAccounts} raw account(s) — ${rawAccounts - iteratedAccounts} account(s) on page ` +
-            `${ledger.length - 1} and any later page(s) were never parsed; the (filtered) account set is NOT fully enumerated: ` +
-            `a work cap is not evidence of corpus completeness`,
-        };
-        break enumeration;
-      }
       iteratedAccounts++;
       if (seen.has(raw.pubkey)) {
         duplicatesAcrossPages++;
@@ -552,6 +539,29 @@ export async function discoverRaydiumV4PoolsPaginated(
       if (parsed === null) {
         malformedSkipped++;
         continue;
+      }
+      // Work cap — checked ONLY after duplicate detection, address
+      // validation and parsing have succeeded. The cap bounds PARSED
+      // POOL RECORDS (--max-pools semantics), not raw accounts received:
+      // a duplicate, malformed or invalid-address account can never add
+      // a parsed pool, so it must never consume the cap and must never
+      // trip "operator-cap-reached". The trip fires exactly when THIS
+      // account is the first that would push the accepted parsed-pool
+      // count beyond the configured limit — stop IMMEDIATELY, before
+      // accepting it, and report the run incomplete (fail closed).
+      if (maxPools !== undefined && parsedPools >= maxPools) {
+        completeness = {
+          status: "operator-cap-reached",
+          provablyComplete: false,
+          detail:
+            `the operator work cap (--max-pools ${maxPools}) stopped enumeration after ${parsedPools} parsed pool(s) ` +
+            `and ${iteratedAccounts} of ${rawAccounts} raw account(s) — the account just examined on page ` +
+            `${ledger.length - 1} parses as a NEW pool beyond the cap and was NOT accepted; ` +
+            `${rawAccounts - iteratedAccounts} account(s) on that page and any later page(s) were never examined; ` +
+            `the (filtered) account set is NOT fully enumerated: ` +
+            `a work cap is not evidence of corpus completeness`,
+        };
+        break enumeration;
       }
       let wsolSide: DiscoveredPoolRecord["wsolSide"] = null;
       try {
