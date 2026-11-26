@@ -36,6 +36,7 @@ import {
   type EndpointKind,
   type Provenance,
 } from "./provenance.js";
+import { rpcJsonRequest } from "./rpcTransport.js";
 
 /**
  * AmmInfo identity window: the SDK pins coin_vault@336, pc_vault@368,
@@ -167,7 +168,6 @@ export async function fetchProgramAccountsRaw(
   programId: PublicKey,
   opts: { filters: unknown[]; dataSlice?: { offset: number; length: number }; fetchImpl?: typeof fetch },
 ): Promise<RawProgramAccount[]> {
-  const doFetch = opts.fetchImpl ?? fetch;
   const body = {
     jsonrpc: "2.0",
     id: 1,
@@ -181,22 +181,37 @@ export async function fetchProgramAccountsRaw(
       },
     ],
   };
-  const res = await doFetch(rpcEndpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    throw new Error(`getProgramAccounts HTTP ${res.status} from ${endpointKindFor(rpcEndpoint)} endpoint`);
+  let json: unknown;
+  if (opts.fetchImpl !== undefined) {
+    // Test/diagnostic seam: the injected transport is driven DIRECTLY —
+    // identical to the previous implementation (no retry layer), so faked
+    // transports keep their exact call semantics.
+    const doFetch = opts.fetchImpl;
+    const res = await doFetch(rpcEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      throw new Error(`getProgramAccounts HTTP ${res.status} from ${endpointKindFor(rpcEndpoint)} endpoint`);
+    }
+    json = await res.json();
+  } else {
+    // Production: the retry-aware transport (Option 2 — Part 1 item B):
+    // bounded retries with exponential backoff + jitter, Retry-After
+    // support, an absolute deadline, and typed exhausted-failure errors.
+    // A transport failure NEVER becomes a successful response or
+    // negative evidence — it propagates as a typed error.
+    json = await rpcJsonRequest(rpcEndpoint, body);
   }
-  const json = (await res.json()) as {
-    error?: unknown;
-    result?: RawProgramAccount[] | { value?: RawProgramAccount[] };
-  };
-  if (json.error !== undefined && json.error !== null) {
-    throw new Error(`getProgramAccounts RPC error: ${JSON.stringify(json.error).slice(0, 200)}`);
+  const parsed = json as { error?: unknown; result?: RawProgramAccount[] | { value?: RawProgramAccount[] } } | null;
+  if (parsed === null || typeof parsed !== "object") {
+    throw new Error("unexpected getProgramAccounts response shape (non-object body)");
   }
-  const value = Array.isArray(json.result) ? json.result : json.result?.value;
+  if (parsed.error !== undefined && parsed.error !== null) {
+    throw new Error(`getProgramAccounts RPC error: ${JSON.stringify(parsed.error).slice(0, 200)}`);
+  }
+  const value = Array.isArray(parsed.result) ? parsed.result : parsed.result?.value;
   if (!Array.isArray(value)) {
     throw new Error("unexpected getProgramAccounts response shape (no account array)");
   }

@@ -76,6 +76,10 @@ export interface PipelineConfig {
   maxPoolsPerScan: number;
   /** Signature-scan limit for last-swap derivations. */
   signatureScanLimit: number;
+  /** Enrichment worker concurrency (bounded, Option 2 Part 1 item C).
+   *  Default 4; env ENRICH_CONCURRENCY. Production values must be chosen
+   *  from measured behavior, never from this default alone. */
+  enrichConcurrency: number;
   /** Discovery staleness policy (slots). */
   discoveryStalenessSlots: number;
   /** Evidence freshness policy (slots). */
@@ -124,6 +128,7 @@ export function loadPipelineConfig(): PipelineConfig {
     vaultProgramId,
     maxPoolsPerScan: intEnv("MAX_POOLS_PER_SCAN", 500),
     signatureScanLimit: intEnv("SIGNATURE_SCAN_LIMIT", 1000),
+    enrichConcurrency: intEnv("ENRICH_CONCURRENCY", 4),
     discoveryStalenessSlots: intEnv("DISCOVERY_STALENESS_SLOTS", DEFAULT_DISCOVERY_STALENESS_SLOTS),
     evidenceFreshnessSlots: intEnv("EVIDENCE_FRESHNESS_SLOTS", DEFAULT_EVIDENCE_FRESHNESS_SLOTS),
     dataDir: process.env.DATA_DIR ?? "./data",
