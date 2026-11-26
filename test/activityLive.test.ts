@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { PublicKey, VersionedTransaction, type AccountInfo, type Connection } from "@solana/web3.js";
+import { PublicKey, SYSVAR_SLOT_HASHES_PUBKEY, VersionedTransaction, type AccountInfo, type Connection } from "@solana/web3.js";
 
 import { RAYDIUM_V4_PROGRAM_ID } from "@graveyield/sdk";
 
@@ -863,9 +863,24 @@ class FakeDevnetRpc {
     this.calls.push(`getBlock:${slot}`);
     return { blockhash: "11111111111111111111111111111111" };
   }
-  async getAccountInfo(_address: PublicKey): Promise<AccountInfo<Uint8Array> | null> {
+  async getAccountInfo(address: PublicKey): Promise<AccountInfo<Uint8Array> | null> {
     this.calls.push("getAccountInfo");
-    return null;
+    // SDK (merged protocol PR #116) resolves slot hashes from the canonical
+    // SlotHashes sysvar via getAccountInfo — no longer getBlock(). Serve a
+    // minimal valid sysvar snapshot whose NEWEST entry is exactly the slot
+    // this fake's getSlot() arithmetic produces (1_000_000 - 4 = 999_996),
+    // so issue.ts's (issuedSlot, slotHash) pair is resolvable the same way
+    // a real destination cluster resolves it. Other accounts stay null.
+    if (!address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) return null;
+    const slot = 999_996n;
+    const hash = new Uint8Array(32).fill(0xab);
+    const data = new Uint8Array(8 + 40);
+    const view = new DataView(data.buffer);
+    view.setBigUint64(0, 1n, true); // entry count
+    view.setBigUint64(8, slot, true); // newest (only) entry: slot
+    data.set(hash, 16); // newest entry: 32-byte hash
+    const account = { lamports: 0, owner: new PublicKey("Sysvar1111111111111111111111111111111111111"), executable: false, rentEpoch: 0n, data };
+    return account as unknown as AccountInfo<Uint8Array>;
   }
 }
 
