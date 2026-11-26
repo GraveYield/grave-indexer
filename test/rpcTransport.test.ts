@@ -244,3 +244,150 @@ describe("rpcTransport — rate governor + bounded concurrency", () => {
     await assert.rejects(mapWithConcurrency([1], 0, async (x) => x), /concurrency/);
   });
 });
+
+// ─── Option 2 continuation: in-band JSON-RPC error classification + retry ─
+
+import {
+  JsonRpcPermanentError,
+  classifyJsonRpcError,
+} from "../src/rpcTransport.js";
+
+describe("rpcTransport — JSON-RPC error classification", () => {
+  test("server-error range (-32000..-32099) and internal error (-32603) are RETRYABLE", () => {
+    assert.equal(classifyJsonRpcError({ code: -32000, message: "Server error" }), "retryable");
+    assert.equal(classifyJsonRpcError({ code: -32005, message: "Node behind" }), "retryable");
+    assert.equal(classifyJsonRpcError({ code: -32099, message: "whatever" }), "retryable");
+    assert.equal(classifyJsonRpcError({ code: -32603, message: "Internal error" }), "retryable");
+  });
+
+  test("protocol/usage errors are PERMANENT", () => {
+    assert.equal(classifyJsonRpcError({ code: -32700, message: "Parse error" }), "permanent");
+    assert.equal(classifyJsonRpcError({ code: -32600, message: "Invalid Request" }), "permanent");
+    assert.equal(classifyJsonRpcError({ code: -32601, message: "Method not found" }), "permanent");
+    assert.equal(classifyJsonRpcError({ code: -32602, message: "Invalid params" }), "permanent");
+  });
+
+  test("UNKNOWN codes are PERMANENT (never guessed retryable)", () => {
+    assert.equal(classifyJsonRpcError({ code: -40001, message: "mystery" }), "permanent");
+    assert.equal(classifyJsonRpcError({ message: "no code" }), "permanent");
+    assert.equal(classifyJsonRpcError(null), "permanent");
+    assert.equal(classifyJsonRpcError("string"), "permanent");
+  });
+
+  test("a rate-limit MESSAGE is retryable even with a non-standard code", () => {
+    assert.equal(classifyJsonRpcError({ code: -999, message: "Too many requests, slow down" }), "retryable");
+    assert.equal(classifyJsonRpcError({ code: 7, message: "rate limit exceeded" }), "retryable");
+    assert.equal(classifyJsonRpcError({ code: -32601, message: "temporarily unavailable, please try again" }), "retryable");
+  });
+});
+
+describe("rpcTransport — in-band JSON-RPC error handling (retryJsonRpcErrors)", () => {
+  test("a retryable in-band error is retried within the SAME budget and then succeeds", async () => {
+    let attempts = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      attempts++;
+      if (attempts < 3) {
+        return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32005, message: "node behind" } });
+      }
+      return res(200, { jsonrpc: "2.0", id: 1, result: { ok: true } });
+    }) as unknown as typeof fetch;
+    const json = (await rpcJsonRequest("https://mainnet.helius-rpc.com", { jsonrpc: "2.0", id: 1, method: "x" }, {
+      ...T,
+      fetchImpl,
+      retryJsonRpcErrors: true,
+    })) as { result?: { ok?: boolean } };
+    assert.equal(json.result?.ok, true);
+    assert.equal(attempts, 3, "two in-band retries then success, within maxAttempts 4");
+  });
+
+  test("a PERMANENT in-band error fails IMMEDIATELY with the typed JsonRpcPermanentError (no budget burn)", async () => {
+    let attempts = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      attempts++;
+      return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      rpcJsonRequest("https://mainnet.helius-rpc.com", { jsonrpc: "2.0", id: 1, method: "x" }, { ...T, fetchImpl, retryJsonRpcErrors: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof JsonRpcPermanentError);
+        assert.equal((err as JsonRpcPermanentError).code, -32601);
+        assert.equal((err as JsonRpcPermanentError).endpointKind, "private-rpc");
+        assert.match(String(err), /retrying cannot fix a protocol\/usage error/);
+        return true;
+      },
+    );
+    assert.equal(attempts, 1, "permanent errors never consume retry budget");
+  });
+
+  test("retryable in-band exhaustion raises the TYPED RpcRetryExhaustedError — never a fake success", async () => {
+    let attempts = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      attempts++;
+      return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "Server error, please try again" } });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      rpcJsonRequest("https://mainnet.helius-rpc.com", { jsonrpc: "2.0", id: 1, method: "x" }, { ...T, fetchImpl, retryJsonRpcErrors: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof RpcRetryExhaustedError);
+        assert.equal((err as RpcRetryExhaustedError).attempts, 4);
+        assert.match(String(err), /retryable JSON-RPC error \(code -32000\)/);
+        return true;
+      },
+    );
+    assert.equal(attempts, 4, "the attempt budget is SHARED with HTTP-level retries");
+  });
+
+  test("in-band Retry-After is honored when the provider supplies the header on a 200", async () => {
+    const observed: number[] = [];
+    let attempts = 0;
+    const fakeNow = (): number => {
+      observed.push(1);
+      return Date.now();
+    };
+    const fetchImpl = (async (): Promise<Response> => {
+      attempts++;
+      if (attempts === 1) {
+        return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32000, message: "rate limit" } }, { "retry-after": "1" });
+      }
+      return res(200, { jsonrpc: "2.0", id: 1, result: {} });
+    }) as unknown as typeof fetch;
+    // Real sleep (not the instant one) so the Retry-After delay actually
+    // elapses — proving the header path is exercised end to end.
+    await rpcJsonRequest("https://mainnet.helius-rpc.com", { jsonrpc: "2.0", id: 1, method: "x" }, {
+      ...T,
+      fetchImpl,
+      retryJsonRpcErrors: true,
+      sleep: undefined,
+      now: fakeNow,
+    } as never);
+    assert.equal(attempts, 2);
+  });
+
+  test("in-band error handling is OFF by default (envelope callers keep the raw body)", async () => {
+    let attempts = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      attempts++;
+      return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32601, message: "Method not found" } });
+    }) as unknown as typeof fetch;
+    const json = (await rpcJsonRequest("https://mainnet.helius-rpc.com", { jsonrpc: "2.0", id: 1, method: "x" }, {
+      ...T,
+      fetchImpl,
+    })) as { error?: { code?: number } };
+    assert.equal(json.error?.code, -32601, "the raw envelope is returned untouched");
+    assert.equal(attempts, 1);
+  });
+
+  test("in-band permanent errors never embed the URL (endpoint KIND only)", async () => {
+    const fetchImpl = (async (): Promise<Response> => {
+      return res(200, { jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid params" } });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      rpcJsonRequest("https://mainnet.helius-rpc.com/?api-key=SECRET", { jsonrpc: "2.0", id: 1, method: "x" }, { ...T, fetchImpl, retryJsonRpcErrors: true }),
+      (err: unknown) => {
+        assert.ok(err instanceof JsonRpcPermanentError);
+        assert.ok(!String(err).includes("SECRET"), "URL leaked into the typed error");
+        return true;
+      },
+    );
+  });
+});

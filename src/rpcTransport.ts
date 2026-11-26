@@ -82,6 +82,63 @@ export class RpcDeadlineExceededError extends Error {
   }
 }
 
+/**
+ * Typed error: the provider returned a PERMANENT JSON-RPC error inside an
+ * HTTP-success response (protocol/usage error — retrying cannot fix it).
+ * Fail fast, explicit; never converted into a fake success or negative
+ * evidence.
+ */
+export class JsonRpcPermanentError extends Error {
+  override readonly name = "JsonRpcPermanentError";
+  readonly endpointKind: EndpointKind;
+  /** JSON-RPC error code from the response envelope. */
+  readonly code: number;
+
+  constructor(endpointKind: EndpointKind, code: number, detail: string) {
+    super(
+      `RPC returned a permanent JSON-RPC error (endpoint kind ${endpointKind}, code ${code}) — ` +
+        `retrying cannot fix a protocol/usage error — ${detail}`,
+    );
+    this.endpointKind = endpointKind;
+    this.code = code;
+  }
+}
+
+/**
+ * Classification of an IN-BAND JSON-RPC error object (HTTP success, body
+ * carries `{ error: { code, message } }`):
+ *
+ *   RETRYABLE — provider-side transient conditions: the JSON-RPC server
+ *   error range (-32000..-32099, which includes rate-limit/limit-exceeded
+ *   codes such as -32005 and generic "server error" -32000) and internal
+ *   error -32603, plus a message-based guard for providers that report
+ *   rate limiting with non-standard codes ("rate limit", "too many
+ *   requests", "please try again", "temporarily unavailable").
+ *
+ *   PERMANENT — protocol/usage errors retrying cannot fix: -32700
+ *   (parse), -32600 (invalid request), -32601 (method not found),
+ *   -32602 (invalid params). ANY UNKNOWN code is classified PERMANENT:
+ *   an error of unknown semantics cannot be safely retried (it may be an
+ *   invalid request that would fail identically), and the retry budget is
+ *   reserved for KNOWN transient conditions. Fail-closed either way — the
+ *   caller sees a typed error, never a fabricated result.
+ */
+export type JsonRpcErrorClass = "retryable" | "permanent";
+
+const RETRYABLE_MESSAGE_RE = /rate limit|too many requests|please try again|temporarily unavailable/;
+
+export function classifyJsonRpcError(error: unknown): JsonRpcErrorClass {
+  if (error === null || typeof error !== "object") return "permanent";
+  const e = error as { code?: unknown; message?: unknown };
+  const message = typeof e.message === "string" ? e.message.toLowerCase() : "";
+  if (RETRYABLE_MESSAGE_RE.test(message)) return "retryable";
+  if (typeof e.code !== "number" || !Number.isFinite(e.code)) return "permanent";
+  if (e.code === -32603) return "retryable"; // internal error (server hiccup)
+  if (e.code >= -32099 && e.code <= -32000) return "retryable"; // server error range (incl. -32005)
+  if (e.code === -32700 || e.code === -32600 || e.code === -32601 || e.code === -32602) return "permanent";
+  return "permanent"; // unknown code: never guess retryability
+}
+
 /** Transport configuration (all bounds REQUIRED to be finite). */
 export interface RpcTransportOptions {
   /** Total retry attempts INCLUDING the first (must be >= 1). Default 4. */
@@ -100,6 +157,15 @@ export interface RpcTransportOptions {
   now?: () => number;
   /** Injectable sleep (tests). Defaults to a real timer. */
   sleep?: (ms: number) => Promise<void>;
+  /** Handle IN-BAND JSON-RPC errors (HTTP success + `{ error }` body):
+   *  classify and retry RETRYABLE ones within the SAME bounded budget and
+   *  deadline as HTTP-level failures; PERMANENT ones fail immediately as
+   *  `JsonRpcPermanentError`. Default false — callers that inspect the
+   *  envelope themselves (e.g. batch arrays, capability probes with typed
+   *  verdicts) keep the raw envelope. Exhaustion raises the TYPED
+   *  `RpcRetryExhaustedError`; a failed call NEVER becomes a fake success,
+   *  a zero balance or negative evidence. */
+  retryJsonRpcErrors?: boolean;
 }
 
 export interface ResolvedTransportOptions {
@@ -111,6 +177,7 @@ export interface ResolvedTransportOptions {
   rng: () => number;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
+  retryJsonRpcErrors: boolean;
 }
 
 export function resolveTransportOptions(opts?: RpcTransportOptions): ResolvedTransportOptions {
@@ -127,6 +194,7 @@ export function resolveTransportOptions(opts?: RpcTransportOptions): ResolvedTra
     rng: opts?.rng ?? Math.random,
     now: opts?.now ?? Date.now,
     sleep: opts?.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+    retryJsonRpcErrors: opts?.retryJsonRpcErrors ?? false,
   };
 }
 
@@ -249,6 +317,49 @@ export async function rpcJsonRequest(
       }
       await o.sleep(delay);
       continue;
+    }
+
+    // IN-BAND JSON-RPC error handling (opt-in): the HTTP exchange
+    // succeeded but the body carries `{ error }`. Classification decides
+    // between a bounded retry (same budget + deadline as HTTP failures;
+    // Retry-After honored when the provider supplies the header even on a
+    // 200) and an immediate typed permanent failure. The attempt counter
+    // is SHARED with the HTTP-level retries, so the total budget stays
+    // bounded exactly as documented.
+    if (o.retryJsonRpcErrors && json !== null && typeof json === "object") {
+      const envelope = json as { error?: unknown };
+      if (envelope.error !== undefined && envelope.error !== null) {
+        const errObj = envelope.error as { code?: unknown; message?: unknown };
+        const code = typeof errObj.code === "number" ? errObj.code : 0;
+        const detail = JSON.stringify(envelope.error).slice(0, 200);
+        if (classifyJsonRpcError(envelope.error) === "permanent") {
+          throw new JsonRpcPermanentError(endpointKind, code, detail);
+        }
+        lastHttpStatus = res.status;
+        if (attempts >= o.maxAttempts) {
+          throw new RpcRetryExhaustedError(
+            endpointKind,
+            attempts,
+            lastHttpStatus,
+            false,
+            `retryable JSON-RPC error (code ${code}): ${detail}`,
+          );
+        }
+        const retryAfterMs = parseRetryAfter(res.headers.get("retry-after"), o.now());
+        const backoff =
+          retryAfterMs !== null && retryAfterMs > 0
+            ? Math.min(retryAfterMs, Math.max(0, deadline - o.now()))
+            : backoffDelayMs(attempts, o.baseDelayMs, o.maxDelayMs, o.rng);
+        if (retryAfterMs !== null && retryAfterMs > o.deadlineMs) {
+          retryAfterUnhonored = true;
+        }
+        if (o.now() + backoff >= deadline) {
+          retryAfterUnhonored = retryAfterUnhonored || retryAfterMs !== null;
+          throw new RpcDeadlineExceededError(endpointKind, o.deadlineMs);
+        }
+        await o.sleep(backoff);
+        continue;
+      }
     }
     return json;
   }
