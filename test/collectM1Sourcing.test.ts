@@ -117,6 +117,7 @@ function collectConfig(dataDir: string): PipelineConfig {
     vaultProgramId: DEVNET_VAULT_PROGRAM_ID,
     maxPoolsPerScan: 10,
     signatureScanLimit: 50,
+    enrichConcurrency: 4,
     discoveryStalenessSlots: 400,
     evidenceFreshnessSlots: 450,
     dataDir,
