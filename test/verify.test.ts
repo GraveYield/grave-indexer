@@ -3,12 +3,16 @@
 // Verifier tests — the full off-chain verification matrix against a
 // mocked RPC. The check order mirrors the on-chain path; every expected
 // rejection names its on-chain analogue (6025/6026/6027/6028/6029/6030)
-// or the operator-side journal.
+// or the operator-side journal. The mock serves a canonical SlotHashes
+// sysvar account — the SAME source the default resolver reads and the
+// on-chain verifier checks — so the 6030 analogue is tested against the
+// sysvar, never against a getBlock mock (finding F1: the two sources
+// diverge on agave 3.x).
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import bs58 from "bs58";
-import { PublicKey, type Connection } from "@solana/web3.js";
+import { PublicKey, SYSVAR_SLOT_HASHES_PUBKEY, type Connection } from "@solana/web3.js";
+import { SYSVAR_PROGRAM_ID } from "@graveyield/sdk";
 import {
   buildEvidenceBundle,
   buildEvidenceMessage,
@@ -22,8 +26,9 @@ import { synth, testOracle } from "./fixtures.js";
 const AMM = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 const SCANNER = new PublicKey("EFJpKtWx5gDnc4Hh6GEEgPLUrPh377E4Nfic8jsJAQJL");
 
-// Mock chain state: current slot 5_000_000; blocks resolvable for a
-// window of slots with deterministic blockhashes (sha-like filler).
+// Mock chain state: current slot 5_000_000; the SlotHashes sysvar holds
+// the newest 512 entries with deterministic per-slot hashes (sha-like
+// filler). Bundle attestations are issued against these same hashes.
 const NOW_SLOT = 5_000_000;
 const NOW_UNIX = 1_760_000_000;
 const SLOT_HASH_WINDOW = 512;
@@ -34,15 +39,38 @@ function mockBlockhash(slot: number): Uint8Array {
   return h;
 }
 
+/** Serialize SlotHashes sysvar data: u64 LE count + 40B entries, newest-first. */
+function serializeSlotHashes(entries: Array<{ slot: number; hash: Uint8Array }>): Uint8Array {
+  const buf = Buffer.alloc(8 + entries.length * 40);
+  buf.writeBigUInt64LE(BigInt(entries.length), 0);
+  entries.forEach(({ slot, hash }, i) => {
+    const base = 8 + i * 40;
+    buf.writeBigUInt64LE(BigInt(slot), base);
+    buf.set(hash, base + 8);
+  });
+  return buf;
+}
+
+function mockSysvarAccount(): {
+  owner: PublicKey;
+  executable: boolean;
+  data: Uint8Array;
+} {
+  const entries: Array<{ slot: number; hash: Uint8Array }> = [];
+  for (let back = 0; back < SLOT_HASH_WINDOW; back++) {
+    const slot = NOW_SLOT - back;
+    entries.push({ slot, hash: mockBlockhash(slot) });
+  }
+  return { owner: SYSVAR_PROGRAM_ID, executable: false, data: serializeSlotHashes(entries) };
+}
+
 function mockConnection(): Connection {
   const fake = {
     getSlot: async (): Promise<number> => NOW_SLOT,
-    getBlock: async (slot: number) => {
-      if (slot <= 0) return null;
-      if (NOW_SLOT - slot > SLOT_HASH_WINDOW) return null; // aged out
-      return { blockhash: bs58.encode(mockBlockhash(slot)) };
+    getAccountInfo: async (address: PublicKey) => {
+      if (address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) return mockSysvarAccount();
+      return null;
     },
-    getAccountInfo: async () => null,
   };
   return fake as unknown as Connection;
 }
@@ -121,6 +149,29 @@ describe("evidence verifier — acceptance", () => {
     }
   });
 
+  test("the default resolver reads the SlotHashes sysvar, never getBlock (F1 regression guard)", async () => {
+    const { oracle, bundle } = await makeBundle();
+    // A connection whose getBlock would return a hash DIFFERENT from the
+    // sysvar entry (agave 3.x divergence, finding F1). The canonical
+    // bundle must still verify — proving the verifier resolves the 6030
+    // analogue from the sysvar only and never consults getBlock.
+    let getBlockCalled = false;
+    const divergentConn = {
+      getSlot: async (): Promise<number> => NOW_SLOT,
+      getBlock: async () => {
+        getBlockCalled = true;
+        return { blockhash: "11111111111111111111111111111111" };
+      },
+      getAccountInfo: async (address: PublicKey) => {
+        if (address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) return mockSysvarAccount();
+        return null;
+      },
+    } as unknown as Connection;
+    const result = await verifyEvidenceBundle(divergentConn, "devnet", bundle, baseVerifyOpts(oracle));
+    assert.equal(result.outcome, "verified", JSON.stringify(result.checks, null, 2));
+    assert.ok(!getBlockCalled, "getBlock must not be consulted by the default resolver");
+  });
+
   test("signer == configured oracle when expectedOracle matches (positive authorization)", async () => {
     const { oracle, bundle } = await makeBundle();
     const result = await verifyEvidenceBundle(mockConnection(), "devnet", bundle, baseVerifyOpts(oracle));
@@ -196,18 +247,17 @@ describe("evidence verifier — rejection matrix", () => {
     assert.equal(result.firstFailure?.onChainAnalogue?.code, 6030);
   });
 
-  test("aged-out slot with no resolvable block → rejected as stale (6029 analogue)", async () => {
+  test("issued_slot absent from the SlotHashes sysvar → rejected at ATTESTATION_SLOT_HASH (6029/6030 analogue)", async () => {
     const { oracle } = await makeBundle();
-    // issuedSlot inside the verifier's own freshness policy (450) is not
-    // reachable here since the mock window is 512 — use the policy bound:
-    // issuedSlot 460 back is within 450? No — 460 > 450 → stale; exercise
-    // the hash-null branch instead via a bundle issued 100 slots back on a
-    // connection whose block lookup returns null.
+    // issuedSlot 100 slots back is inside the verifier's own freshness
+    // policy (450), so the hash-resolution branch runs: the connection
+    // below has no SlotHashes sysvar at all — the default resolver fails
+    // closed and the check surfaces the 6029/6030 analogue.
     const issuedSlot = NOW_SLOT - 100;
     const { bundle } = await makeBundle({ issuedSlot, slotHash: mockBlockhash(issuedSlot), signer: oracle });
     const nullConn = {
       getSlot: async () => NOW_SLOT,
-      getBlock: async () => null,
+      getAccountInfo: async () => null,
     } as unknown as Connection;
     const result = await verifyEvidenceBundle(nullConn, "devnet", bundle, baseVerifyOpts(oracle));
     assert.equal(result.outcome, "rejected");

@@ -47,9 +47,9 @@
 //   7. tampered-binding        → ATTESTATION_BINDING (6027 analogue)
 //   8. future-timestamp        → ATTESTATION_TIMESTAMP (6028 analogue)
 //   9. stale-slot              → ATTESTATION_STALE (6029 analogue)
-//  10. slot-hash-mismatch      → ATTESTATION_SLOT_HASH (6030 analogue)
-//  11. replayed-evidence       → ATTESTATION_REPLAY (journal)
-//  12. canonical-bundle        → verifier "oracle-gated" outcome (all
+//   10. slot-hash-mismatch      → ATTESTATION_SLOT_HASH (6030 analogue)
+//   11. replayed-evidence       → ATTESTATION_REPLAY (journal)
+//   12. canonical-bundle        → verifier "oracle-gated" outcome (all
 //                                properties proven; key equality is the
 //                                single remaining gate)
 //
@@ -80,11 +80,14 @@ import {
   buildLaunchPriceEd25519VerifyInstruction,
   decodeGraveYieldError,
   decodeGraveYieldErrorCode,
+  fetchRecentSlotHash,
   fetchScannerProtocolConfig,
+  fetchSlotHashesSnapshot,
   scannerProtocolConfigPda,
   ATTESTATION_MSG_LEN,
   LAUNCH_PRICE_MSG_OFFSET,
   type DecodedGraveYieldError,
+  type SlotHashEntry,
 } from "@graveyield/sdk";
 import { verifyEvidenceBundle, type VerificationCheckId, type VerifyResult } from "./verify.js";
 import {
@@ -475,46 +478,48 @@ async function runVerifierLevelCases(ctx: {
 
   const nowSlot = Number(await connection.getSlot());
 
-  // Memoized slot-hash resolver: devnet public RPC rate-limits getBlock
-  // hard, so the whole matrix shares one resolved slot + hash.
-  let memo: { slot: number; hash: Uint8Array } | null = null;
-  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  // Canonical slot-hash resolution: ONE validated SlotHashes sysvar
+  // snapshot shared by the whole matrix — the same single-parser SDK
+  // reader the issuers use (`fetchSlotHashesSnapshot` /
+  // `fetchRecentSlotHash`). The resolver deliberately does NOT use
+  // `getBlock(slot).blockhash`: on agave 3.x that value is not the
+  // SlotHashes entry for the slot (lifecycle-rehearsal finding F1), so a
+  // getBlock-based mirror would disagree with the on-chain 6030 check
+  // the verifier mirrors.
+  let snapshot: SlotHashEntry[] | null = null;
+  let snapshotFailed = false;
   const memoResolver = async (
     slot: number,
   ): Promise<{ hash: Uint8Array | null; indeterminate: boolean }> => {
-    if (memo && memo.slot === slot) return { hash: memo.hash, indeterminate: false };
-    for (let attempt = 0; attempt < 6 && !memo; attempt++) {
+    if (!snapshot && !snapshotFailed) {
       try {
-        const block = await connection.getBlock(slot, { maxSupportedTransactionVersion: 0 });
-        if (block?.blockhash) {
-          memo = { slot, hash: new PublicKey(block.blockhash).toBytes() };
-          return { hash: memo.hash, indeterminate: false };
-        }
+        snapshot = await fetchSlotHashesSnapshot(connection);
       } catch {
-        // 429 / transient — pace and retry.
+        // Genuine RPC failure — indeterminate, never a stale verdict.
+        snapshotFailed = true;
       }
-      await sleep(2000);
     }
-    return { hash: null, indeterminate: memo === null };
+    if (snapshotFailed) return { hash: null, indeterminate: true };
+    if (!snapshot) return { hash: null, indeterminate: false }; // sysvar absent — fail closed
+    const found = snapshot.find((e) => e.slot === slot);
+    return { hash: found ? found.hash : null, indeterminate: false };
   };
 
-  // Issuance slot: a few slots back so the block is confirmed + indexed.
-  let issuedSlot = Math.max(1, nowSlot - 8);
-  let slotHash: Uint8Array | null = null;
-  for (let back = 8; back <= 60 && !slotHash; back += 4) {
-    issuedSlot = Math.max(1, nowSlot - back);
-    const resolved = await memoResolver(issuedSlot);
-    if (resolved.hash) slotHash = resolved.hash;
-  }
-  if (!slotHash) {
-    // Cannot resolve any recent block — verifier cases needing hash
+  // Issuance slot: a REAL recent (slot, hash) pair taken from ONE
+  // validated SlotHashes sysvar snapshot — never a slot manufactured by
+  // `getSlot()` arithmetic (slots can be skipped) and never a getBlock
+  // blockhash. This is the SDK's canonical pairing contract; the
+  // "canonical bundle" case below must itself be canonical evidence.
+  const recent = await fetchRecentSlotHash(connection);
+  if (!recent) {
+    // Cannot resolve any real sysvar entry — verifier cases needing hash
     // context are skipped rather than mis-reported.
     const skipCase = (id: string, description: string): EvidencePathCaseReport => ({
       caseId: id,
       layer: "verifier-live",
-      description: `${description} — SKIPPED: no recent devnet block resolvable via RPC.`,
+      description: `${description} — SKIPPED: no valid SlotHashes sysvar entry available (sysvar absent/invalid or RPC failure).`,
       expectation: { result: "reject" },
-      observed: { note: "skipped — RPC indexing" },
+      observed: { note: "skipped — SlotHashes sysvar unavailable" },
       pass: true,
       skipped: true,
     });
@@ -527,6 +532,8 @@ async function runVerifierLevelCases(ctx: {
       skipCase("replayed-evidence", "Journal rejects replayed identical evidence"),
     ];
   }
+  const issuedSlot = recent.slot;
+  const slotHash: Uint8Array = recent.hash;
 
   const poolAddress = synthAddress(0xa1); // synthetic pool for the report run
   const ammProgramId = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
@@ -665,6 +672,8 @@ async function runVerifierLevelCases(ctx: {
   );
 
   // 9. stale slot: issued far outside the ~512-slot SlotHashes window.
+  //    (Manufactured on purpose — this is a NEGATIVE case; the freshness
+  //    gate rejects it before any hash resolution, exactly as on chain.)
   const staleSlot = Math.max(1, nowSlot - 10_000);
   const staleBundle = buildEvidenceBundle({
     ...bundleToInput(canonical),
@@ -1000,5 +1009,3 @@ function buildCustomPrecompileIx(opts: {
     data,
   });
 }
-
-
