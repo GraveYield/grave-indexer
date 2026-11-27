@@ -22,12 +22,15 @@
 // well-formedness (the bundle carries exactly one 112-byte message, one
 // 32-byte key, one 64-byte signature at canonical placements) and direct
 // Ed25519 verification. Steps 3–8 run against LIVE chain data
-// (ProtocolConfig via RPC, SlotHashes membership via getBlock).
+// (ProtocolConfig via RPC, SlotHashes membership via the canonical
+// SlotHashes sysvar reader — never `getBlock` (finding F1)).
 
 import { Connection, PublicKey } from "@solana/web3.js";
 import {
   fetchScannerProtocolConfig,
+  fetchSlotHash,
   scannerProtocolConfigPda,
+  SlotHashesAccountInvalidError,
 } from "@graveyield/sdk";
 import {
   parseEvidenceBundle,
@@ -89,7 +92,8 @@ export interface VerifyOptions {
   nowSlot?: number;
   /** Expected configured oracle (skips the live ProtocolConfig fetch). */
   expectedOracle?: PublicKey;
-  /** Max step-backs when resolving a recent slot's block (default 8). */
+  /** Bounded retries for transient RPC failures when reading the
+   *  SlotHashes sysvar (default 8). Name kept for API compatibility. */
   blockLookupRetries?: number;
   /** Trust window: issued_slot older than (now - window) is stale. */
   freshnessWindowSlots?: number;
@@ -125,9 +129,31 @@ function check(
 }
 
 /**
- * Resolve a slot's blockhash with bounded retries for RPC indexing lag.
- * Returns null when the slot has no resolvable block (stale/skipped) and
- * "indeterminate" cannot be excluded.
+ * Resolve a slot's 32-byte hash from the canonical SlotHashes sysvar —
+ * the same source the on-chain verifier reads
+ * (`attestation.rs::slot_hash_lookup`) and the same single-parser SDK
+ * reader the issuers use (`fetchSlotHash`). Bounded retries apply only
+ * to transient RPC failures.
+ *
+ * This deliberately does NOT use `getBlock(slot).blockhash`: on agave
+ * 3.x that value is not the SlotHashes entry for the slot (lifecycle-
+ * rehearsal finding F1 — the two sources diverged on every probed
+ * slot), so a getBlock-based mirror would disagree with the on-chain
+ * 6030 check this verifier mirrors.
+ *
+ * Returns null when the slot is absent from the sysvar (aged out or
+ * skipped — exactly the on-chain 6029 fail-closed outcome) or the
+ * sysvar data fails strict validation; "indeterminate" only after
+ * transient RPC failures exhaust the retries.
+ *
+ * Classification is explicit and matches the documented semantics:
+ * structurally invalid sysvar data is a PERMANENT fail-closed outcome
+ * (`{ hash: null, indeterminate: false }`) — the current pinned SDK
+ * converts `SlotHashesAccountInvalidError` to `null` inside
+ * `fetchSlotHash`, and the resolver additionally classifies the error
+ * directly should it ever surface from that layer, so the malformed
+ * path can never be misreported as an indeterminate RPC outage and
+ * never burns retries on data that no retry can repair.
  */
 async function resolveSlotHash(
   connection: Connection,
@@ -135,21 +161,21 @@ async function resolveSlotHash(
   retries: number,
 ): Promise<{ hash: Uint8Array | null; indeterminate: boolean }> {
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const probe = slot - attempt;
-    if (probe <= 0) return { hash: null, indeterminate: false };
     try {
-      const block = await connection.getBlock(probe, { maxSupportedTransactionVersion: 0 });
-      if (block && block.blockhash) {
-        // Only the EXACT slot answers the on-chain hash check; stepping
-        // back is only useful to distinguish "RPC lag" from "gap". If the
-        // requested slot itself yielded nothing while an older one
-        // resolved, the exact slot is treated as missing (stale).
-        if (probe === slot) {
-          return { hash: new PublicKey(block.blockhash).toBytes(), indeterminate: false };
-        }
-        break;
+      const hash = await fetchSlotHash(connection, slot);
+      if (hash) return { hash, indeterminate: false };
+      // Sysvar present but the slot is absent, or the sysvar data
+      // failed strict validation — both are the on-chain fail-closed
+      // outcome, not an RPC problem. No retry changes this.
+      return { hash: null, indeterminate: false };
+    } catch (err) {
+      if (err instanceof SlotHashesAccountInvalidError) {
+        // Structurally invalid sysvar data — a permanent fail-closed
+        // outcome, never transient. Retrying cannot repair the bytes;
+        // misreporting it as indeterminate would contradict the
+        // documented semantics above.
+        return { hash: null, indeterminate: false };
       }
-    } catch {
       // RPC hiccup: retry, then report indeterminate below.
     }
   }
@@ -312,12 +338,12 @@ export async function verifyEvidenceBundle(
         "ATTESTATION_SLOT_HASH",
         false,
         ON_CHAIN.ATTESTATION_SLOT_HASH,
-        "slot within window but block not (yet) resolvable via RPC — indeterminate, not stale",
+        "slot within window but the SlotHashes sysvar read failed transiently — indeterminate, not stale",
       );
       slotHashCheck.outcome = "indeterminate";
       checks.push(slotHashCheck);
     } else if (hash === null) {
-      checks.push(check("ATTESTATION_SLOT_HASH", false, ON_CHAIN.ATTESTATION_STALE, "no block resolvable for issued_slot — on chain this slot is absent from SlotHashes"));
+      checks.push(check("ATTESTATION_SLOT_HASH", false, ON_CHAIN.ATTESTATION_STALE, "issued_slot absent from the canonical SlotHashes sysvar — on chain this reverts AttestationStale (6029)"));
     } else {
       const hashHex = Buffer.from(hash).toString("hex");
       const expectedHex = Buffer.from(msgBytes.slice(80, 112)).toString("hex");
@@ -326,7 +352,7 @@ export async function verifyEvidenceBundle(
           "ATTESTATION_SLOT_HASH",
           hashHex === expectedHex,
           ON_CHAIN.ATTESTATION_SLOT_HASH,
-          `chain blockhash ${hashHex.slice(0, 16)}… vs attested ${expectedHex.slice(0, 16)}…`,
+          `chain SlotHashes entry ${hashHex.slice(0, 16)}… vs attested ${expectedHex.slice(0, 16)}…`,
         ),
       );
     }

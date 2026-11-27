@@ -15,19 +15,22 @@
 //   9. program-level simulations never run on a pending deployment
 //
 // The program accounts are mocked at the RPC boundary (getAccountInfo /
-// getBalance / requestAirdrop / getSlot / getBlock); the ProtocolConfig
-// bytes are synthetic but byte-exact against the SDK borsh layout, so the
-// decoders run for real.
+// getBalance / requestAirdrop / getSlot); the mock also serves the
+// canonical SlotHashes sysvar — the source the verifier harness reads
+// (finding F1: the harness never resolves hashes via getBlock). The
+// ProtocolConfig bytes are synthetic but byte-exact against the SDK
+// borsh layout, so the decoders run for real.
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SYSVAR_SLOT_HASHES_PUBKEY } from "@solana/web3.js";
 import {
   AccountDisc,
   decodeScannerProtocolConfig,
   decodeVaultProtocolConfig,
   scannerProtocolConfigPda,
   vaultProtocolConfigPda,
+  SYSVAR_PROGRAM_ID,
 } from "@graveyield/sdk";
 
 import {
@@ -67,9 +70,28 @@ interface MockState {
   airdropCalls: string[];
 }
 
+/**
+ * Minimal valid SlotHashes sysvar snapshot (u64 LE count, then 40-byte
+ * (slot, hash) entries newest-first) whose newest entry matches the
+ * mock's getSlot(). Every real cluster serves this sysvar, and the
+ * verifier harness resolves slot hashes from it — never from getBlock.
+ */
+function slotHashesSysvarAccount(): MockAccount {
+  const count = 8;
+  const data = Buffer.alloc(8 + count * 40);
+  data.writeBigUInt64LE(BigInt(count), 0);
+  for (let i = 0; i < count; i++) {
+    const base = 8 + i * 40;
+    data.writeBigUInt64LE(BigInt(1_000_000 - i), base);
+    for (let j = 0; j < 32; j++) data[base + 8 + j] = (1_000_000 - i + j * 31) & 0xff;
+  }
+  return { owner: SYSVAR_PROGRAM_ID, executable: false, data };
+}
+
 function mockRpc(state: MockState): Connection {
   return {
     async getAccountInfo(addr: PublicKey) {
+      if (addr.equals(SYSVAR_SLOT_HASHES_PUBKEY)) return slotHashesSysvarAccount();
       return state.accounts.get(addr.toBase58()) ?? null;
     },
     async getBalance(addr: PublicKey) {
