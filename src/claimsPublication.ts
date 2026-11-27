@@ -476,6 +476,15 @@ export async function runClaimsPublicationSequence(opts: {
   const executed: ClaimsPublicationStep[] = [];
   const artifactBytes = input.artifactBytes;
 
+  // D4 review: source identity is REQUIRED before any network write. A
+  // publication that cannot name the exact commit it publishes from is
+  // refused — "notrack" (or any non-SHA) never reaches draft creation.
+  if (!/^[0-9a-f]{40}$/.test(input.sourceCommit)) {
+    throw new ClaimsPublicationError(
+      `sourceCommit must be a real 40-hex Git commit SHA for publication (got ${JSON.stringify(input.sourceCommit)}) — resolve and validate the commit before publishing`,
+    );
+  }
+
   // Identify the previous last-known-good pointer FIRST (rollback ref).
   const previousRefSha = await store.stableRefSha();
   let previous: ClaimsSequenceResult["previous"] = null;
@@ -597,6 +606,12 @@ export async function runClaimsPublicationSequence(opts: {
   }
 
   // ── 7. activate-stable-reference (ONE atomic pointer move) ──────────────
+  // D4 review: ANY failure at or after activation automatically restores
+  // the previous known-good reference; ambiguous failures are handled
+  // conservatively and an unrestorable state is reported as an explicit
+  // terminal "unverified" outcome — never silently.
+  let activated = false;
+  try {
   const { pointer, pointerJson } = buildClaimsPointer({
     versionedTag: tag,
     sourceCommit: input.sourceCommit,
@@ -648,6 +663,29 @@ export async function runClaimsPublicationSequence(opts: {
     throw new ClaimsPublicationError("the stable artifact's identity does not match its pointer");
   }
   executed.push("verify-stable-reference");
+  activated = true;
+  } catch (activationErr) {
+    const outcome = await rollbackClaimsStableReference({
+      store,
+      previous,
+      activatedTag: tag,
+    }).catch((rbErr: unknown) => {
+      // Ambiguous/failed rollback attempt itself: handled conservatively —
+      // this is an explicit TERMINAL UNVERIFIED state.
+      throw new ClaimsPublicationError(
+        `publication failed after stable-reference activation (${activationErr instanceof Error ? activationErr.message : String(activationErr)}); rollback could NOT be attempted or completed (${rbErr instanceof Error ? rbErr.message : String(rbErr)}) — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
+      );
+    });
+    const detail = activationErr instanceof Error ? activationErr.message : String(activationErr);
+    if (outcome === "unverified") {
+      throw new ClaimsPublicationError(
+        `publication failed after stable-reference activation (${detail}); rollback could NOT be verified — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
+      );
+    }
+    throw new ClaimsPublicationError(
+      `publication failed after stable-reference activation (${detail}); rollback ${outcome === "restored" ? "RESTORED" : "removed the first-publication reference for"} the previous known-good pointer and the restoration was verified by read-back`,
+    );
+  }
 
   return { executed, activatedTag: tag, previous, artifactSha256, artifactByteLength };
 }

@@ -104,6 +104,8 @@ export interface ClaimsArtifact {
   };
 }
 
+const U64_MAX = (1n << 64n) - 1n;
+
 const U64_KEYS = new Set([
   "snapshot_slot",
   "lp_total_supply_at_snapshot",
@@ -124,6 +126,10 @@ const U64_KEYS = new Set([
 
 /** Exact-integer parse of a claims artifact (see module doc). */
 export function parseClaimsArtifact(text: string): ClaimsArtifact {
+  // D4 review: full u64 domain enforcement on EVERY serialized u64 field —
+  // negatives refused, values above 2^64-1 refused, imprecise magnitudes
+  // refused. Arithmetic consistency downstream is never relied on for
+  // range safety.
   const reviver = (
     key: string,
     value: unknown,
@@ -131,10 +137,18 @@ export function parseClaimsArtifact(text: string): ClaimsArtifact {
   ): unknown => {
     if (U64_KEYS.has(key) && typeof value === "number") {
       const source = context?.source;
-      if (typeof source === "string" && /^\d+$/.test(source)) return BigInt(source);
-      if (!Number.isSafeInteger(value)) {
+      if (typeof source === "string" && /^\d+$/.test(source)) {
+        const exact = BigInt(source);
+        if (exact > U64_MAX) {
+          throw new ClaimsArtifactError(
+            `field "${key}" value ${source} is outside the u64 range (0 … 2^64-1)`,
+          );
+        }
+        return exact;
+      }
+      if (value < 0 || !Number.isSafeInteger(value)) {
         throw new ClaimsArtifactError(
-          `field "${key}" exceeded exact-integer parse capability — refusing an imprecise artifact`,
+          `field "${key}" is not a non-negative in-range integer (negative, rounded, or beyond exact-integer parse capability)`,
         );
       }
       return BigInt(value);

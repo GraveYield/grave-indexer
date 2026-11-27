@@ -1,0 +1,76 @@
+# Claims-artifact publication — DEDICATED workflow (D4).
+# Logically separate from publish-console-snapshot.yml (ConsoleSnapshotV2
+# pool-discovery): own stable ref (claims-artifact-prod), own pointer
+# schema, own asset namespace. Implements the draft-first lifecycle from
+# grave-indexer docs/CLAIMS_PUBLICATION.md via src/claimsPublishCli.ts:
+# validate → digest → draft release → upload → read-back verification →
+# immutable publish → ONE atomic stable-ref move → post-activation
+# verification, with automatic verified rollback of the previous
+# known-good pointer on any post-activation failure.
+name: publish-claims-artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_path:
+        description: "Path to the D3 claims artifact (claims-artifact.json)"
+        required: true
+      source_commit:
+        description: "The protocol commit the artifact was produced from (40-hex)"
+        required: true
+      producer_identity:
+        description: "Producer identity (e.g. grave-snapshotter-cli)"
+        required: true
+      producer_version:
+        description: "Producer version/commit tag"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish-claims-artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build vendored SDK
+        run: pnpm run build:sdk
+
+      - name: Verify the artifact bundle BEFORE any network write
+        run: |
+          node --import tsx -e "
+            const { verifyClaimsArtifactBytes } = await import('./src/claimsArtifact.js');
+            const fs = await import('node:fs');
+            const bytes = fs.readFileSync(process.argv[1]);
+            const v = verifyClaimsArtifactBytes(bytes);
+            console.log('claims-grade artifact verified:', v.rootHex.slice(0, 16) + '…', 'slot', v.snapshotSlot);
+          " "\${{ inputs.artifact_path }}"
+
+      - name: Publish (draft-first, immutable, stable-pointer promotion)
+        env:
+          GY_CLAIMS_GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pnpm run claims:publish -- \
+            --repo "\${{ github.repository }}" \
+            --artifact "\${{ inputs.artifact_path }}" \
+            --source-commit "\${{ inputs.source_commit }}" \
+            --producer-identity "\${{ inputs.producer_identity }}" \
+            --producer-version "\${{ inputs.producer_version }}"
+
+      - name: Report
+        if: always()
+        run: echo "claims publication job finished (status: ${{ job.status }})"
