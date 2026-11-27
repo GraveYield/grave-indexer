@@ -58,19 +58,19 @@ jobs:
             const bytes = fs.readFileSync(process.argv[1]);
             const v = verifyClaimsArtifactBytes(bytes);
             console.log('claims-grade artifact verified:', v.rootHex.slice(0, 16) + '…', 'slot', v.snapshotSlot);
-          " "\${{ inputs.artifact_path }}"
+          " "${{ inputs.artifact_path }}"
 
       - name: Publish (draft-first, immutable, stable-pointer promotion)
         env:
-          GY_CLAIMS_GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
+          GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           pnpm run claims:publish -- \
-            --repo "\${{ github.repository }}" \
-            --artifact "\${{ inputs.artifact_path }}" \
-            --source-commit "\${{ inputs.source_commit }}" \
-            --producer-identity "\${{ inputs.producer_identity }}" \
-            --producer-version "\${{ inputs.producer_version }}"
+            --repo "${{ github.repository }}" \
+            --artifact "${{ inputs.artifact_path }}" \
+            --source-commit "${{ inputs.source_commit }}" \
+            --producer-identity "${{ inputs.producer_identity }}" \
+            --producer-version "${{ inputs.producer_version }}"
 
       - name: Report
         if: always()
-        run: echo "claims publication job finished (status: ${{ job.status }})"
+        run: 'echo "claims publication job finished (status: ${{ job.status }})"'
