@@ -264,6 +264,72 @@ describe("evidence verifier — rejection matrix", () => {
     assert.equal(result.firstFailure?.id, "ATTESTATION_SLOT_HASH");
   });
 
+  test("standalone resolver: structurally invalid SlotHashes sysvar → fail-closed rejection, never indeterminate, no retries burned", async () => {
+    const { oracle } = await makeBundle();
+    const issuedSlot = NOW_SLOT - 100; // within the freshness window → hash resolution runs
+    const { bundle } = await makeBundle({ issuedSlot, slotHash: mockBlockhash(issuedSlot), signer: oracle });
+    // Malformed sysvar body: header claims 8 entries but only 3 are
+    // serialized — the SDK parser rejects the length mismatch. The
+    // DEFAULT (standalone) resolver path runs — no injected
+    // slotHashResolver — and must classify this as a PERMANENT
+    // fail-closed outcome (exactly like an absent slot), not as a
+    // transient RPC outage: one fetch, no retries, check outcome "fail"
+    // (never "indeterminate").
+    const bad = serializeSlotHashes(
+      Array.from({ length: 8 }, (_, i) => ({ slot: NOW_SLOT - i, hash: mockBlockhash(NOW_SLOT - i) })),
+    ).subarray(0, 8 + 3 * 40);
+    let sysvarFetches = 0;
+    const malformedConn = {
+      getSlot: async () => NOW_SLOT,
+      getAccountInfo: async (address: PublicKey) => {
+        if (address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) {
+          sysvarFetches++;
+          return { owner: SYSVAR_PROGRAM_ID, executable: false, data: bad };
+        }
+        return null;
+      },
+    } as unknown as Connection;
+    const result = await verifyEvidenceBundle(malformedConn, "devnet", bundle, {
+      ...baseVerifyOpts(oracle),
+      blockLookupRetries: 8, // retries are enabled — and must NOT fire on malformed data
+    });
+    assert.equal(result.outcome, "rejected");
+    assert.equal(result.firstFailure?.id, "ATTESTATION_SLOT_HASH");
+    const slotHashCheck = result.checks.find((c) => c.id === "ATTESTATION_SLOT_HASH")!;
+    assert.equal(slotHashCheck.outcome, "fail", "malformed sysvar data is fail-closed, not indeterminate");
+    assert.equal(sysvarFetches, 1, "no retry may burn on data no retry can repair");
+  });
+
+  test("standalone resolver: genuine RPC failure → bounded retries preserved, then an indeterminate check (not a stale/fail-closed verdict)", async () => {
+    const { oracle } = await makeBundle();
+    const issuedSlot = NOW_SLOT - 100;
+    const { bundle } = await makeBundle({ issuedSlot, slotHash: mockBlockhash(issuedSlot), signer: oracle });
+    let sysvarFetches = 0;
+    const rpcDownConn = {
+      getSlot: async () => NOW_SLOT,
+      getAccountInfo: async (address: PublicKey) => {
+        if (address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) {
+          sysvarFetches++;
+          throw new Error("mock: connection reset by peer");
+        }
+        return null;
+      },
+    } as unknown as Connection;
+    const retries = 3;
+    const result = await verifyEvidenceBundle(rpcDownConn, "devnet", bundle, {
+      ...baseVerifyOpts(oracle),
+      blockLookupRetries: retries,
+    });
+    assert.equal(
+      sysvarFetches,
+      retries + 1,
+      "genuine RPC failures keep the bounded retry policy (attempts = retries + 1)",
+    );
+    const slotHashCheck = result.checks.find((c) => c.id === "ATTESTATION_SLOT_HASH")!;
+    assert.equal(slotHashCheck.outcome, "indeterminate", "exhausted transient RPC failures stay indeterminate");
+    assert.match(slotHashCheck.detail ?? "", /indeterminate, not stale/);
+  });
+
   test("replayed evidence → rejected at ATTESTATION_REPLAY on second observation", async () => {
     const { oracle, bundle } = await makeBundle();
     const journal = new ReplayJournal(null);

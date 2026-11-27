@@ -30,6 +30,7 @@ import {
   fetchScannerProtocolConfig,
   fetchSlotHash,
   scannerProtocolConfigPda,
+  SlotHashesAccountInvalidError,
 } from "@graveyield/sdk";
 import {
   parseEvidenceBundle,
@@ -144,6 +145,15 @@ function check(
  * skipped — exactly the on-chain 6029 fail-closed outcome) or the
  * sysvar data fails strict validation; "indeterminate" only after
  * transient RPC failures exhaust the retries.
+ *
+ * Classification is explicit and matches the documented semantics:
+ * structurally invalid sysvar data is a PERMANENT fail-closed outcome
+ * (`{ hash: null, indeterminate: false }`) — the current pinned SDK
+ * converts `SlotHashesAccountInvalidError` to `null` inside
+ * `fetchSlotHash`, and the resolver additionally classifies the error
+ * directly should it ever surface from that layer, so the malformed
+ * path can never be misreported as an indeterminate RPC outage and
+ * never burns retries on data that no retry can repair.
  */
 async function resolveSlotHash(
   connection: Connection,
@@ -158,7 +168,14 @@ async function resolveSlotHash(
       // failed strict validation — both are the on-chain fail-closed
       // outcome, not an RPC problem. No retry changes this.
       return { hash: null, indeterminate: false };
-    } catch {
+    } catch (err) {
+      if (err instanceof SlotHashesAccountInvalidError) {
+        // Structurally invalid sysvar data — a permanent fail-closed
+        // outcome, never transient. Retrying cannot repair the bytes;
+        // misreporting it as indeterminate would contradict the
+        // documented semantics above.
+        return { hash: null, indeterminate: false };
+      }
       // RPC hiccup: retry, then report indeterminate below.
     }
   }
