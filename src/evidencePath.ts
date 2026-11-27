@@ -80,10 +80,10 @@ import {
   buildLaunchPriceEd25519VerifyInstruction,
   decodeGraveYieldError,
   decodeGraveYieldErrorCode,
-  fetchRecentSlotHash,
   fetchScannerProtocolConfig,
   fetchSlotHashesSnapshot,
   scannerProtocolConfigPda,
+  SlotHashesAccountInvalidError,
   ATTESTATION_MSG_LEN,
   LAUNCH_PRICE_MSG_OFFSET,
   type DecodedGraveYieldError,
@@ -479,47 +479,65 @@ async function runVerifierLevelCases(ctx: {
   const nowSlot = Number(await connection.getSlot());
 
   // Canonical slot-hash resolution: ONE validated SlotHashes sysvar
-  // snapshot shared by the whole matrix — the same single-parser SDK
-  // reader the issuers use (`fetchSlotHashesSnapshot` /
-  // `fetchRecentSlotHash`). The resolver deliberately does NOT use
-  // `getBlock(slot).blockhash`: on agave 3.x that value is not the
-  // SlotHashes entry for the slot (lifecycle-rehearsal finding F1), so a
-  // getBlock-based mirror would disagree with the on-chain 6030 check
-  // the verifier mirrors.
-  let snapshot: SlotHashEntry[] | null = null;
-  let snapshotFailed = false;
+  // snapshot fetched EXACTLY ONCE per verifier-level run — the same
+  // single-parser SDK reader the issuers use (`fetchSlotHashesSnapshot`).
+  // BOTH the recent (slot, hash) issuance pair AND every resolver lookup
+  // derive from that single in-memory snapshot, so issuance and
+  // verification provably share the same snapshot and no second
+  // SlotHashes RPC read can occur (regression-tested in
+  // test/evidencePathSnapshot.test.ts). The resolver deliberately does
+  // NOT use `getBlock(slot).blockhash`: on agave 3.x that value is not
+  // the SlotHashes entry for the slot (lifecycle-rehearsal finding F1),
+  // so a getBlock-based mirror would disagree with the on-chain 6030
+  // check the verifier mirrors.
+  type SnapshotOutcome =
+    | { kind: "ok"; entries: SlotHashEntry[] }
+    | { kind: "sysvar-missing" }
+    | { kind: "sysvar-invalid"; reason: string }
+    | { kind: "rpc-failure"; message: string };
+  let outcome: SnapshotOutcome;
+  try {
+    const entries = await fetchSlotHashesSnapshot(connection);
+    outcome = entries ? { kind: "ok", entries } : { kind: "sysvar-missing" };
+  } catch (err) {
+    if (err instanceof SlotHashesAccountInvalidError) {
+      // Structurally invalid sysvar — fail closed, carrying the parser's
+      // structured detail (never repaired, never substituted).
+      outcome = { kind: "sysvar-invalid", reason: err.message };
+    } else {
+      // Genuine RPC failure on the initial fetch — classified EXPLICITLY
+      // as an infrastructure outcome. It is never swallowed, never
+      // misreported as a stale-evidence rejection, and never silently
+      // converted into "valid evidence available".
+      outcome = {
+        kind: "rpc-failure",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  // In-memory resolver: reads ONLY the single snapshot fetched above.
+  // Performs no RPC reads of any kind — every lookup is a find over the
+  // already-validated entries. `indeterminate` stays false here by
+  // design: a successfully fetched snapshot is deterministic in-memory
+  // state, and the not-ok paths are handled explicitly below (they never
+  // reach bundle construction).
+  const okEntries = outcome.kind === "ok" ? outcome.entries : null;
   const memoResolver = async (
     slot: number,
   ): Promise<{ hash: Uint8Array | null; indeterminate: boolean }> => {
-    if (!snapshot && !snapshotFailed) {
-      try {
-        snapshot = await fetchSlotHashesSnapshot(connection);
-      } catch {
-        // Genuine RPC failure — indeterminate, never a stale verdict.
-        snapshotFailed = true;
-      }
-    }
-    if (snapshotFailed) return { hash: null, indeterminate: true };
-    if (!snapshot) return { hash: null, indeterminate: false }; // sysvar absent — fail closed
-    const found = snapshot.find((e) => e.slot === slot);
+    if (!okEntries) return { hash: null, indeterminate: false }; // fail closed
+    const found = okEntries.find((e) => e.slot === slot);
     return { hash: found ? found.hash : null, indeterminate: false };
   };
 
-  // Issuance slot: a REAL recent (slot, hash) pair taken from ONE
-  // validated SlotHashes sysvar snapshot — never a slot manufactured by
-  // `getSlot()` arithmetic (slots can be skipped) and never a getBlock
-  // blockhash. This is the SDK's canonical pairing contract; the
-  // "canonical bundle" case below must itself be canonical evidence.
-  const recent = await fetchRecentSlotHash(connection);
-  if (!recent) {
-    // Cannot resolve any real sysvar entry — verifier cases needing hash
-    // context are skipped rather than mis-reported.
+  const unavailableVerifierCases = (detail: string): EvidencePathCaseReport[] => {
     const skipCase = (id: string, description: string): EvidencePathCaseReport => ({
       caseId: id,
       layer: "verifier-live",
-      description: `${description} — SKIPPED: no valid SlotHashes sysvar entry available (sysvar absent/invalid or RPC failure).`,
+      description: `${description} — SKIPPED: ${detail}.`,
       expectation: { result: "reject" },
-      observed: { note: "skipped — SlotHashes sysvar unavailable" },
+      observed: { note: `skipped — ${detail}` },
       pass: true,
       skipped: true,
     });
@@ -531,6 +549,63 @@ async function runVerifierLevelCases(ctx: {
       skipCase("slot-hash-mismatch", "Verifier rejects a wrong slot hash"),
       skipCase("replayed-evidence", "Journal rejects replayed identical evidence"),
     ];
+  };
+
+  if (outcome.kind === "rpc-failure") {
+    // Genuine transient RPC failure on the initial snapshot fetch: report
+    // the verifier cases as an explicit INDETERMINATE infrastructure
+    // failure — NOT a skip-as-pass, NOT stale evidence. `allPass` flips
+    // false so the smoke fails loudly until RPC access is restored.
+    const rpcMessage = outcome.message;
+    const indeterminateCase = (id: string, description: string): EvidencePathCaseReport => ({
+      caseId: id,
+      layer: "verifier-live",
+      description: `${description} — INDETERMINATE: genuine RPC failure while reading the canonical SlotHashes sysvar (infrastructure error — not a stale-evidence rejection and not a pass; rerun the smoke once RPC access is restored).`,
+      expectation: { result: "reject" },
+      observed: { note: `indeterminate — SlotHashes sysvar RPC failure: ${rpcMessage}` },
+      pass: false,
+    });
+    return [
+      indeterminateCase("canonical-bundle-verifier", "Verifier-level canonical bundle (oracle-gated)"),
+      indeterminateCase("tampered-binding", "Verifier rejects a bundle whose binding was tampered"),
+      indeterminateCase("future-timestamp", "Verifier rejects a future last-swap timestamp"),
+      indeterminateCase("stale-slot", "Verifier rejects a bundle issued far outside the SlotHashes window"),
+      indeterminateCase("slot-hash-mismatch", "Verifier rejects a wrong slot hash"),
+      indeterminateCase("replayed-evidence", "Journal rejects replayed identical evidence"),
+    ];
+  }
+  if (outcome.kind === "sysvar-missing") {
+    // Missing canonical data: explicit fail-closed skip for the verifier
+    // cases that require a valid evidence pair (never misreported as an
+    // infrastructure failure and never silently run with manufactured
+    // evidence).
+    return unavailableVerifierCases(
+      "canonical SlotHashes sysvar account not found on this cluster — fail-closed: no evidence pair can be issued",
+    );
+  }
+  if (outcome.kind === "sysvar-invalid") {
+    // Structurally invalid canonical data: explicit fail-closed skip with
+    // the structured detail surfaced.
+    const reason = outcome.reason;
+    return unavailableVerifierCases(
+      `canonical SlotHashes sysvar structurally invalid — fail-closed: ${reason}`,
+    );
+  }
+
+  // Issuance pair: derived DIRECTLY from the same validated snapshot
+  // (newest entry — identical selection semantics to the SDK's
+  // `fetchRecentSlotHash`, whose SEPARATE sysvar fetch this replaces).
+  // Never a slot manufactured by `getSlot()` arithmetic (slots can be
+  // skipped) and never a getBlock blockhash. This is the SDK's canonical
+  // pairing contract; the "canonical bundle" case below must itself be
+  // canonical evidence from the SAME snapshot the resolver serves.
+  const recent: SlotHashEntry | null = outcome.entries[0] ?? null;
+  if (!recent) {
+    // The snapshot read succeeded but contains zero entries — no evidence
+    // pair exists yet; fail closed exactly like a missing sysvar.
+    return unavailableVerifierCases(
+      "canonical SlotHashes sysvar is present but contains no entries — fail-closed: no evidence pair can be issued",
+    );
   }
   const issuedSlot = recent.slot;
   const slotHash: Uint8Array = recent.hash;
