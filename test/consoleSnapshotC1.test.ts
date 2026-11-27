@@ -281,8 +281,25 @@ class VerificationRpc {
 
 /** getProgramAccounts transport fake (same shape as ingest.test.ts): the
  *  discovery enumeration sees one WSOL-supported pool per requested
- *  address, carrying the synthetic 160-byte identity slice. */
+ *  address. The identity slice carries the REAL fixture pool's VAULTS
+ *  (bytes 336..367 / 368..399 of the real 752-byte AmmInfo — the exact
+ *  accounts the swap fixture's token balances corroborate against, and
+ *  the same accounts the SDK derivation reads on-chain) with an
+ *  M1-oriented mint layout (coin_mint synthetic non-WSOL, pc_mint WSOL):
+ *  in production discovery and derivation read the SAME account, and the
+ *  vault passthrough (Option 2) relies on that identity matching. The
+ *  pure synthetic slice would contradict the fixture's real vault
+ *  corroboration; the REAL slice alone would fail the D-01 quote-side
+ *  gate (the fixture pool is SOL/USDC — WSOL on coin side). The
+ *  classifier keys on the vault ADDRESSES only (raydiumV4Evidence.ts),
+ *  so this combination is self-consistent for every stage under test. */
 function gpaFetch(pools: PublicKey[]): typeof fetch {
+  const real = poolAccountBytes();
+  const slice = new Uint8Array(160);
+  slice.set(real.slice(336, 336 + 160)); // real vaults + mints + lp_mint
+  slice.set(synth(0x13).toBytes(), 64); // coin_mint → synthetic non-WSOL
+  slice.set(WSOL_MINT.toBytes(), 96); // pc_mint → WSOL (M1 quote side)
+  const sliceBase64 = Buffer.from(slice).toString("base64");
   return (async () =>
     new Response(
       JSON.stringify({
@@ -291,7 +308,7 @@ function gpaFetch(pools: PublicKey[]): typeof fetch {
         result: pools.map((p) => ({
           pubkey: p.toBase58(),
           account: {
-            data: [Buffer.from(buildAmmInfoSlice()).toString("base64"), "base64"],
+            data: [sliceBase64, "base64"],
             owner: RAYDIUM_V4_PROGRAM_ID.toBase58(),
           },
         })),
@@ -309,6 +326,7 @@ function snapshotConfig(dataDir: string): PipelineConfig {
     vaultProgramId: DEVNET_VAULT_PROGRAM_ID,
     maxPoolsPerScan: 10,
     signatureScanLimit: 50,
+    enrichConcurrency: 4,
     discoveryStalenessSlots: 400,
     evidenceFreshnessSlots: 450,
     dataDir,

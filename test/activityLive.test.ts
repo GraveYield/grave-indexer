@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { PublicKey, VersionedTransaction, type AccountInfo, type Connection } from "@solana/web3.js";
+import { PublicKey, SYSVAR_SLOT_HASHES_PUBKEY, VersionedTransaction, type AccountInfo, type Connection } from "@solana/web3.js";
 
 import { RAYDIUM_V4_PROGRAM_ID } from "@graveyield/sdk";
 
@@ -863,9 +863,24 @@ class FakeDevnetRpc {
     this.calls.push(`getBlock:${slot}`);
     return { blockhash: "11111111111111111111111111111111" };
   }
-  async getAccountInfo(_address: PublicKey): Promise<AccountInfo<Uint8Array> | null> {
+  async getAccountInfo(address: PublicKey): Promise<AccountInfo<Uint8Array> | null> {
     this.calls.push("getAccountInfo");
-    return null;
+    // SDK (merged protocol PR #116) resolves slot hashes from the canonical
+    // SlotHashes sysvar via getAccountInfo — no longer getBlock(). Serve a
+    // minimal valid sysvar snapshot whose NEWEST entry is exactly the slot
+    // this fake's getSlot() arithmetic produces (1_000_000 - 4 = 999_996),
+    // so issue.ts's (issuedSlot, slotHash) pair is resolvable the same way
+    // a real destination cluster resolves it. Other accounts stay null.
+    if (!address.equals(SYSVAR_SLOT_HASHES_PUBKEY)) return null;
+    const slot = 999_996n;
+    const hash = new Uint8Array(32).fill(0xab);
+    const data = new Uint8Array(8 + 40);
+    const view = new DataView(data.buffer);
+    view.setBigUint64(0, 1n, true); // entry count
+    view.setBigUint64(8, slot, true); // newest (only) entry: slot
+    data.set(hash, 16); // newest entry: 32-byte hash
+    const account = { lamports: 0, owner: new PublicKey("Sysvar1111111111111111111111111111111111111"), executable: false, rentEpoch: 0n, data };
+    return account as unknown as AccountInfo<Uint8Array>;
   }
 }
 
@@ -878,6 +893,7 @@ function collectConfig(dataDir: string): PipelineConfig {
     vaultProgramId: DEVNET_VAULT_PROGRAM_ID,
     maxPoolsPerScan: 10,
     signatureScanLimit: 50,
+    enrichConcurrency: 4,
     discoveryStalenessSlots: 400,
     evidenceFreshnessSlots: 450,
     dataDir,
@@ -951,5 +967,76 @@ describe("Correction 002 — collect path attestation gating (end-to-end)", () =
       assert.equal(readdirSync(join(dataDir, "evidence")).length, 0, "no bundle without a verified anchor");
       assert.equal(devnet.calls.length, 0);
     });
+  });
+});
+
+// ─── Option 2 — vault passthrough (Part 1 item A) ────────────────────────
+
+/** Instrumented fake: counts the AmmInfo fetches the SDK performs. */
+class CountingRpc extends FakeRpc {
+  accountInfoCalls = 0;
+  override async getAccountInfo(address: PublicKey): Promise<AccountInfo<Uint8Array> | null> {
+    this.accountInfoCalls++;
+    return super.getAccountInfo(address);
+  }
+}
+
+describe("ActivityIndexerLive — vault passthrough (Option 2)", () => {
+  test("baseline parity: without vaults the SDK fetches the AmmInfo itself and verifies", async () => {
+    const rpc = new CountingRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), slot: swapV2Outer.slot, blockTime: 1_700_000_100 },
+    ]);
+    const evidence = await indexer().indexActivity(rpc.asConnection(), POOL, { scanLimit: 50 });
+    assert.equal(evidence.evidenceStatus, "verified");
+    assert.ok(rpc.accountInfoCalls >= 1, "baseline must fetch the pool account");
+  });
+
+  test("KNOWN vaults skip the redundant AmmInfo fetch with an IDENTICAL anchor", async () => {
+    const withFetch = new CountingRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), slot: swapV2Outer.slot, blockTime: 1_700_000_100 },
+    ]);
+    const baseline = await indexer().indexActivity(withFetch.asConnection(), POOL, { scanLimit: 50 });
+
+    const passthrough = new CountingRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), slot: swapV2Outer.slot, blockTime: 1_700_000_100 },
+    ]);
+    const evidence = await indexer().indexActivity(passthrough.asConnection(), POOL, {
+      scanLimit: 50,
+      coinVault: COIN_VAULT,
+      pcVault: PC_VAULT,
+    });
+    assert.equal(passthrough.accountInfoCalls, 0, "no redundant pool fetch when both vaults are known");
+    assert.equal(evidence.evidenceStatus, baseline.evidenceStatus);
+    assert.equal(evidence.lastSwapUnixTs, baseline.lastSwapUnixTs);
+    assert.equal(evidence.lastSwapSlot, baseline.lastSwapSlot);
+    assert.equal(evidence.lastSwapSignature, baseline.lastSwapSignature);
+    assert.equal(evidence.definitive, true);
+  });
+
+  test("WRONG vaults do not bypass validation — corroboration fails closed to incomplete", async () => {
+    const rpc = new CountingRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), slot: swapV2Outer.slot, blockTime: 1_700_000_100 },
+    ]);
+    const wrongA = new PublicKey(new Uint8Array(32).fill(0x77));
+    const wrongB = new PublicKey(new Uint8Array(32).fill(0x78));
+    const evidence = await indexer().indexActivity(rpc.asConnection(), POOL, {
+      scanLimit: 50,
+      coinVault: wrongA,
+      pcVault: wrongB,
+    });
+    assert.equal(evidence.evidenceStatus, "incomplete", "wrong vaults must never yield a verified anchor");
+    assert.equal(evidence.lastSwapUnixTs, 0);
+  });
+
+  test("a SINGLE vault does not suppress the authoritative fetch (both-or-neither)", async () => {
+    const rpc = new CountingRpc([
+      { signature: swapV2Outer.signature, response: responseFrom(swapV2Outer), slot: swapV2Outer.slot, blockTime: 1_700_000_100 },
+    ]);
+    const evidence = await indexer().indexActivity(rpc.asConnection(), POOL, {
+      scanLimit: 50,
+      coinVault: COIN_VAULT,
+    });
+    assert.ok(rpc.accountInfoCalls >= 1, "partial vault knowledge still fetches the on-chain pair");
+    assert.equal(evidence.evidenceStatus, "verified");
   });
 });

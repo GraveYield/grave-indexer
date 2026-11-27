@@ -44,7 +44,7 @@ import {
 import { DEVNET_SCANNER_PROGRAM_ID, DEVNET_VAULT_PROGRAM_ID, type PipelineConfig } from "../src/config.js";
 import { buildAmmInfoSlice, synth } from "./fixtures.js";
 
-// ─── Seams ───────────────────────────────────────────────────────────────────
+// ─── Seams ───────────────────────────────────────────────────────────
 
 function protocolConfigBytes(): Uint8Array {
   // Exact layout from test/consoleSnapshotC1.test.ts (real Anchor shape):
@@ -165,6 +165,7 @@ function snapshotConfig(dataDir: string): PipelineConfig {
     vaultProgramId: DEVNET_VAULT_PROGRAM_ID,
     maxPoolsPerScan: 10,
     signatureScanLimit: 50,
+    enrichConcurrency: 4,
     discoveryStalenessSlots: 400,
     evidenceFreshnessSlots: 450,
     dataDir,
@@ -193,7 +194,7 @@ function withEnv<T>(env: Record<string, string>, fn: () => Promise<T>): Promise<
   });
 }
 
-// ─── Command-level RPC filter + completeness ─────────────────────────────────
+// ─── Command-level RPC filter + completeness ─────────────────────────────
 
 describe("cmdConsoleSnapshot — RPC-level M1 filter + completeness safeguards", () => {
   test("the command sends the verified pc_mint@432 WSOL memcmp filter in the RPC request", async () => {
@@ -298,7 +299,7 @@ describe("cmdConsoleSnapshot — RPC-level M1 filter + completeness safeguards",
   });
 });
 
-// ─── Publication staging + independent re-verification ───────────────────────
+// ─── Publication staging + independent re-verification ───────────────
 
 describe("cmdPublishSnapshot / cmdVerifySnapshot — staged publication gate", () => {
   test("a complete run stages artifact + provenance + checksum with accurate integrity", async () => {
@@ -596,5 +597,145 @@ describe("cmdVerifySnapshot — the independent completeness contract (Finding 3
       () => verifyRawArtifactCompleteness({ failures: [{ stage: 42 }], counts: { enriched: 2 } }, prov),
       /completeness evidence: failures\[0\]\.stage is not a non-empty string/,
     );
+  });
+});
+
+// ─── Option 2 continuation: paginated mode work cap + provenance sidecar ──
+
+describe("cmdConsoleSnapshot — paginated mode (--max-pools work cap + discovery-provenance sidecar)", () => {
+  test("the operator cap propagates into paginated discovery, the artifact stays INCOMPLETE, and the page ledger is preserved in the internal sidecar", async () => {
+    await withEnv({ DISCOVERY_PAGINATION_MODE: "paginated-strict" }, async () => {
+      await withTempDataDir(async (dataDir) => {
+        const sliceBase64 = (): string =>
+          Buffer.from(buildAmmInfoSlice()).toString("base64");
+        const accountOf = (seed: number): { pubkey: string; base64: string } => ({
+          pubkey: synth(seed).toBase58(),
+          base64: sliceBase64(),
+        });
+        const BRACKET_SLOT = 424_242;
+        let getSlotCalls = 0;
+        const fetchImpl = (async (_url: string | URL, init?: { body?: string }) => {
+          const body = JSON.parse(String(init?.body)) as {
+            method: string;
+            params: [string, Record<string, unknown>];
+          };
+          if (body.method === "getSlot") {
+            getSlotCalls++;
+            return new Response(JSON.stringify({ jsonrpc: "2.0", id: 1, result: BRACKET_SLOT }), { status: 200 });
+          }
+          assert.equal(body.method, "getProgramAccountsV2");
+          const cfg = body.params[1]!;
+          // Capability probe: limit 1, withContext true.
+          if (Number(cfg.limit) === 1) {
+            return new Response(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  context: { slot: 899, apiVersion: "0.0.0" },
+                  value: { accounts: [{ pubkey: accountOf(0x60).pubkey, account: { data: [accountOf(0x60).base64, "base64"] } }], paginationKey: "page-1" },
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          const cursor = (cfg.paginationKey as string | undefined) ?? null;
+          const page0 = {
+            accounts: [accountOf(0x60), accountOf(0x61)],
+            nextCursor: "page-1",
+            contextSlot: 900,
+          };
+          const page1 = {
+            accounts: [accountOf(0x62)],
+            nextCursor: null,
+            contextSlot: 901,
+          };
+          const page = cursor === null ? page0 : page1;
+          return new Response(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              result: {
+                context: { slot: page.contextSlot, apiVersion: "0.0.0" },
+                value: {
+                  accounts: page.accounts.map((a) => ({ pubkey: a.pubkey, account: { data: [a.base64, "base64"] } })),
+                  paginationKey: page.nextCursor,
+                },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }) as unknown as typeof fetch;
+
+        const code = await cmdConsoleSnapshot(snapshotConfig(dataDir), {
+          maxPools: 2,
+          enrich: 10,
+          maxAgeHours: 24,
+          discoveryConnection: new DiscoveryRpc().asConnection(),
+          verificationConnection: new VerificationRpc().asConnection(),
+          discoveryFetchImpl: fetchImpl,
+        });
+        assert.equal(code, 1, "a cap-stopped paginated run must never exit zero");
+
+        // BOTH completeness records: the specific paginated verdict AND the
+        // operator cap message naming --max-pools.
+        const raw = JSON.parse(readFileSync(join(dataDir, "console-snapshot.json"), "utf8")) as {
+          counts: { parsedPools: number };
+          failures: Array<{ stage: string; reason: string }>;
+        };
+        const capFailures = raw.failures.filter((f) => f.stage === "discovery-completeness");
+        assert.equal(capFailures.length, 2);
+        assert.ok(capFailures.some((f) => f.reason.includes("paginated discovery completeness: operator-cap-reached")));
+        assert.ok(capFailures.some((f) => f.reason.includes("--max-pools cap (2)")));
+        assert.ok(capFailures.some((f) => f.reason.includes("NOT fully enumerated")));
+        assert.equal(raw.counts.parsedPools, 2, "never parsed beyond the cap");
+        // The artifact itself stays schema-valid (the failures are free-form stages).
+        assert.doesNotThrow(() => parseConsoleSnapshot(raw));
+
+        // The internal sidecar preserves the FULL paginated provenance.
+        const sidecar = JSON.parse(readFileSync(join(dataDir, "discovery-provenance.json"), "utf8")) as {
+          schemaVersion: number;
+          kind: string;
+          mode: string;
+          provider: { method: string; endpointKind: string; commitment: string; withContext: boolean };
+          workCap: { maxPools: number; semantics: string };
+          slotBrackets: { lower: number; upper: number; semantics: string };
+          observationWindow: { kind: string; slotMin: number; slotMax: number; commitment: string };
+          completeness: { status: string; provablyComplete: boolean };
+          accounting: { parsedPools: number; pageRequests: number; rawAccounts: number };
+          pageLedger: Array<{ pageIndex: number; receivedCount: number; contextSlot: number | null; cursorSent: string | null; nextCursor: string | null }>;
+        };
+        assert.equal(sidecar.schemaVersion, 1);
+        assert.equal(sidecar.kind, "discovery-provenance-report");
+        assert.equal(sidecar.mode, "paginated-strict");
+        assert.equal(sidecar.provider.method, "getProgramAccountsV2");
+        assert.equal(sidecar.provider.commitment, "finalized");
+        assert.equal(sidecar.provider.withContext, true);
+        assert.ok(!sidecar.provider.endpointKind.includes("http"), "endpoint KIND only — no URL");
+        assert.equal(sidecar.workCap.maxPools, 2);
+        assert.match(sidecar.workCap.semantics, /parsed-pool-records/);
+        // Slot brackets and observation window are DISTINCT concepts.
+        assert.equal(sidecar.slotBrackets.lower, BRACKET_SLOT);
+        assert.equal(sidecar.slotBrackets.upper, BRACKET_SLOT);
+        assert.equal(sidecar.observationWindow.kind, "bounded-observation-window");
+        assert.deepEqual([sidecar.observationWindow.slotMin, sidecar.observationWindow.slotMax], [900, 901]);
+        assert.notEqual(sidecar.slotBrackets.lower, sidecar.observationWindow.slotMin);
+        // Completeness verdict + accounting + per-page ledger preserved verbatim.
+        assert.equal(sidecar.completeness.status, "operator-cap-reached");
+        assert.equal(sidecar.completeness.provablyComplete, false);
+        assert.equal(sidecar.accounting.parsedPools, 2);
+        assert.equal(sidecar.accounting.pageRequests, 2);
+        assert.equal(sidecar.accounting.rawAccounts, 3);
+        assert.equal(sidecar.pageLedger.length, 2);
+        assert.deepEqual(sidecar.pageLedger.map((e) => e.receivedCount), [2, 1]);
+        assert.deepEqual(sidecar.pageLedger.map((e) => e.contextSlot), [900, 901]);
+        assert.deepEqual(sidecar.pageLedger.map((e) => e.nextCursor), ["page-1", null]);
+        // Secret-free sidecar: no URL, no api-key material anywhere.
+        const sidecarText = readFileSync(join(dataDir, "discovery-provenance.json"), "utf8");
+        assert.ok(!sidecarText.includes("discovery.invalid"), "the discovery URL must never appear in the sidecar");
+        assert.ok(!sidecarText.includes("api-key"));
+        assert.equal(getSlotCalls, 2, "one opening + one closing bracket getSlot");
+      });
+    });
   });
 });
