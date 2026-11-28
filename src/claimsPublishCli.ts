@@ -22,6 +22,13 @@
 //     [--expected-pool <pool>] [--expected-lp-mint <mint>] [--expected-amm-program-id <id>] \
 //     [--handoff-only]
 //
+// P125-01: the producer repository, trusted branch (main), and workflow
+// path (.github/workflows/claims-snapshot.yml) are PINNED by the handoff
+// module itself — the handoff refuses any producer repo other than
+// GraveYield/graveyield-protocol and verifies branch + workflow identity
+// from GitHub API response data (run head_branch / path / immutable
+// workflow_id), never from caller-supplied metadata alone.
+//
 // `--handoff-only` runs the verification pipeline and exits WITHOUT any
 // publication side effect (used by the workflow's pre-flight step).
 //
@@ -42,6 +49,8 @@ import {
   CLAIMS_PRODUCER_ARTIFACT_NAME,
   DEFAULT_CLAIMS_PRODUCER_REPO,
   PINNED_CLAIMS_PRODUCER_IDENTITY,
+  PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+  PINNED_TRUSTED_PRODUCER_BRANCH,
   fetchVerifiedClaimsArtifact,
   publishVerifiedProducerArtifact,
   type ClaimsProducerExpectations,
@@ -105,6 +114,12 @@ function expectationsFromArgs(args: Args): ClaimsProducerExpectations {
     producerRepo: args.producerRepo,
     producerRunId: args.producerRunId,
     producerWorkflowName: args.producerWorkflowName,
+    // P125-01: the trusted branch and workflow path are set to the
+    // handoff's immutable pins here (NOT flags/env — a dispatch cannot
+    // relax them). The handoff re-verifies both against the pins and
+    // against the GitHub API's authoritative run/workflow records.
+    producerBranch: PINNED_TRUSTED_PRODUCER_BRANCH,
+    producerWorkflowPath: PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
     artifactName: args.artifactName,
     sourceCommit: args.sourceCommit,
     producerIdentity: args.producerIdentity,

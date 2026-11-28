@@ -22,6 +22,10 @@ import { UNCX_RAYDIUM_AMM_V4_LOCKER_PROGRAM_ID } from "../src/claimsArtifact.js"
 import {
   CLAIMS_PRODUCER_ARTIFACT_NAME,
   ClaimsProducerHandoffError,
+  PINNED_CLAIMS_PRODUCER_REPO,
+  PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+  PINNED_TRUSTED_PRODUCER_BRANCH,
+  PINNED_CLAIMS_PRODUCER_IDENTITY,
   fetchVerifiedClaimsArtifact,
   parseProducerRunId,
   publishVerifiedProducerArtifact,
@@ -86,16 +90,21 @@ function validArtifactText(mutate?: (a: Record<string, unknown>) => void): strin
 
 const COMMIT = "a".repeat(40);
 const RUN_ID = 42;
-const WORKFLOW_NAME = "produce-claims-artifact";
+// P125-01: the pinned producer identity is ALSO the workflow display
+// name (claims-snapshot.yml's `name:`); the handoff pins both.
+const WORKFLOW_NAME = PINNED_CLAIMS_PRODUCER_IDENTITY;
+const WORKFLOW_ID = 777;
 
 function expectations(overrides?: Partial<ClaimsProducerExpectations>): ClaimsProducerExpectations {
   return {
-    producerRepo: "o/r",
+    producerRepo: PINNED_CLAIMS_PRODUCER_REPO,
     producerRunId: RUN_ID,
     producerWorkflowName: WORKFLOW_NAME,
+    producerWorkflowPath: PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+    producerBranch: PINNED_TRUSTED_PRODUCER_BRANCH,
     artifactName: CLAIMS_PRODUCER_ARTIFACT_NAME,
     sourceCommit: COMMIT,
-    producerIdentity: "grave-snapshotter-cli",
+    producerIdentity: PINNED_CLAIMS_PRODUCER_IDENTITY,
     expectedPool: POOL.toBase58(),
     ...overrides,
   };
@@ -184,18 +193,36 @@ function mockGithub(opts?: {
   zip?: Uint8Array;
   zipStatus?: number;
   redirect?: boolean;
+  /** The producer repo the mock serves routes for (default: pinned). */
+  repo?: string;
+  /** The workflow record behind the run's workflow_id (null = 404). */
+  workflow?: Record<string, unknown> | null;
 }): { fetchImpl: typeof fetch; requests: Array<{ method: string; path: string }> } {
   const requests: Array<{ method: string; path: string }> = [];
+  const repo = opts?.repo ?? PINNED_CLAIMS_PRODUCER_REPO;
   const zip = opts?.zip ?? buildZip([{ name: CLAIMS_PRODUCER_ARTIFACT_NAME, data: Buffer.from(validArtifactText(), "utf8") }]);
-  const runRecord = opts?.run === null
+  const defaultRun = {
+    name: WORKFLOW_NAME,
+    status: "completed",
+    conclusion: "success",
+    head_sha: COMMIT,
+    head_branch: PINNED_TRUSTED_PRODUCER_BRANCH,
+    path: PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+    workflow_id: WORKFLOW_ID,
+    head_repository: { full_name: repo },
+    repository: { full_name: repo },
+  };
+  // Partial patches OVERRIDE only the given fields (an explicit
+  // `undefined` in the patch erases the field, which the handoff must
+  // treat as missing evidence → fail closed).
+  const runRecord = opts?.run === null ? null : { ...defaultRun, ...(opts?.run ?? {}) };
+  const workflowRecord = opts?.workflow === null
     ? null
-    : (opts?.run ?? {
+    : (opts?.workflow ?? {
+        id: WORKFLOW_ID,
         name: WORKFLOW_NAME,
-        status: "completed",
-        conclusion: "success",
-        head_sha: COMMIT,
-        head_repository: { full_name: "o/r" },
-        repository: { full_name: "o/r" },
+        path: PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+        state: "active_can_be_scheduled",
       });
   const artifacts = opts?.artifacts ?? [
     { id: 9001, name: CLAIMS_PRODUCER_ARTIFACT_NAME, expired: false, size_in_bytes: zip.length },
@@ -209,16 +236,20 @@ function mockGithub(opts?: {
     if (!path.startsWith("/claims-artifact-zip") && (auth === undefined || !auth.startsWith("Bearer "))) {
       return new Response(JSON.stringify({ message: "unauthenticated" }), { status: 401 });
     }
-    if (path === `/repos/o/r/actions/runs/${RUN_ID}`) {
+    if (path === `/repos/${repo}/actions/runs/${RUN_ID}`) {
       if (opts?.runStatus) return new Response(null, { status: opts.runStatus });
       if (runRecord === null) return new Response(null, { status: 404 });
       return new Response(JSON.stringify(runRecord), { status: 200 });
     }
-    if (path === `/repos/o/r/actions/runs/${RUN_ID}/artifacts?per_page=100`) {
+    if (new RegExp(`^/repos/${repo}/actions/workflows/\\d+$`).test(path)) {
+      if (workflowRecord === null) return new Response(null, { status: 404 });
+      return new Response(JSON.stringify(workflowRecord), { status: 200 });
+    }
+    if (path === `/repos/${repo}/actions/runs/${RUN_ID}/artifacts?per_page=100`) {
       if (opts?.artifactsStatus) return new Response(null, { status: opts.artifactsStatus });
       return new Response(JSON.stringify({ total_count: artifacts.length, artifacts }), { status: 200 });
     }
-    if (path === `/repos/o/r/actions/runs/${RUN_ID}/artifacts/9001/zip`) {
+    if (path === `/repos/${repo}/actions/runs/${RUN_ID}/artifacts/9001/zip`) {
       if (opts?.zipStatus) return new Response(null, { status: opts.zipStatus });
       if (opts?.redirect) {
         return new Response(null, { status: 302, headers: { location: "https://blob.example/claims-artifact-zip" } });
@@ -278,8 +309,165 @@ describe("I-06: valid handoff (happy path)", () => {
     assert.ok(requests.length >= 3, "run + artifacts + zip were all requested");
     assert.ok(requests.every((r) => r.method === "GET"), "the handoff performs GET requests ONLY");
     assert.ok(
-      requests.some((r) => r.path === `/repos/o/r/actions/runs/${RUN_ID}`),
+      requests.some((r) => r.path === `/repos/${PINNED_CLAIMS_PRODUCER_REPO}/actions/runs/${RUN_ID}`),
       "the run was resolved from the explicit producer run id",
+    );
+    assert.ok(
+      requests.some((r) => r.path === `/repos/${PINNED_CLAIMS_PRODUCER_REPO}/actions/workflows/${WORKFLOW_ID}`),
+      "the run's immutable workflow identity was resolved via the workflows API (P125-01)",
+    );
+  });
+});
+
+describe("P125-01: producer identity trust boundary — repository, branch, workflow", () => {
+  test("a trusted main-branch run of the pinned producer workflow is accepted (full handoff path)", async () => {
+    // The default mock IS the trusted context: pinned repo, main branch,
+    // pinned workflow path + immutable ID, success, exact head SHA.
+    const { fetchImpl, requests } = mockGithub();
+    const result = await fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl });
+    assert.equal(result.runHeadSha, COMMIT);
+    assert.ok(requests.every((r) => r.method === "GET"), "GETs only");
+  });
+
+  test("a feature-branch run is rejected (UNTRUSTED BRANCH)", async () => {
+    const { fetchImpl } = mockGithub({ run: { head_branch: "feat/lower-commit-fee" } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("UNTRUSTED BRANCH") && e.message.includes("feat/lower-commit-fee"),
+    );
+  });
+
+  test("a fork run (different head repository) is rejected (FORK / UNTRUSTED ORIGIN)", async () => {
+    const { fetchImpl } = mockGithub({ run: { head_repository: { full_name: "attacker/graveyield-protocol-fork" } } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("FORK / UNTRUSTED ORIGIN") && e.message.includes("attacker/graveyield-protocol-fork"),
+    );
+  });
+
+  test("a run with MISSING head repository identity fails closed (no silent trust)", async () => {
+    const { fetchImpl } = mockGithub({ run: { head_repository: null } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("NO usable head repository identity") && e.message.includes("failing closed"),
+    );
+  });
+
+  test("a run living in a different repository is rejected", async () => {
+    const { fetchImpl } = mockGithub({ run: { repository: { full_name: "attacker/evil-repo" } } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("not the pinned producer repository"),
+    );
+  });
+
+  test("a run of a DIFFERENT workflow path is rejected (same display name does not help)", async () => {
+    // Same workflow display name, same branch, same SHA — but the run
+    // belongs to another workflow FILE. Display-name trust is gone.
+    const { fetchImpl } = mockGithub({ run: { path: ".github/workflows/attacker-clone.yml" } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("WRONG WORKFLOW PATH"),
+    );
+  });
+
+  test("a run whose IMMUTABLE workflow ID resolves to a different path is rejected", async () => {
+    const { fetchImpl } = mockGithub({
+      run: { workflow_id: 888 },
+      workflow: { id: 888, name: WORKFLOW_NAME, path: ".github/workflows/attacker-clone.yml", state: "active" },
+    });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("WORKFLOW IDENTITY MISMATCH"),
+    );
+  });
+
+  test("a run with missing workflow path metadata fails closed", async () => {
+    const { fetchImpl } = mockGithub({ run: { path: undefined } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("NO usable workflow path metadata") && e.message.includes("failing closed"),
+    );
+  });
+
+  test("a run with missing immutable workflow_id metadata fails closed", async () => {
+    const { fetchImpl } = mockGithub({ run: { workflow_id: undefined } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("NO usable immutable workflow_id metadata") && e.message.includes("failing closed"),
+    );
+  });
+
+  test("a run whose workflow record cannot be resolved (404) fails closed", async () => {
+    const { fetchImpl } = mockGithub({ workflow: null });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("producer workflow record") && e.message.includes("404"),
+    );
+  });
+
+  test("a disabled producer workflow fails closed", async () => {
+    const { fetchImpl } = mockGithub({
+      workflow: { id: WORKFLOW_ID, name: WORKFLOW_NAME, path: PINNED_CLAIMS_PRODUCER_WORKFLOW_PATH, state: "disabled_manually" },
+    });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("not active") && e.message.includes("failing closed"),
+    );
+  });
+
+  test("a run with missing branch metadata fails closed", async () => {
+    const { fetchImpl } = mockGithub({ run: { head_branch: undefined } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("NO usable head_branch metadata") && e.message.includes("failing closed"),
+    );
+  });
+
+  test("a caller-supplied foreign producer repo is refused BEFORE any network call", async () => {
+    let networkHits = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      networkHits += 1;
+      return new Response(null, { status: 500 });
+    }) as unknown as typeof fetch;
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({
+        token: "t",
+        expectations: expectations({ producerRepo: "attacker/evil" }),
+        fetchImpl,
+      }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("not the pinned producer repository") && e.message.includes("P125-01"),
+    );
+    assert.equal(networkHits, 0, "the pin check precedes every network call");
+  });
+
+  test("caller-supplied foreign branch / path / name expectations are refused BEFORE any network call", async () => {
+    for (const patch of [
+      { producerBranch: "dev" },
+      { producerWorkflowPath: ".github/workflows/attacker-clone.yml" },
+      { producerWorkflowName: "attacker-producer" },
+    ]) {
+      let networkHits = 0;
+      const fetchImpl = (async (): Promise<Response> => {
+        networkHits += 1;
+        return new Response(null, { status: 500 });
+      }) as unknown as typeof fetch;
+      await assert.rejects(
+        fetchVerifiedClaimsArtifact({ token: "t", expectations: expectations(patch), fetchImpl }),
+        /P125-01/,
+        `expectation patch ${JSON.stringify(patch)} must be refused against the pin`,
+      );
+      assert.equal(networkHits, 0, "pin enforcement precedes every network call");
+    }
+  });
+
+  test("a run with a mismatched branch despite trusted repo+workflow is rejected (defense in depth)", async () => {
+    // A run on main's SHA but from a differently-named branch (e.g. a
+    // renamed ref) is still refused: the branch check is independent.
+    const { fetchImpl } = mockGithub({ run: { head_branch: "release-candidate" } });
+    await assert.rejects(
+      fetchVerifiedClaimsArtifact({ ...handoffArgs(), fetchImpl }),
+      (e: ClaimsProducerHandoffError) => e.message.includes("UNTRUSTED BRANCH"),
     );
   });
 });
@@ -495,6 +683,9 @@ describe("I-06: publish composition — invalid cases cause ZERO publication sid
       { label: "unavailable download", mock: mockGithub({ zipStatus: 500 }) },
       { label: "wrong run id", mock: mockGithub({ run: null }) },
       { label: "wrong workflow identity", mock: mockGithub({ run: { name: "attacker-ci", status: "completed", conclusion: "success", head_sha: COMMIT } }) },
+      { label: "feature branch", mock: mockGithub({ run: { head_branch: "feat/x" } }) },
+      { label: "fork origin", mock: mockGithub({ run: { head_repository: { full_name: "attacker/fork" } } }) },
+      { label: "wrong workflow path", mock: mockGithub({ run: { path: ".github/workflows/attacker-clone.yml" } }) },
       { label: "run failed", mock: mockGithub({ run: { name: WORKFLOW_NAME, status: "completed", conclusion: "failure", head_sha: COMMIT } }) },
       { label: "commit mismatch", mock: mockGithub({ run: { name: WORKFLOW_NAME, status: "completed", conclusion: "success", head_sha: "b".repeat(40) } }) },
       { label: "wrong zip entry", mock: mockGithub({ zip: buildZip([{ name: "snapshot.json", data: Buffer.from("{}", "utf8") }]) }) },
