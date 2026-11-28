@@ -274,10 +274,12 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
    * `expectCurrentSha` (the sha the caller saw — previous pointer, or null
    * for first publication) is verified against the live ref before the
    * write; a mismatch refuses the move instead of clobbering a concurrent
-   * publisher's update. Note honestly: the GitHub REST API has no native
-   * compare-and-swap for refs, so this is verify-then-write with a
-   * residual TOCTOU window — the workflow's `concurrency` group is the
-   * primary serialization, and this check is defense in depth.
+   * publisher's update. Note honestly (I-05): the GitHub REST API has no
+   * conditional write for refs, so this is verify-then-write, NOT an
+   * atomic compare-and-swap; the workflow's `concurrency` group
+   * serializes THIS repo's publication runs, and the ownership check +
+   * refusal are the protection against EXTERNAL writers (a writer that
+   * wins the race is reported as TERMINAL UNVERIFIED, never clobbered).
    */
   async updateStableRef(tagObjectSha: string, opts?: { expectCurrentSha?: string | null }): Promise<void> {
     const expect = opts?.expectCurrentSha;
@@ -305,7 +307,29 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
   }
 
   /** DELETE /git/refs/tags/claims-artifact-prod — first-publication rollback only. */
-  async deleteStableRef(): Promise<void> {
+  /**
+   * DELETE /git/refs/tags/claims-artifact-prod — ownership-conditional
+   * (I-05). GitHub answers HTTP 404 for an ALREADY-ABSENT ref; that is a
+   * verified absence, treated as a no-op success (identical to the
+   * in-memory store — no DELETE request is issued for an absent ref).
+   * A live ref whose sha differs from `expectCurrentSha` (the sha the
+   * caller observed) is REFUSED — a concurrent publisher's pointer is
+   * never deleted. Note honestly: the GitHub REST API has no conditional
+   * DELETE for refs, so this is verify-then-write, NOT an atomic
+   * compare-and-swap; the residual window is covered by the workflow's
+   * concurrency group plus the ownership gate, and an external writer
+   * that wins the race is reported, never clobbered.
+   */
+  async deleteStableRef(opts?: { expectCurrentSha?: string | null }): Promise<void> {
+    const expect = opts?.expectCurrentSha;
+    const probe = await this.api(`/repos/${this.repo}/git/ref/tags/claims-artifact-prod`);
+    if (probe.status === 404) return; // already absent — verified, nothing to delete
+    if (!probe.ok) throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", probe.status, `probe failed: ${probe.status}`);
+    const live = JSON.parse(Buffer.from(await readCapped(probe, MAX_API_JSON_BYTES, "/git/ref/…")).toString("utf8")) as { object?: { sha?: unknown } };
+    const liveSha = typeof live.object?.sha === "string" ? live.object.sha : null;
+    if (expect !== undefined && (liveSha === null || liveSha !== expect)) {
+      throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", probe.status, `stable ref moved concurrently (expected ${expect ?? "<none>"}, found ${liveSha ?? "unknown"}) — deletion refused: this run does not own the reference`);
+    }
     await this.expectStatus(`/repos/${this.repo}/git/refs/tags/claims-artifact-prod`, { method: "DELETE" }, [204]);
   }
 

@@ -19,6 +19,7 @@ import {
   parseClaimsPointer,
   claimsVersionedTag,
   rollbackClaimsStableReference,
+  buildClaimsPointer,
   type ClaimsReleaseStore,
 } from "../src/claimsPublication.js";
 import { runClaimsPublicationSequence } from "../src/claimsPublication.js";
@@ -189,7 +190,7 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
     const run = input(validArtifactText());
     await assert.rejects(
       runClaimsPublicationSequence({ store: failingStore(run.store, "updateStableRef"), input: run.input }),
-      /rollback (RESTORED|removed the first-publication reference)/,
+      /rollback (RESTORED|left the stable reference ABSENT)/,
     );
     assert.equal(await run.store.stableRefSha(), null, "no half-activated pointer survives");
     assert.ok(run.store.hasRelease(claimsVersionedTag(1_800_000_000_000, "a".repeat(40))), "the versioned release (immutable identity) survives");
@@ -235,8 +236,42 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
 
   test("unrestorable rollback reports the explicit terminal unverified state", async () => {
     const run = input(validArtifactText());
-    // updateStableRef fault AND deleteStableRef fault: rollback cannot be
-    // attempted → terminal unverified.
+    // I-05: activation SUCCEEDS (the ref is this attempt's), then the
+    // stable verification fails and the conditional DELETE itself faults —
+    // the rollback cannot complete → terminal unverified.
+    class VerifyFailsAndDeleteFaults extends InMemoryClaimsReleaseStore {
+      private verifyFetched = 0;
+      private deleteCalls = 0;
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json") {
+          this.verifyFetched += 1;
+          if (this.verifyFetched === 1) {
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
+        }
+        return bytes;
+      }
+      override async deleteStableRef(opts?: { expectCurrentSha?: string | null }): Promise<void> {
+        this.deleteCalls += 1;
+        throw new ClaimsPublicationError("injected fault at deleteStableRef");
+      }
+    }
+    const broken = new VerifyFailsAndDeleteFaults();
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: broken, input: run.input }),
+      (e: ClaimsPublicationError) =>
+        e.message.includes("TERMINAL UNVERIFIED STATE") && e.message.includes("injected fault at deleteStableRef"),
+    );
+  });
+
+  test("I-05: activation never lands → rollback verifies ABSENCE, issues NO DELETE", async () => {
+    const run = input(validArtifactText());
+    // The ref move itself faults: the stable ref never comes into being.
+    // The rollback must verify the absence and treat it as absent — the
+    // deleteStableRef fault is NEVER hit because no DELETE is issued.
     const broken = new Proxy(run.store, {
       get(target, prop, receiver) {
         if (prop === "updateStableRef" || prop === "deleteStableRef") {
@@ -247,8 +282,10 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
     }) as ClaimsReleaseStore;
     await assert.rejects(
       runClaimsPublicationSequence({ store: broken, input: run.input }),
-      /TERMINAL UNVERIFIED STATE/,
+      (e: ClaimsPublicationError) =>
+        e.message.includes("left the stable reference ABSENT") && !e.message.includes("TERMINAL UNVERIFIED"),
     );
+    assert.equal(await run.store.stableRefSha(), null, "the ref is still absent");
   });
 });
 
@@ -454,15 +491,23 @@ describe("Review round 2, finding 1: no workflow input reaches a run script", ()
         else assert.ok(!line.includes("${{"), `expression inside a run block: ${line.trim()}`);
       }
     }
-    // Inputs reach the shell ONLY via env indirection.
-    for (const required of ["CLAIMS_ARTIFACT_PATH", "CLAIMS_SOURCE_COMMIT", "CLAIMS_PRODUCER_IDENTITY", "CLAIMS_PRODUCER_VERSION"]) {
+    // Inputs reach the shell ONLY via env indirection (I-06 input set).
+    for (const required of ["CLAIMS_PRODUCER_RUN_ID", "CLAIMS_SOURCE_COMMIT", "CLAIMS_PRODUCER_IDENTITY", "CLAIMS_PRODUCER_VERSION", "CLAIMS_EXPECTED_POOL"]) {
       assert.match(yml, new RegExp(`^\\s+${required}:\\s+\\$\\{\\{ inputs\\.`, "m"), `env indirection missing: ${required}`);
     }
     assert.match(yml, /GY_CLAIMS_GITHUB_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/);
     // And the run scripts consume quoted env vars, not expressions.
-    for (const quoted of ['"$CLAIMS_ARTIFACT_PATH"', '"$CLAIMS_SOURCE_COMMIT"', '"$CLAIMS_PRODUCER_IDENTITY"', '"$CLAIMS_PRODUCER_VERSION"']) {
+    for (const quoted of ['"$CLAIMS_PRODUCER_RUN_ID"', '"$CLAIMS_SOURCE_COMMIT"', '"$CLAIMS_PRODUCER_IDENTITY"', '"$CLAIMS_PRODUCER_VERSION"', '"$CLAIMS_EXPECTED_POOL"']) {
       assert.ok(yml.includes(quoted), `run script must consume ${quoted}`);
     }
+    // I-06: the path-based provenance hole is GONE — no artifact_path input
+    // or artifact file consumption anywhere; the producer identity/workflow
+    // expectations are PINNED in the workflow, not dispatched.
+    assert.ok(!yml.includes("artifact_path"), "the arbitrary-path input must not exist (I-06)");
+    assert.match(yml, /GY_CLAIMS_PRODUCER_REPO: GraveYield\/graveyield-protocol/);
+    assert.match(yml, /GY_CLAIMS_PRODUCER_WORKFLOW: /);
+    assert.match(yml, /GY_CLAIMS_ARTIFACT_NAME: claims-artifact\.json/);
+    assert.match(yml, /--producer-run-id "\$CLAIMS_PRODUCER_RUN_ID"/);
   });
 });
 
@@ -603,5 +648,353 @@ describe("Review round 2, finding 2: ownership-conditional rollback (concurrent 
     // Matching expectation passes.
     await adapter.updateStableRef(bSha, { expectCurrentSha: bSha });
     assert.equal(patchCalls, 1);
+  });
+});
+
+describe("I-05: rollback safety against foreign stable-reference updates", () => {
+  /** Counting wrapper: records every destructive call and read. */
+  function counted(store: ClaimsReleaseStore): {
+    store: ClaimsReleaseStore;
+    calls: { delete: number; update: number; create: number; reads: number };
+  } {
+    const calls = { delete: 0, update: 0, create: 0, reads: 0 };
+    const wrapped = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "deleteStableRef") {
+          return (opts?: { expectCurrentSha?: string | null }) => {
+            calls.delete += 1;
+            return target.deleteStableRef(opts);
+          };
+        }
+        if (prop === "updateStableRef") {
+          return (sha: string, opts?: { expectCurrentSha?: string | null }) => {
+            calls.update += 1;
+            return target.updateStableRef(sha, opts);
+          };
+        }
+        if (prop === "createTagObject") {
+          return (args: { message: string; commitSha: string }) => {
+            calls.create += 1;
+            return target.createTagObject(args);
+          };
+        }
+        if (prop === "stableRefSha") {
+          return () => {
+            calls.reads += 1;
+            return target.stableRefSha();
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as ClaimsReleaseStore;
+    return { store: wrapped, calls };
+  }
+
+  /** Valid pointer JSON for a synthetic previous/owned tag object. */
+  function pointerMessage(versionedTag: string): string {
+    return buildClaimsPointer({
+        versionedTag,
+        sourceCommit: "a".repeat(40),
+        publishedAtUnixMs: 1_799_999_999_999,
+        artifactBytes: new TextEncoder().encode("{}"),
+        manifestBytes: new TextEncoder().encode("{}"),
+        checksumBytes: new TextEncoder().encode("x"),
+        artifactSchemaVersion: 2,
+        pool: POOL.toBase58(),
+        lpMint: MINT.toBase58(),
+        snapshotSlot: 1,
+        merkleRoot: "ff".repeat(32),
+        producer: { identity: "x", version: "1" },
+        previous: null,
+      }).pointerJson;
+  }
+  const PREV_TAG = "claims-artifact-prod-20260101T000000Z-aaaaaaaaaaaa";
+
+  test("1. ref absent before rollback: NO delete call, absence verified, treated as absent", async () => {
+    const store = new InMemoryClaimsReleaseStore();
+    const { store: wrapped, calls } = counted(store);
+    const outcome = await rollbackClaimsStableReference({
+      store: wrapped,
+      previous: null,
+      activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+      activatedTagObjectSha: "<never-activated>",
+    });
+    assert.equal(outcome, "first-publication-removed", "an absent ref IS the safe terminal state");
+    assert.equal(calls.delete, 0, "no DELETE request for an absent ref");
+    assert.equal(calls.update, 0);
+    assert.equal(await store.stableRefSha(), null);
+    // absence is VERIFIED (two reads: gate + re-verify)
+    assert.ok(calls.reads >= 2, "absence was re-verified");
+  });
+
+  test("2. foreign publisher creates a ref after the ownership check: rollback does not delete it", async () => {
+    // First publication whose activation never landed: the gate sees an
+    // absent ref and — by construction — never issues a DELETE, so a
+    // foreign ref created afterwards is untouched by this rollback path.
+    const store = new InMemoryClaimsReleaseStore();
+    const { store: wrapped } = counted(store);
+    const outcome = await rollbackClaimsStableReference({
+      store: wrapped,
+      previous: null,
+      activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+      activatedTagObjectSha: "<never-activated>",
+    });
+    assert.equal(outcome, "first-publication-removed");
+    // Simulate the foreign publisher winning the race immediately after:
+    const foreignSha = await store.createTagObject({ message: "foreign", commitSha: "f".repeat(40) });
+    await store.updateStableRef(foreignSha);
+    assert.notEqual(await store.stableRefSha(), null, "the foreign pointer exists");
+    // and the adapter-level guarantee: with a real (re-probing) adapter,
+    // a DELETE on an absent-at-probe ref is skipped entirely — proven in
+    // test 6 below (404 → no DELETE request).
+  });
+
+  test("2b. adapter-level: ref goes foreign between probe and DELETE → deletion refused, no DELETE sent", async () => {
+    const ourSha = "1".repeat(40);
+    const foreignSha = "2".repeat(40);
+    let probeCount = 0;
+    let deletes = 0;
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const method = (init?.method ?? "GET").toUpperCase();
+      const path = url.replace(/^https:\/\/[^/]+/, "");
+      if (path === "/repos/o/r/git/ref/tags/claims-artifact-prod") {
+        probeCount += 1;
+        // First probe (the ownership gate) shows OUR ref; any later probe
+        // shows the FOREIGN pointer — the race window.
+        const sha = probeCount === 1 ? ourSha : foreignSha;
+        return new Response(JSON.stringify({ object: { sha, type: "tag" } }), { status: 200 });
+      }
+      if (path === "/repos/o/r/git/refs/tags/claims-artifact-prod" && method === "DELETE") {
+        deletes += 1;
+        return new Response(null, { status: 204 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+    const adapter = new GitHubClaimsReleaseStore({ repo: "o/r", token: "t", fetchImpl });
+    // The ROLLBACK flow: gate probe (1) sees ours → conditional DELETE
+    // re-probes (2) and finds the foreign pointer → refused.
+    await assert.rejects(
+      rollbackClaimsStableReference({
+        store: adapter,
+        previous: null,
+        activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+        activatedTagObjectSha: ourSha,
+      }),
+      /deletion refused/,
+    );
+    assert.equal(deletes, 0, "no DELETE was issued against a foreign pointer");
+    void foreignSha;
+  });
+
+  test("3. foreign publisher changes the ref before restoration: rollback does not overwrite it", async () => {
+    const store = new InMemoryClaimsReleaseStore();
+    const firstRef = await store.createTagObject({ message: pointerMessage(PREV_TAG), commitSha: "a".repeat(40) });
+    await store.updateStableRef(firstRef);
+    // A concurrent publisher moves the ref to ITS OWN tag object.
+    const foreignRef = await store.createTagObject({ message: "foreign", commitSha: "c".repeat(40) });
+    await store.updateStableRef(foreignRef);
+    const { store: wrapped, calls } = counted(store);
+    const outcome = await rollbackClaimsStableReference({
+      store: wrapped,
+      previous: { versionedTag: PREV_TAG, tagObjectSha: firstRef, pointer: JSON.parse(pointerMessage(PREV_TAG)) },
+      activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+      activatedTagObjectSha: "b".repeat(40), // this attempt's (no longer live) activation
+    });
+    assert.equal(outcome, "foreign-reference-untouched");
+    assert.equal(calls.update, 0, "no ref write against a foreign pointer");
+    assert.equal(calls.delete, 0);
+    assert.equal(await store.stableRefSha(), foreignRef, "the live ref is untouched");
+  });
+
+  test("4. current ref still points to this failed attempt: previous known-good restored + verified", async () => {
+    const store = new InMemoryClaimsReleaseStore();
+    const firstRef = await store.createTagObject({ message: pointerMessage(PREV_TAG), commitSha: "a".repeat(40) });
+    await store.updateStableRef(firstRef);
+    const oursSha = await store.createTagObject({ message: "ours", commitSha: "b".repeat(40) });
+    await store.updateStableRef(oursSha);
+    const { store: wrapped, calls } = counted(store);
+    const outcome = await rollbackClaimsStableReference({
+      store: wrapped,
+      previous: { versionedTag: PREV_TAG, tagObjectSha: firstRef, pointer: JSON.parse(pointerMessage(PREV_TAG)) },
+      activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+      activatedTagObjectSha: oursSha,
+    });
+    assert.equal(outcome, "restored");
+    assert.equal(calls.update, 1, "exactly one conditional restore write");
+    const refSha = await store.stableRefSha();
+    const pointer = parseClaimsPointer((await store.fetchTagObject(refSha!)).message);
+    assert.equal(pointer.versionedTag, PREV_TAG, "the previous known-good pointer serves again");
+  });
+
+  test("5. previous ref absent + this attempt owns the activated ref: safe conditional deletion", async () => {
+    const run = input(validArtifactText());
+    // First publication: activation lands (ref = ours), the stable verify
+    // then fails → rollback deletes ONLY the owned ref.
+    class VerifyFails extends InMemoryClaimsReleaseStore {
+      private verifyFetched = 0;
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json") {
+          this.verifyFetched += 1;
+          if (this.verifyFetched === 1) {
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
+        }
+        return bytes;
+      }
+    }
+    const store = new VerifyFails();
+    const { store: wrapped, calls } = counted(store);
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: wrapped, input: run.input }),
+      /left the stable reference ABSENT/,
+    );
+    assert.equal(calls.delete, 1, "exactly one conditional DELETE of the owned ref");
+    assert.equal(await store.stableRefSha(), null, "the owned ref is gone");
+    assert.ok((store as unknown as { hasRelease(tag: string): boolean }).hasRelease(claimsVersionedTag(1_800_000_000_000, "a".repeat(40))), "the immutable versioned release survives");
+  });
+
+  test("6. GitHub adapter: real absent-ref responses match the in-memory store (no-op, no DELETE)", async () => {
+    const requests: Array<{ method: string; path: string; status: number }> = [];
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const method = (init?.method ?? "GET").toUpperCase();
+      const path = url.replace(/^https:\/\/[^/]+/, "");
+      // GitHub's real behavior: GET /git/ref/… → 404 when the ref is absent.
+      if (path === "/repos/o/r/git/ref/tags/claims-artifact-prod") {
+        requests.push({ method, path, status: 404 });
+        return new Response(null, { status: 404 });
+      }
+      requests.push({ method, path, status: 404 });
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+    const adapter = new GitHubClaimsReleaseStore({ repo: "o/r", token: "t", fetchImpl });
+    // Real response: ref absent → adapter no-ops (same as InMemory).
+    await adapter.deleteStableRef({ expectCurrentSha: "1".repeat(40) });
+    // InMemory semantics for the same state: silent no-op success.
+    const mem = new InMemoryClaimsReleaseStore();
+    await mem.deleteStableRef({ expectCurrentSha: "1".repeat(40) });
+    assert.equal(await mem.stableRefSha(), null);
+    // And the adapter never reached the DELETE endpoint.
+    assert.ok(requests.every((r) => r.method !== "DELETE"), "no DELETE request for an absent ref");
+    assert.equal(await adapter.stableRefSha(), null, "absence is reported as null by both stores");
+    const memSha = await mem.stableRefSha();
+    assert.equal(memSha, null);
+  });
+
+  test("7. uncertain ownership or failed read-back → TERMINAL UNVERIFIED without destructive action", async () => {
+    const run = input(validArtifactText());
+    // (a) previous pointer known, ref GONE: ownership of the absence is
+    // unverifiable → "unverified", zero destructive calls.
+    const store = new InMemoryClaimsReleaseStore();
+    const { store: wrapped, calls } = counted(store);
+    const outcome = await rollbackClaimsStableReference({
+      store: wrapped,
+      previous: {
+        versionedTag: PREV_TAG,
+        tagObjectSha: "a".repeat(40),
+        pointer: JSON.parse(pointerMessage(PREV_TAG)),
+      },
+      activatedTag: claimsVersionedTag(1_800_000_000_000, "a".repeat(40)),
+      activatedTagObjectSha: "b".repeat(40),
+    });
+    assert.equal(outcome, "unverified");
+    assert.equal(calls.delete, 0);
+    assert.equal(calls.update, 0);
+    // (b) sequence-level: a ref that VANISHES while a previous pointer is
+    // known → TERMINAL UNVERIFIED, zero destructive calls.
+    class RefVanishes extends InMemoryClaimsReleaseStore {
+      private gone = false;
+      private verifyFetched = 0;
+      override async stableRefSha(): Promise<string | null> {
+        return this.gone ? null : super.stableRefSha();
+      }
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json") {
+          this.verifyFetched += 1;
+          if (this.verifyFetched === 2) {
+            // attempt 2's stable verify: an external writer deletes the ref
+            // and the verification fails at the same moment.
+            this.gone = true;
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
+        }
+        return bytes;
+      }
+    }
+    const ghost = new RefVanishes();
+    const ghostCalls = counted(ghost);
+    await runClaimsPublicationSequence({ store: ghostCalls.store, input: run.input });
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: ghostCalls.store, input: { ...run.input, publishedAtUnixMs: 1_800_060_000_000 } }),
+      (e: ClaimsPublicationError) => e.message.includes("TERMINAL UNVERIFIED"),
+    );
+    assert.equal(ghostCalls.calls.delete, 0, "no destructive call on unverifiable absence");
+    // updateStableRef fired exactly twice across BOTH attempts — the two
+    // legitimate activations; the rollback itself wrote nothing.
+    assert.equal(ghostCalls.calls.update, 2, "only the two legitimate activations wrote the ref");
+    // (c) the rollback's restore write succeeds, but an external writer
+    // moves the ref to a VALID foreign pointer before read-back →
+    // "unverified" → TERMINAL UNVERIFIED, and the foreign pointer survives.
+    const FOREIGN_TAG = "claims-artifact-prod-20260101T000000Z-cccccccccccc";
+    class ReadBackHijacked extends InMemoryClaimsReleaseStore {
+      private verifyFetched = 0;
+      private refWrites = 0;
+      private foreignShaValue: string | null = null;
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json") {
+          this.verifyFetched += 1;
+          if (this.verifyFetched === 2) {
+            // attempt 2's verify: tamper → drives the rollback
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
+        }
+        return bytes;
+      }
+      override async updateStableRef(sha: string, opts?: { expectCurrentSha?: string | null }): Promise<void> {
+        await super.updateStableRef(sha, opts);
+        this.refWrites += 1;
+        // Write #3 is attempt 2's ROLLBACK restore — immediately after it,
+        // a concurrent publisher wins the race and moves the ref to its
+        // own VALID pointer, so the read-back parses but mismatches.
+        if (this.refWrites === 3 && this.foreignShaValue === null) {
+          const foreignPointer = buildClaimsPointer({
+            versionedTag: FOREIGN_TAG,
+            sourceCommit: "c".repeat(40),
+            publishedAtUnixMs: 1_800_050_000_000,
+            artifactBytes: new TextEncoder().encode("{}"),
+            manifestBytes: new TextEncoder().encode("{}"),
+            checksumBytes: new TextEncoder().encode("x"),
+            artifactSchemaVersion: 2,
+            pool: POOL.toBase58(),
+            lpMint: MINT.toBase58(),
+            snapshotSlot: 1,
+            merkleRoot: "ff".repeat(32),
+            producer: { identity: "other", version: "0" },
+            previous: null,
+          }).pointerJson;
+          this.foreignShaValue = await this.createTagObject({ message: foreignPointer, commitSha: "c".repeat(40) });
+          await super.updateStableRef(this.foreignShaValue, undefined);
+        }
+      }
+    }
+    const rez = new ReadBackHijacked();
+    await runClaimsPublicationSequence({ store: rez, input: run.input });
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: rez, input: { ...run.input, publishedAtUnixMs: 1_800_060_000_000 } }),
+      (e: ClaimsPublicationError) => e.message.includes("TERMINAL UNVERIFIED") && e.message.includes("could NOT be verified"),
+    );
+    const rezSha = await rez.stableRefSha();
+    assert.notEqual(rezSha, null, "the foreign pointer survives");
+    assert.equal(parseClaimsPointer((await rez.fetchTagObject(rezSha!)).message).versionedTag, FOREIGN_TAG);
   });
 });

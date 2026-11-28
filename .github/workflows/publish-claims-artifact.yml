@@ -1,38 +1,70 @@
-# Claims-artifact publication — DEDICATED workflow (D4).
+# Claims-artifact publication — DEDICATED workflow (D4, I-06 handoff).
 # Logically separate from publish-console-snapshot.yml (ConsoleSnapshotV2
 # pool-discovery): own stable ref (claims-artifact-prod), own pointer
 # schema, own asset namespace. Implements the draft-first lifecycle from
-# grave-indexer docs/CLAIMS_PUBLICATION.md via src/claimsPublishCli.ts:
-# validate → digest → draft release → upload → read-back verification →
-# immutable publish → ONE atomic stable-ref move → post-activation
-# verification, with automatic verified rollback of the previous
-# known-good pointer on any post-activation failure.
+# docs/CLAIMS_PUBLICATION.md via src/claimsPublishCli.ts:
+# producer-run handoff (validate run identity + provenance + artifact
+# bytes, READ-ONLY) → digest → draft release → upload → read-back
+# verification → immutable publish → ONE ownership-checked stable-ref
+# update → post-activation verification, with automatic ownership-checked
+# rollback of the previous known-good pointer on any post-activation
+# failure (I-05).
+#
+# I-06: the artifact is NOT taken from a filesystem path — a dispatch
+# starts a fresh runner and a path is not proof of producer origin. The
+# artifact is retrieved from an explicit, validated PRODUCER RUN in the
+# producer repository (graveyield-protocol, where the Rust
+# grave-snapshotter-cli lives) via the authenticated Actions artifacts
+# API, then fully re-verified before any network write. See
+# docs/CLAIMS_PUBLICATION.md § "D3→D4 artifact handoff" for the operator
+# procedure and the currently-missing producer-side upload.
 name: publish-claims-artifact
 
 on:
   workflow_dispatch:
     inputs:
-      artifact_path:
-        description: "Path to the D3 claims artifact (claims-artifact.json)"
+      producer_run_id:
+        description: "Numeric ID of the producer run in GraveYield/graveyield-protocol that sealed the claims artifact (from its run URL)"
         required: true
+        type: string
       source_commit:
-        description: "The protocol commit the artifact was produced from (40-hex)"
+        description: "The protocol commit the artifact was produced from (40-hex; must equal the producer run's head commit)"
         required: true
       producer_identity:
-        description: "Producer identity (e.g. grave-snapshotter-cli)"
+        description: "Producer identity recorded in the pointer (must be the pinned producer: grave-snapshotter-cli)"
         required: true
       producer_version:
-        description: "Producer version/commit tag"
+        description: "Producer version/commit tag recorded in the pointer"
+        required: true
+      expected_pool:
+        description: "Pool identity the artifact must carry (rejects a mismatched artifact before any side effect)"
         required: true
 
 permissions:
   contents: write
 
-# Review finding 2: publications are SERIALIZED — a second publication
-# waits instead of racing the first one's stable-ref move/rollback.
+# Round-2 finding 2 / I-05: publications are SERIALIZED — a second
+# publication waits instead of racing the first one's stable-ref
+# update/rollback. This protects THIS repo's runs against each other;
+# EXTERNAL writers are handled by the ownership gate (a ref that changed
+# hands is never clobbered — the run reports TERMINAL UNVERIFIED).
 concurrency:
   group: claims-artifact-publication
   cancel-in-progress: false
+
+env:
+  # ── PINNED PRODUCER IDENTITY (I-06) ─────────────────────────────────
+  # These expectations are pinned HERE, never passed as dispatch inputs —
+  # an attacker must not be able to point the provenance check at their
+  # own workflow. GY_CLAIMS_PRODUCER_WORKFLOW must be set to the exact
+  # workflow `name` of the (future) producer workflow in
+  # GraveYield/graveyield-protocol that runs grave-snapshotter-cli and
+  # uploads `claims-artifact.json` as a run artifact. Until that producer
+  # workflow exists and uploads the artifact, every dispatch fails closed
+  # at the handoff step (missing artifact) — by design, honestly (I-06).
+  GY_CLAIMS_PRODUCER_REPO: GraveYield/graveyield-protocol
+  GY_CLAIMS_PRODUCER_WORKFLOW: grave-snapshotter-cli
+  GY_CLAIMS_ARTIFACT_NAME: claims-artifact.json
 
 jobs:
   publish-claims-artifact:
@@ -56,37 +88,57 @@ jobs:
       - name: Build vendored SDK
         run: pnpm run build:sdk
 
-      # Review finding 1: NO workflow_dispatch input is interpolated into a
-      # `run:` script. Every input crosses into the shell ONLY as an
-      # environment variable (GitHub expands `env:` values, never shell
-      # text) and is consumed as a quoted "$VAR" — a value containing shell
+      # I-06 pre-flight: resolve + verify the producer artifact with
+      # READ-ONLY API calls (GET only) — run identity, workflow identity,
+      # commit provenance, artifact presence/expiry/uniqueness, zip byte
+      # length + CRC32, claims-grade integrity, pool identity. NO release,
+      # tag, ref, or asset is touched in this step.
+      #
+      # Round-2 finding 1: NO dispatch input is interpolated into a `run:`
+      # script. Every input crosses into the shell ONLY as an environment
+      # variable (GitHub expands `env:` values, never shell text) and is
+      # consumed as a quoted "$VAR" — a value containing shell
       # metacharacters stays data, never code.
-      - name: Verify the artifact bundle BEFORE any network write
+      - name: Verify the producer-run artifact (READ-ONLY handoff pre-flight)
         env:
-          CLAIMS_ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAIMS_PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
+          CLAIMS_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          CLAIMS_PRODUCER_IDENTITY: ${{ inputs.producer_identity }}
+          CLAIMS_PRODUCER_VERSION: ${{ inputs.producer_version }}
+          CLAIMS_EXPECTED_POOL: ${{ inputs.expected_pool }}
         run: |
-          node --import tsx -e "
-            const { verifyClaimsArtifactBytes } = await import('./src/claimsArtifact.js');
-            const fs = await import('node:fs');
-            const bytes = fs.readFileSync(process.argv[1]);
-            const v = verifyClaimsArtifactBytes(bytes);
-            console.log('claims-grade artifact verified:', v.rootHex.slice(0, 16) + '…', 'slot', v.snapshotSlot);
-          " "$CLAIMS_ARTIFACT_PATH"
+          pnpm exec tsx src/claimsPublishCli.ts \
+            --handoff-only \
+            --repo "$GITHUB_REPOSITORY" \
+            --producer-run-id "$CLAIMS_PRODUCER_RUN_ID" \
+            --producer-repo "$GY_CLAIMS_PRODUCER_REPO" \
+            --producer-workflow "$GY_CLAIMS_PRODUCER_WORKFLOW" \
+            --artifact-name "$GY_CLAIMS_ARTIFACT_NAME" \
+            --source-commit "$CLAIMS_SOURCE_COMMIT" \
+            --producer-identity "$CLAIMS_PRODUCER_IDENTITY" \
+            --producer-version "$CLAIMS_PRODUCER_VERSION" \
+            --expected-pool "$CLAIMS_EXPECTED_POOL"
 
       - name: Publish (draft-first, immutable, stable-pointer promotion)
         env:
           GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLAIMS_ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          CLAIMS_PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
           CLAIMS_SOURCE_COMMIT: ${{ inputs.source_commit }}
           CLAIMS_PRODUCER_IDENTITY: ${{ inputs.producer_identity }}
           CLAIMS_PRODUCER_VERSION: ${{ inputs.producer_version }}
+          CLAIMS_EXPECTED_POOL: ${{ inputs.expected_pool }}
         run: |
-          pnpm run claims:publish -- \
+          pnpm exec tsx src/claimsPublishCli.ts \
             --repo "$GITHUB_REPOSITORY" \
-            --artifact "$CLAIMS_ARTIFACT_PATH" \
+            --producer-run-id "$CLAIMS_PRODUCER_RUN_ID" \
+            --producer-repo "$GY_CLAIMS_PRODUCER_REPO" \
+            --producer-workflow "$GY_CLAIMS_PRODUCER_WORKFLOW" \
+            --artifact-name "$GY_CLAIMS_ARTIFACT_NAME" \
             --source-commit "$CLAIMS_SOURCE_COMMIT" \
             --producer-identity "$CLAIMS_PRODUCER_IDENTITY" \
-            --producer-version "$CLAIMS_PRODUCER_VERSION"
+            --producer-version "$CLAIMS_PRODUCER_VERSION" \
+            --expected-pool "$CLAIMS_EXPECTED_POOL"
 
       - name: Report
         if: always()

@@ -6,7 +6,7 @@
 // its own stable ref, asset names, pointer schema, validators, and
 // versioned-tag namespace. Safe mechanisms are REUSED (ReleaseStore
 // abstraction, immutable versioned releases, annotated-tag-object
-// pointer, ONE atomic ref move, read-back verification, last-known-good
+// pointer, ONE ownership-checked ref update, read-back verification, last-known-good
 // preservation) but no console-snapshot pointer, asset, or ref is
 // touched or interpreted.
 //
@@ -24,7 +24,7 @@
 //                                  the versioned identity is immutable from
 //                                  here (assets never re-uploaded)
 //   7. activate-stable-reference   pointer JSON into a NEW annotated tag
-//                                  object, ONE atomic ref move on
+//                                  object, ONE ownership-checked ref update on
 //                                  `claims-artifact-prod` (previous
 //                                  last-known-good preserved on any
 //                                  earlier failure)
@@ -314,10 +314,10 @@ export interface ClaimsReleaseStore {
   stableRefSha(): Promise<string | null>;
   /** Mirrors POST /git/tags — creates an immutable annotated tag object. */
   createTagObject(args: { message: string; commitSha: string }): Promise<string>;
-  /** Mirrors POST/PATCH /git/refs/tags/claims-artifact-prod — the ONE atomic pointer move. */
+  /** Mirrors POST/PATCH /git/refs/tags/claims-artifact-prod — the ONE ownership-checked pointer move. */
   updateStableRef(tagObjectSha: string, opts?: { expectCurrentSha?: string | null }): Promise<void>;
   /** Mirrors DELETE /git/refs/tags/claims-artifact-prod — first-publication rollback only. */
-  deleteStableRef(): Promise<void>;
+  deleteStableRef(opts?: { expectCurrentSha?: string | null }): Promise<void>;
   /** Mirrors GET /git/tags/{sha}. */
   fetchTagObject(tagObjectSha: string): Promise<{ message: string; commitSha: string }>;
   /** Mirrors GET /repos/{repo}/releases/tags/{tag} asset fetch (versioned tag URLs). */
@@ -388,7 +388,19 @@ export class InMemoryClaimsReleaseStore implements ClaimsReleaseStore {
     this.stableRef = tagObjectSha;
   }
 
-  async deleteStableRef(): Promise<void> {
+  async deleteStableRef(opts?: { expectCurrentSha?: string | null }): Promise<void> {
+    // I-05: absent ref → no-op success. The real GitHub adapter answers 404
+    // for an absent ref and treats it as already-absent; both stores mirror
+    // that so "already gone" is never an error and never a DELETE call.
+    if (this.stableRef === null) return;
+    // I-05: conditional delete — a ref that no longer names the caller's
+    // expected sha is refused, never deleted.
+    const expect = opts?.expectCurrentSha;
+    if (expect !== undefined && this.stableRef !== expect) {
+      throw new ClaimsPublicationError(
+        `stable ref moved concurrently (expected ${expect}, found ${this.stableRef}) — deletion refused: this run does not own the reference`,
+      );
+    }
     this.stableRef = null;
   }
 
@@ -605,7 +617,7 @@ export async function runClaimsPublicationSequence(opts: {
     throw err;
   }
 
-  // ── 7. activate-stable-reference (ONE ownership-checked pointer move) ───
+  // ── 7. activate-stable-reference (ONE ownership-checked pointer move; verify-then-write — the GitHub refs API has no conditional write) ───
   // D4 review: ANY failure at or after activation automatically restores
   // the previous known-good reference — but ONLY if the stable ref still
   // belongs to THIS attempt. If another publisher moved it concurrently,
@@ -692,8 +704,12 @@ export async function runClaimsPublicationSequence(opts: {
         `publication failed after stable-reference activation (${detail}); rollback could NOT be verified — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
       );
     }
+    const rollbackReport =
+      outcome === "restored"
+        ? "rollback RESTORED the previous known-good pointer and the restoration was verified by read-back"
+        : "rollback left the stable reference ABSENT — the absence was verified by re-read and NO destructive write was issued";
     throw new ClaimsPublicationError(
-      `publication failed after stable-reference activation (${detail}); rollback ${outcome === "restored" ? "RESTORED" : "removed the first-publication reference for"} the previous known-good pointer and the restoration was verified by read-back`,
+      `publication failed after stable-reference activation (${detail}); ${rollbackReport}`,
     );
   }
 
@@ -720,29 +736,54 @@ export async function rollbackClaimsStableReference(opts: {
 }): Promise<"restored" | "first-publication-removed" | "foreign-reference-untouched" | "unverified"> {
   const { store, previous, activatedTagObjectSha } = opts;
 
-  // OWNERSHIP GATE (review finding 2): the ref may be restored/deleted
-  // only while it still names THIS attempt's activation. A ref that names
-  // nothing (first publication that never activated) or this attempt's
-  // sha is owned; anything else belongs to a concurrent publisher.
+  // OWNERSHIP GATE (I-05): the ref may be restored or deleted ONLY while
+  // its current target belongs to THIS failed attempt. Every branch below
+  // either verifies the ref state first or refuses to act. Uncertain
+  // ownership NEVER triggers a destructive call — the caller reports
+  // TERMINAL UNVERIFIED.
   const currentSha = await store.stableRefSha();
-  const owned =
-    currentSha === null
-      ? previous === null // first publication, activation never landed
-      : currentSha === activatedTagObjectSha;
-  if (!owned) return "foreign-reference-untouched";
 
   if (previous === null) {
-    await store.deleteStableRef();
+    // First publication. The ref is either absent (activation never
+    // landed, or the ref is simply not there) or still names THIS
+    // attempt's activation.
+    if (currentSha === null) {
+      // I-05 (1): the ref is already absent — VERIFY the absence and
+      // treat it as absent. NO DELETE request is issued for an absent
+      // ref (the old code called deleteStableRef unconditionally).
+      if ((await store.stableRefSha()) !== null) return "unverified";
+      return "first-publication-removed";
+    }
+    if (currentSha !== activatedTagObjectSha) {
+      // A concurrent publisher owns the ref — never delete it.
+      return "foreign-reference-untouched";
+    }
+    await store.deleteStableRef({ expectCurrentSha: activatedTagObjectSha });
     if ((await store.stableRefSha()) !== null) return "unverified";
     return "first-publication-removed";
   }
-  // If the ref still names the PREVIOUS pointer, this attempt never
-  // actually moved it — nothing to restore; the read-back below proves it.
-  if (currentSha !== activatedTagObjectSha) {
-    // unreachable (owned implies currentSha === activatedTagObjectSha or
-    // null-with-previous-null); kept as a guard.
+
+  if (currentSha === null) {
+    // The stable ref is GONE while a previous pointer is known. Ownership
+    // of the absence cannot be established (a concurrent publisher or
+    // external writer may have deleted it) — leave everything untouched.
     return "unverified";
   }
+  if (currentSha === previous.tagObjectSha) {
+    // This attempt never actually moved the ref: it still names the
+    // previous known-good pointer. Nothing to restore — verify by
+    // read-back and report success WITHOUT any write.
+    const untouched = await store.fetchTagObject(currentSha);
+    if (parseClaimsPointer(untouched.message).versionedTag !== previous.versionedTag) {
+      return "unverified";
+    }
+    return "restored";
+  }
+  if (currentSha !== activatedTagObjectSha) {
+    // A concurrent publisher moved the ref — never overwrite it.
+    return "foreign-reference-untouched";
+  }
+
   const object = await store.fetchTagObject(previous.tagObjectSha);
   const restoredPointer = parseClaimsPointer(object.message);
   if (restoredPointer.versionedTag !== previous.versionedTag) {

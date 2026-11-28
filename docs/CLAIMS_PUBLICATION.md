@@ -58,7 +58,7 @@ interface method documents its exact GitHub REST mirror):
 4. **upload-draft-assets** — artifact + manifest + checksum uploaded into the DRAFT.
 5. **verify-draft-readback** — fetch the assets BACK from the draft; verify digest + byte length + checksum sidecar + FULL claims-grade re-verification.
 6. **publish-immutable-release** — `PATCH /releases/{id} {draft:false, make_latest:"false"}`. From here the versioned identity is immutable by publisher convention: assets are never re-uploaded, never mutated.
-7. **activate-stable-reference** — the pointer JSON (digests, byte lengths, schema version, pool, mint, snapshot slot, root, producer identity, previous pointer) is written into a NEW annotated tag object (`POST /git/tags`), and `refs/tags/claims-artifact-prod` moves with ONE atomic ref update. This is the only stable-pointer operation in the whole sequence.
+7. **activate-stable-reference** — the pointer JSON (digests, byte lengths, schema version, pool, mint, snapshot slot, root, producer identity, previous pointer) is written into a NEW annotated tag object (`POST /git/tags`), and `refs/tags/claims-artifact-prod` moves with ONE ownership-checked ref update. This is the only stable-pointer operation in the whole sequence. Honest note (I-05): the GitHub refs API has no conditional write — the update is verify-then-write (the expected current sha is checked against the live ref first), never a true compare-and-swap; the workflow `concurrency` group serializes publication runs, and an external writer that wins the race is reported (TERMINAL UNVERIFIED), never clobbered.
 8. **verify-stable-reference** — re-read the ref, parse the pointer, fetch the assets from the POINTER's versioned release, verify digests/lengths/checksum and the artifact identity (root/pool/mint/slot) against the pointer.
 
 Failure semantics:
@@ -123,6 +123,78 @@ only by the owner-triggered workflow.
 | Draft cleanup failure surfaced | the failed run's draft still exists | delete the draft release manually; the stable pointer is unaffected |
 | Post-activation failure reported `unverified` | rollback could not verify restoration | treat the stable pointer as suspect; verify manually against the previous versioned release, then re-run |
 | Consumer digest mismatch | pointer and bytes disagree (cache/tamper) | re-fetch from the pointer's versioned tag; if persistent, treat as an integrity incident |
+
+## D3→D4 artifact handoff (I-06)
+
+A dispatch starts a FRESH runner: a bare `artifact_path` string cannot
+transfer the Rust-produced artifact to the publication runner, and a
+local path is never proof of producer origin. The publication workflow
+therefore retrieves the artifact from an explicit, validated PRODUCER
+RUN.
+
+### Actual producer (verified, not invented)
+
+* The claims artifact is sealed by the Rust `grave-snapshotter-cli`
+  (`snapshotter/src/bin/grave-snapshotter-cli.rs` in
+  `GraveYield/graveyield-protocol`), which writes the deterministic
+  artifact JSON to an `--out` path.
+* The manifest and checksum are DERIVED by the publication sequence from
+  the artifact bytes — the only producer-side deliverable is the single
+  `claims-artifact.json`.
+* **Missing producer-side dependency (honest):** NO workflow in
+  `graveyield-protocol` currently runs `grave-snapshotter-cli` and
+  uploads `claims-artifact.json` as a named run artifact
+  (`ci.yml` runs `cargo test -p grave-snapshotter` only; `fork-harness.yml`
+  uploads only a failure log). Until such a producer workflow exists,
+  every publication dispatch fails CLOSED at the handoff step
+  ("missing artifact") — by design. No fixture simulates the handoff.
+
+### Operator procedure
+
+1. Run the producer workflow in `GraveYield/graveyield-protocol` (once it
+   exists) with the correct commit; note its numeric run ID from the run
+   URL (`.../actions/runs/<id>`).
+2. Dispatch `publish-claims-artifact` in `grave-indexer` with:
+   `producer_run_id` (that run ID), `source_commit` (the 40-hex commit —
+   it must equal the producer run's head commit), `producer_identity`
+   (must be the pinned `grave-snapshotter-cli`), `producer_version`, and
+   `expected_pool` (the pool identity the artifact must carry).
+3. The workflow's pre-flight step resolves the run (READ-ONLY, GET-only)
+   and rejects: nonexistent run ID, wrong workflow identity, unfinished or
+   failed runs, head-commit mismatch, missing/expired/ambiguous artifacts,
+   zip byte-length mismatch, CRC32 corruption, invalid schema/provenance,
+   and pool/producer identity mismatch — all BEFORE any release, tag,
+   asset, or reference is touched.
+4. The producer workflow name and artifact name are PINNED in the
+   publication workflow's environment
+   (`GY_CLAIMS_PRODUCER_WORKFLOW`, `GY_CLAIMS_ARTIFACT_NAME`) — never
+   accepted as dispatch inputs, so an attacker cannot point the
+   provenance check at their own workflow. When the producer workflow
+   lands, set `GY_CLAIMS_PRODUCER_WORKFLOW` to its exact `name`.
+5. Failures are reported in the step log and the job fails; no partial
+   publication state can exist (the handoff performs zero writes).
+
+### Rollback safety against foreign stable-reference updates (I-05)
+
+The stable-reference rollback is OWNERSHIP-CONDITIONAL:
+
+* An ALREADY-ABSENT ref is verified by re-read and treated as absent —
+  no DELETE request is issued (the GitHub refs API answers 404 for an
+  absent ref; the real adapter and the in-memory store share exactly
+  these semantics).
+* A ref may be deleted or restored ONLY while it still names THIS failed
+  attempt's activated tag object (or, for first publication, is absent).
+* A ref that changed hands (concurrent publisher or external writer) is
+  NEVER overwritten or deleted — the run reports TERMINAL UNVERIFIED.
+* Uncertain ownership (e.g. the ref vanishes while a previous pointer is
+  known) and failed read-backs are reported TERMINAL UNVERIFIED with zero
+  destructive calls.
+* Ref moves and deletes verify the live sha against the caller's
+  expectation before writing. Honest: the GitHub refs API has no
+  conditional write — this is verify-then-write, NOT atomic
+  compare-and-swap. The workflow `concurrency` group serializes this
+  repo's publication runs; EXTERNAL writers are handled by the ownership
+  gate and refusal, never by trusting the concurrency group.
 
 ## Honest limitation (recorded)
 

@@ -1,28 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Claims-artifact publication CLI (D4 review finding: production wiring).
-// Runs the draft-first sequence (claimsPublication.ts) against the real
-// GitHub adapter (claimsGitHubStore.ts). Intended for the dedicated
-// claims-publication workflow ONLY — never run manually against
-// production without the owner gate.
+// Claims-artifact publication CLI (D4 review finding: production wiring;
+// I-06: real D3→D4 producer-run handoff).
+//
+// The artifact is NEVER taken from a local filesystem path — a dispatch
+// starts a fresh runner and a path is not proof of producer origin.
+// Instead the CLI resolves the EXPLICIT producer run (validated run ID),
+// checks it against the EXPECTED producer workflow identity, retrieves
+// the named artifact from that exact run via the authenticated Actions
+// artifacts API, and verifies its byte length, CRC32, claims-grade
+// integrity, and identity expectations BEFORE any publication side
+// effect. See src/claimsProducerHandoff.ts.
 //
 // Usage:
-//   tsx src/claimsPublishCli.ts --repo owner/repo --artifact <file> \
-//     --source-commit <40-hex> --producer-identity <id> --producer-version <v>
+//   tsx src/claimsPublishCli.ts --repo owner/repo \
+//     --producer-run-id <decimal run id> \
+//     --producer-repo <owner/name> \
+//     --producer-workflow <expected workflow name> \
+//     --artifact-name <name> \
+//     --source-commit <40-hex> --producer-identity <id> --producer-version <v> \
+//     [--expected-pool <pool>] [--expected-lp-mint <mint>] [--expected-amm-program-id <id>] \
+//     [--handoff-only]
+//
+// `--handoff-only` runs the verification pipeline and exits WITHOUT any
+// publication side effect (used by the workflow's pre-flight step).
 //
 // The GitHub token is read from GY_CLAIMS_GITHUB_TOKEN (or GITHUB_TOKEN)
 // and is NEVER printed, echoed, or included in error output.
 
-import { readFileSync } from "node:fs";
 import { GitHubClaimsReleaseStore } from "./claimsGitHubStore.js";
 import { runClaimsPublicationSequence, ClaimsPublicationError } from "./claimsPublication.js";
+import {
+  CLAIMS_PRODUCER_ARTIFACT_NAME,
+  DEFAULT_CLAIMS_PRODUCER_REPO,
+  PINNED_CLAIMS_PRODUCER_IDENTITY,
+  fetchVerifiedClaimsArtifact,
+  publishVerifiedProducerArtifact,
+  type ClaimsProducerExpectations,
+} from "./claimsProducerHandoff.js";
 
 interface Args {
   repo: string;
-  artifact: string;
+  producerRunId: number;
+  producerRepo: string;
+  producerWorkflowName: string;
+  artifactName: string;
   sourceCommit: string;
   producerIdentity: string;
   producerVersion: string;
+  expectedPool?: string | undefined;
+  expectedLpMint?: string | undefined;
+  expectedAmmProgramId?: string | undefined;
+  handoffOnly: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -33,27 +62,89 @@ function parseArgs(argv: string[]): Args {
   const missing = (name: string): never => {
     throw new ClaimsPublicationError(`required argument ${name} is missing`);
   };
+  const runIdRaw = argOf("--producer-run-id") ?? missing("--producer-run-id");
+  if (!/^[0-9]+$/.test(runIdRaw)) {
+    throw new ClaimsPublicationError("--producer-run-id must be a decimal run number");
+  }
+  const producerRunId = Number(runIdRaw);
+  if (!Number.isSafeInteger(producerRunId) || producerRunId < 1) {
+    throw new ClaimsPublicationError("--producer-run-id is not a representable run number (safe-integer subset enforced)");
+  }
+  const producerIdentity = argOf("--producer-identity") ?? missing("--producer-identity");
+  if (producerIdentity !== PINNED_CLAIMS_PRODUCER_IDENTITY) {
+    throw new ClaimsPublicationError(
+      `--producer-identity ${JSON.stringify(producerIdentity)} does not match the pinned producer identity ${JSON.stringify(PINNED_CLAIMS_PRODUCER_IDENTITY)}`,
+    );
+  }
   return {
     repo: argOf("--repo") ?? missing("--repo"),
-    artifact: argOf("--artifact") ?? missing("--artifact"),
+    producerRunId,
+    producerRepo: argOf("--producer-repo") ?? DEFAULT_CLAIMS_PRODUCER_REPO,
+    producerWorkflowName: argOf("--producer-workflow") ?? missing("--producer-workflow"),
+    artifactName: argOf("--artifact-name") ?? CLAIMS_PRODUCER_ARTIFACT_NAME,
     sourceCommit: argOf("--source-commit") ?? missing("--source-commit"),
-    producerIdentity: argOf("--producer-identity") ?? missing("--producer-identity"),
+    producerIdentity,
     producerVersion: argOf("--producer-version") ?? missing("--producer-version"),
+    expectedPool: argOf("--expected-pool"),
+    expectedLpMint: argOf("--expected-lp-mint"),
+    expectedAmmProgramId: argOf("--expected-amm-program-id"),
+    handoffOnly: argv.includes("--handoff-only"),
+  };
+}
+
+function expectationsFromArgs(args: Args): ClaimsProducerExpectations {
+  return {
+    producerRepo: args.producerRepo,
+    producerRunId: args.producerRunId,
+    producerWorkflowName: args.producerWorkflowName,
+    artifactName: args.artifactName,
+    sourceCommit: args.sourceCommit,
+    producerIdentity: args.producerIdentity,
+    expectedPool: args.expectedPool,
+    expectedLpMint: args.expectedLpMint,
+    expectedAmmProgramId: args.expectedAmmProgramId,
   };
 }
 
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const token = process.env["GY_CLAIMS_GITHUB_TOKEN"] ?? process.env["GITHUB_TOKEN"] ?? "";
+  const expectations = expectationsFromArgs(args);
+
+  if (args.handoffOnly) {
+    // Pre-flight: READ-ONLY (GET requests only) — verifies the producer
+    // run identity, provenance, and artifact bytes WITHOUT any
+    // publication side effect. Result JSON carries no secret material.
+    const handoff = await fetchVerifiedClaimsArtifact({ token, expectations });
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: true,
+        handoffOnly: true,
+        producerRepo: expectations.producerRepo,
+        producerRunId: expectations.producerRunId,
+        artifactId: handoff.artifactId,
+        artifactName: handoff.artifactName,
+        artifactSha256: handoff.artifactSha256Hex,
+        runHeadSha: handoff.runHeadSha,
+      })}\n`,
+    );
+    return 0;
+  }
+
   const store = new GitHubClaimsReleaseStore({ repo: args.repo, token });
-  const result = await runClaimsPublicationSequence({
-    store,
-    input: {
-      artifactBytes: readFileSync(args.artifact),
-      sourceCommit: args.sourceCommit,
-      producer: { identity: args.producerIdentity, version: args.producerVersion },
-      publishedAtUnixMs: Date.now(),
-    },
+  const result = await publishVerifiedProducerArtifact({
+    token,
+    expectations,
+    publish: (artifactBytes) =>
+      runClaimsPublicationSequence({
+        store,
+        input: {
+          artifactBytes,
+          sourceCommit: args.sourceCommit,
+          producer: { identity: args.producerIdentity, version: args.producerVersion },
+          publishedAtUnixMs: Date.now(),
+        },
+      }),
   });
   // Result JSON carries NO secret material (digests, tags, pointers only).
   process.stdout.write(
