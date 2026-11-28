@@ -18,6 +18,7 @@ import {
   ClaimsPublicationError,
   parseClaimsPointer,
   claimsVersionedTag,
+  rollbackClaimsStableReference,
   type ClaimsReleaseStore,
 } from "../src/claimsPublication.js";
 import { runClaimsPublicationSequence } from "../src/claimsPublication.js";
@@ -419,5 +420,188 @@ describe("D4 review: GitHub adapter (controlled mock, no network)", () => {
     assert.match(yml, /publish-claims-artifact/);
     assert.match(yml, /claims-artifact-prod|claims:publish|claimsPublishCli/);
     assert.ok(!yml.includes("console-snapshot-prod"), "must not touch the ConsoleSnapshotV2 namespace");
+  });
+});
+
+describe("Review round 2, finding 1: no workflow input reaches a run script", () => {
+  test("every expression lives in env:/with: — run: scripts contain no ${{ }}", async () => {
+    const { readFileSync } = await import("node:fs");
+    const yml = readFileSync(new URL("../.github/workflows/publish-claims-artifact.yml", import.meta.url), "utf8");
+    // Concurrency serialization is present (finding 2, primary guard).
+    assert.match(yml, /concurrency:\n\s+group: claims-artifact-publication/);
+    assert.match(yml, /cancel-in-progress: false/);
+    // Every workflow expression must live on an `env:` line, never inside
+    // a `run:` script (finding 1: static injection check).
+    const lines = yml.split("\n");
+    let inRun = false;
+    let runIndent = 0;
+    for (const line of lines) {
+      const runMatch = line.match(/^(\s*)(?:-\s+)?run:\s*(.*)$/);
+      if (runMatch) {
+        const runValue = runMatch[2] ?? "";
+        inRun = !/^[>'\"]/.test(runValue) || runValue.includes("|") || runValue.includes(">");
+        runIndent = runMatch[1]!.length;
+        // inline (single-line) run values must not interpolate expressions
+        if (inRun && runValue && !runValue.includes("|") && !runValue.includes(">")) {
+          assert.ok(!runValue.includes("${{"), `expression inside inline run: ${line.trim()}`);
+          inRun = false;
+        }
+        continue;
+      }
+      if (inRun) {
+        const indent = line.match(/^(\s*)/)?.[1]?.length ?? 0;
+        if (indent <= runIndent) inRun = false;
+        else assert.ok(!line.includes("${{"), `expression inside a run block: ${line.trim()}`);
+      }
+    }
+    // Inputs reach the shell ONLY via env indirection.
+    for (const required of ["CLAIMS_ARTIFACT_PATH", "CLAIMS_SOURCE_COMMIT", "CLAIMS_PRODUCER_IDENTITY", "CLAIMS_PRODUCER_VERSION"]) {
+      assert.match(yml, new RegExp(`^\\s+${required}:\\s+\\$\\{\\{ inputs\\.`, "m"), `env indirection missing: ${required}`);
+    }
+    assert.match(yml, /GY_CLAIMS_GITHUB_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/);
+    // And the run scripts consume quoted env vars, not expressions.
+    for (const quoted of ['"$CLAIMS_ARTIFACT_PATH"', '"$CLAIMS_SOURCE_COMMIT"', '"$CLAIMS_PRODUCER_IDENTITY"', '"$CLAIMS_PRODUCER_VERSION"']) {
+      assert.ok(yml.includes(quoted), `run script must consume ${quoted}`);
+    }
+  });
+});
+
+describe("Review round 2, finding 2: ownership-conditional rollback (concurrent publisher)", () => {
+  function foreignSha(): string {
+    return "f".repeat(40);
+  }
+
+  test("a ref moved by a concurrent publisher is NEVER clobbered by rollback — TERMINAL UNVERIFIED", async () => {
+    // First publication by publisher A.
+    const a = input(validArtifactText());
+    const good = await runClaimsPublicationSequence(a);
+    const refBefore = await a.store.stableRefSha();
+
+    // Publisher B publishes (moves the ref to ITS pointer).
+    const b = input(validArtifactText(), {});
+    const goodB = await runClaimsPublicationSequence({ store: a.store, input: { ...b.input, publishedAtUnixMs: 1_800_060_000_000 } });
+    const refAfterB = await a.store.stableRefSha();
+    assert.notEqual(refAfterB, refBefore, "B moved the ref");
+
+    // Simulate A's LATE rollback (e.g. a delayed verification failure) —
+    // it must refuse because the ref no longer names A's activation.
+    const outcome = await rollbackClaimsStableReference({
+      store: a.store,
+      previous: { versionedTag: good.activatedTag!, tagObjectSha: refBefore!, pointer: parseClaimsPointer((await a.store.fetchTagObject(refBefore!)).message) },
+      activatedTag: good.activatedTag!,
+      activatedTagObjectSha: refBefore!,
+    });
+    assert.equal(outcome, "foreign-reference-untouched", "late rollback must not touch B's ref");
+    assert.equal(await a.store.stableRefSha(), refAfterB, "B's pointer is untouched");
+    void goodB;
+  });
+
+  test("the sequence reports TERMINAL UNVERIFIED when the ref changed hands mid-attempt", async () => {
+    const run = input(validArtifactText());
+    // The attempt activates fine, but by verify time the ref belongs to
+    // someone else (concurrent move between activate and verify).
+    class ConcurrentMove extends InMemoryClaimsReleaseStore {
+      private moved = false;
+      private foreignShaValue = foreignSha();
+      override async stableRefSha(): Promise<string | null> {
+        const sha = await super.stableRefSha();
+        return this.moved ? this.foreignShaValue : sha;
+      }
+      // The FIRST post-activation asset fetch is where the concurrent
+      // publisher wins the race: from that moment the stable ref names the
+      // FOREIGN pointer — and the same fetch returns tampered bytes so the
+      // attempt's own verification fails, driving the rollback path.
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json" && !this.moved) {
+          this.moved = true;
+          const flipped = Uint8Array.from(bytes);
+          flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+          return flipped;
+        }
+        return bytes;
+      }
+    }
+    const t = new ConcurrentMove();
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: t, input: run.input }),
+      (e: ClaimsPublicationError) => e.message.includes("TERMINAL UNVERIFIED") && e.message.includes("NO LONGER names this attempt"),
+      "rollback must refuse to clobber the concurrent publisher",
+    );
+    assert.equal(await t.stableRefSha(), foreignSha(), "the foreign pointer is left untouched");
+  });
+
+  test("owned rollback still restores the previous pointer (unchanged good path)", async () => {
+    const first = input(validArtifactText());
+    const good = await runClaimsPublicationSequence(first);
+    // Inject a verify failure on the second attempt only.
+    class FailOnceVerify extends InMemoryClaimsReleaseStore {
+      private attempts = 0;
+      override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
+        const bytes = await super.fetchAssetByTag(tag, name);
+        if (name === "claims-artifact.json") {
+          this.attempts++;
+          if (this.attempts === 2) {
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
+        }
+        return bytes;
+      }
+    }
+    const t = new FailOnceVerify();
+    await runClaimsPublicationSequence({ store: t, input: { ...input(validArtifactText()).input, publishedAtUnixMs: 1_800_000_000_000 } });
+    await assert.rejects(
+      runClaimsPublicationSequence({ store: t, input: { ...input(validArtifactText()).input, publishedAtUnixMs: 1_800_060_000_000 } }),
+      /rollback RESTORED/,
+    );
+    const refSha = await t.stableRefSha();
+    assert.equal(parseClaimsPointer((await t.fetchTagObject(refSha!)).message).versionedTag, good.activatedTag);
+  });
+
+  test("the adapter refuses a ref move when the live sha does not match the caller's expectation (CAS defense-in-depth)", async () => {
+    const aSha = "1".repeat(40);
+    const bSha = "2".repeat(40);
+    let liveRef: string | null = null; // null = ref absent
+    let patchCalls = 0;
+    const refBody = () => JSON.stringify({ object: { sha: liveRef, type: "tag" } });
+    const fetchImpl = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const method = (init?.method ?? "GET").toUpperCase();
+      const path = url.replace(/^https:\/\/[^/]+/, "");
+      if (path === "/repos/o/r/git/ref/tags/claims-artifact-prod") {
+        return liveRef === null ? new Response(null, { status: 404 }) : new Response(refBody(), { status: 200 });
+      }
+      if (path === "/repos/o/r/git/refs/tags/claims-artifact-prod" && method === "PATCH") {
+        patchCalls++;
+        liveRef = (JSON.parse(String(init?.body)) as { sha: string }).sha;
+        return new Response(refBody(), { status: 200 });
+      }
+      if (path === "/repos/o/r/git/refs" && method === "POST") {
+        patchCalls++;
+        liveRef = (JSON.parse(String(init?.body)) as { sha: string }).sha;
+        return new Response(JSON.stringify({ ref: "refs/tags/claims-artifact-prod" }), { status: 201 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+    const adapter = new GitHubClaimsReleaseStore({ repo: "o/r", token: "t", fetchImpl });
+    // First move with expectation null (first publication) — allowed.
+    await adapter.updateStableRef(aSha, { expectCurrentSha: null });
+    assert.equal(liveRef, aSha);
+    // An attempt that still expects the ref ABSENT must be refused.
+    await assert.rejects(adapter.updateStableRef(bSha, { expectCurrentSha: null }), /refused non-atomic overwrite|moved concurrently/);
+    assert.equal(liveRef, aSha, "ref unchanged after refusal");
+    assert.equal(patchCalls, 1, "no PATCH was issued for a refused move");
+    // A concurrent publisher moved the ref to B; an attempt that still
+    // expects A must be refused, leaving B untouched.
+    liveRef = bSha;
+    patchCalls = 0;
+    await assert.rejects(adapter.updateStableRef(aSha, { expectCurrentSha: aSha }), /moved concurrently/);
+    assert.equal(patchCalls, 0, "no PATCH on ownership mismatch");
+    assert.equal(liveRef, bSha, "B's pointer untouched");
+    // Matching expectation passes.
+    await adapter.updateStableRef(bSha, { expectCurrentSha: bSha });
+    assert.equal(patchCalls, 1);
   });
 });

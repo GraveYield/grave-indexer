@@ -28,6 +28,12 @@ on:
 permissions:
   contents: write
 
+# Review finding 2: publications are SERIALIZED — a second publication
+# waits instead of racing the first one's stable-ref move/rollback.
+concurrency:
+  group: claims-artifact-publication
+  cancel-in-progress: false
+
 jobs:
   publish-claims-artifact:
     runs-on: ubuntu-latest
@@ -50,7 +56,14 @@ jobs:
       - name: Build vendored SDK
         run: pnpm run build:sdk
 
+      # Review finding 1: NO workflow_dispatch input is interpolated into a
+      # `run:` script. Every input crosses into the shell ONLY as an
+      # environment variable (GitHub expands `env:` values, never shell
+      # text) and is consumed as a quoted "$VAR" — a value containing shell
+      # metacharacters stays data, never code.
       - name: Verify the artifact bundle BEFORE any network write
+        env:
+          CLAIMS_ARTIFACT_PATH: ${{ inputs.artifact_path }}
         run: |
           node --import tsx -e "
             const { verifyClaimsArtifactBytes } = await import('./src/claimsArtifact.js');
@@ -58,19 +71,25 @@ jobs:
             const bytes = fs.readFileSync(process.argv[1]);
             const v = verifyClaimsArtifactBytes(bytes);
             console.log('claims-grade artifact verified:', v.rootHex.slice(0, 16) + '…', 'slot', v.snapshotSlot);
-          " "${{ inputs.artifact_path }}"
+          " "$CLAIMS_ARTIFACT_PATH"
 
       - name: Publish (draft-first, immutable, stable-pointer promotion)
         env:
           GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAIMS_ARTIFACT_PATH: ${{ inputs.artifact_path }}
+          CLAIMS_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          CLAIMS_PRODUCER_IDENTITY: ${{ inputs.producer_identity }}
+          CLAIMS_PRODUCER_VERSION: ${{ inputs.producer_version }}
         run: |
           pnpm run claims:publish -- \
-            --repo "${{ github.repository }}" \
-            --artifact "${{ inputs.artifact_path }}" \
-            --source-commit "${{ inputs.source_commit }}" \
-            --producer-identity "${{ inputs.producer_identity }}" \
-            --producer-version "${{ inputs.producer_version }}"
+            --repo "$GITHUB_REPOSITORY" \
+            --artifact "$CLAIMS_ARTIFACT_PATH" \
+            --source-commit "$CLAIMS_SOURCE_COMMIT" \
+            --producer-identity "$CLAIMS_PRODUCER_IDENTITY" \
+            --producer-version "$CLAIMS_PRODUCER_VERSION"
 
       - name: Report
         if: always()
-        run: 'echo "claims publication job finished (status: ${{ job.status }})"'
+        env:
+          GITHUB_JOB_STATUS: ${{ job.status }}
+        run: 'echo "claims publication job finished (status: $GITHUB_JOB_STATUS)"'

@@ -502,6 +502,7 @@ describe("claims publication sequence (draft-first, fixture store)", () => {
       store,
       previous,
       activatedTag: claimsVersionedTag(1_800_000_180_000, "a".repeat(40)),
+      activatedTagObjectSha: sha, // this attempt activated exactly this tag object
     });
     assert.equal(outcome, "restored");
     const refSha = await store.stableRefSha();
@@ -517,6 +518,7 @@ describe("claims publication sequence (draft-first, fixture store)", () => {
       store,
       previous: first.previous, // null — first publication
       activatedTag: first.activatedTag!,
+      activatedTagObjectSha: (await store.stableRefSha()) ?? "<never-activated>",
     });
     assert.equal(outcome, "first-publication-removed");
     assert.equal(await store.stableRefSha(), null);

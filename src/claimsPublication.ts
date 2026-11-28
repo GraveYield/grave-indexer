@@ -315,7 +315,7 @@ export interface ClaimsReleaseStore {
   /** Mirrors POST /git/tags — creates an immutable annotated tag object. */
   createTagObject(args: { message: string; commitSha: string }): Promise<string>;
   /** Mirrors POST/PATCH /git/refs/tags/claims-artifact-prod — the ONE atomic pointer move. */
-  updateStableRef(tagObjectSha: string): Promise<void>;
+  updateStableRef(tagObjectSha: string, opts?: { expectCurrentSha?: string | null }): Promise<void>;
   /** Mirrors DELETE /git/refs/tags/claims-artifact-prod — first-publication rollback only. */
   deleteStableRef(): Promise<void>;
   /** Mirrors GET /git/tags/{sha}. */
@@ -381,7 +381,7 @@ export class InMemoryClaimsReleaseStore implements ClaimsReleaseStore {
     return sha;
   }
 
-  async updateStableRef(tagObjectSha: string): Promise<void> {
+  async updateStableRef(tagObjectSha: string, _opts?: { expectCurrentSha?: string | null }): Promise<void> {
     if (!this.tagObjects.has(tagObjectSha)) {
       throw new ClaimsPublicationError(`tag object ${tagObjectSha} does not exist — ref update refused (HTTP 422)`);
     }
@@ -605,12 +605,15 @@ export async function runClaimsPublicationSequence(opts: {
     throw err;
   }
 
-  // ── 7. activate-stable-reference (ONE atomic pointer move) ──────────────
+  // ── 7. activate-stable-reference (ONE ownership-checked pointer move) ───
   // D4 review: ANY failure at or after activation automatically restores
-  // the previous known-good reference; ambiguous failures are handled
-  // conservatively and an unrestorable state is reported as an explicit
-  // terminal "unverified" outcome — never silently.
+  // the previous known-good reference — but ONLY if the stable ref still
+  // belongs to THIS attempt. If another publisher moved it concurrently,
+  // rollback leaves the ref untouched and reports TERMINAL UNVERIFIED
+  // (review finding 2). Ambiguous failures are handled conservatively and
+  // an unverifiable state is reported explicitly — never silently.
   let activated = false;
+  let activatedTagObjectSha: string | null = null;
   try {
   const { pointer, pointerJson } = buildClaimsPointer({
     versionedTag: tag,
@@ -628,7 +631,8 @@ export async function runClaimsPublicationSequence(opts: {
     previous: previous === null ? null : { versionedTag: previous.versionedTag, tagObjectSha: previous.tagObjectSha },
   });
   const newSha = await store.createTagObject({ message: pointerJson, commitSha: input.sourceCommit });
-  await store.updateStableRef(newSha);
+  await store.updateStableRef(newSha, { expectCurrentSha: previous?.tagObjectSha ?? null });
+  activatedTagObjectSha = newSha;
   executed.push("activate-stable-reference");
 
   // ── 8. verify-stable-reference (identity chain over the moved ref) ──────
@@ -669,6 +673,7 @@ export async function runClaimsPublicationSequence(opts: {
       store,
       previous,
       activatedTag: tag,
+      activatedTagObjectSha: activatedTagObjectSha ?? "<never-activated>",
     }).catch((rbErr: unknown) => {
       // Ambiguous/failed rollback attempt itself: handled conservatively —
       // this is an explicit TERMINAL UNVERIFIED state.
@@ -677,6 +682,11 @@ export async function runClaimsPublicationSequence(opts: {
       );
     });
     const detail = activationErr instanceof Error ? activationErr.message : String(activationErr);
+    if (outcome === "foreign-reference-untouched") {
+      throw new ClaimsPublicationError(
+        `publication failed after stable-reference activation (${detail}); the stable reference NO LONGER names this attempt's tag object — a concurrent publisher owns it now. Rollback left the reference UNTOUCHED to avoid clobbering the other publisher's update — TERMINAL UNVERIFIED STATE: inspect the stable reference manually before any further publication`,
+      );
+    }
     if (outcome === "unverified") {
       throw new ClaimsPublicationError(
         `publication failed after stable-reference activation (${detail}); rollback could NOT be verified — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
@@ -701,12 +711,37 @@ export async function rollbackClaimsStableReference(opts: {
   previous: ClaimsSequenceResult["previous"];
   /** The pointer this run had activated (for the verify step). */
   activatedTag: string;
-}): Promise<"restored" | "first-publication-removed" | "unverified"> {
-  const { store, previous } = opts;
+  /**
+   * The tag-object SHA this attempt activated. Rollback touches the ref
+   * ONLY if the stable ref still names THIS sha — a ref that has been
+   * moved by a concurrent publisher is left untouched (review finding 2).
+   */
+  activatedTagObjectSha: string;
+}): Promise<"restored" | "first-publication-removed" | "foreign-reference-untouched" | "unverified"> {
+  const { store, previous, activatedTagObjectSha } = opts;
+
+  // OWNERSHIP GATE (review finding 2): the ref may be restored/deleted
+  // only while it still names THIS attempt's activation. A ref that names
+  // nothing (first publication that never activated) or this attempt's
+  // sha is owned; anything else belongs to a concurrent publisher.
+  const currentSha = await store.stableRefSha();
+  const owned =
+    currentSha === null
+      ? previous === null // first publication, activation never landed
+      : currentSha === activatedTagObjectSha;
+  if (!owned) return "foreign-reference-untouched";
+
   if (previous === null) {
     await store.deleteStableRef();
     if ((await store.stableRefSha()) !== null) return "unverified";
     return "first-publication-removed";
+  }
+  // If the ref still names the PREVIOUS pointer, this attempt never
+  // actually moved it — nothing to restore; the read-back below proves it.
+  if (currentSha !== activatedTagObjectSha) {
+    // unreachable (owned implies currentSha === activatedTagObjectSha or
+    // null-with-previous-null); kept as a guard.
+    return "unverified";
   }
   const object = await store.fetchTagObject(previous.tagObjectSha);
   const restoredPointer = parseClaimsPointer(object.message);
@@ -714,7 +749,7 @@ export async function rollbackClaimsStableReference(opts: {
     return "unverified";
   }
   const newSha = await store.createTagObject({ message: object.message, commitSha: object.commitSha });
-  await store.updateStableRef(newSha);
+  await store.updateStableRef(newSha, { expectCurrentSha: activatedTagObjectSha });
   const refSha = await store.stableRefSha();
   const readBack = refSha === null ? null : await store.fetchTagObject(refSha).then((o) => parseClaimsPointer(o.message));
   if (readBack?.versionedTag !== previous.versionedTag) return "unverified";
