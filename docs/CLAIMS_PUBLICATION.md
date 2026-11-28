@@ -58,19 +58,28 @@ interface method documents its exact GitHub REST mirror):
 4. **upload-draft-assets** — artifact + manifest + checksum uploaded into the DRAFT.
 5. **verify-draft-readback** — fetch the assets BACK from the draft; verify digest + byte length + checksum sidecar + FULL claims-grade re-verification.
 6. **publish-immutable-release** — `PATCH /releases/{id} {draft:false, make_latest:"false"}`. From here the versioned identity is immutable by publisher convention: assets are never re-uploaded, never mutated.
-7. **activate-stable-reference** — the pointer JSON (digests, byte lengths, schema version, pool, mint, snapshot slot, root, producer identity, previous pointer) is written into a NEW annotated tag object (`POST /git/tags`), and `refs/tags/claims-artifact-prod` moves with ONE ownership-checked ref update. This is the only stable-pointer operation in the whole sequence. Honest note (I-05): the GitHub refs API has no conditional write — the update is verify-then-write (the expected current sha is checked against the live ref first), never a true compare-and-swap; the workflow `concurrency` group serializes publication runs, and an external writer that wins the race is reported (TERMINAL UNVERIFIED), never clobbered.
-8. **verify-stable-reference** — re-read the ref, parse the pointer, fetch the assets from the POINTER's versioned release, verify digests/lengths/checksum and the artifact identity (root/pool/mint/slot) against the pointer.
+7. **verify-versioned-release** (I-05) — the FULL pointer-identity verification (digests, lengths, checksum, claims-grade re-verification, artifact identity) over the PUBLISHED versioned release, BEFORE any stable-ref write. Every content failure is caught while the stable pointer is still untouched, so destructive rollback is needed ONLY for failures of the ref move itself or of the post-move read — the architecture deliberately minimizes the scenarios that require destructive rollback.
+8. **activate-stable-reference** — the pointer JSON (digests, byte lengths, schema version, pool, mint, snapshot slot, root, producer identity, previous pointer) is written into a NEW annotated tag object (`POST /git/tags`), and `refs/tags/claims-artifact-prod` moves with ONE ownership-checked ref update. This is the only stable-pointer operation in the whole sequence. Honest note (I-05): the GitHub refs API has no conditional write — the update is verify-then-write with a POST-WRITE READ-BACK, never a true compare-and-swap; the workflow `concurrency` group serializes publication runs, and an external writer that wins the race is reported (TERMINAL UNVERIFIED), never silently accepted.
+9. **verify-stable-reference** — re-read the ref, parse the pointer, fetch the assets from the POINTER's versioned release, verify digests/lengths/checksum and the artifact identity (root/pool/mint/slot) against the pointer.
 
 Failure semantics:
 
-* Any failure **before step 6** deletes ONLY this run's un-published
+* Any failure **before step 8** deletes ONLY this run's un-published
   draft (a failed cleanup is surfaced loudly) — the previous
-  last-known-good pointer is untouched and keeps serving.
-* Any failure **at or after step 7** is rolled back by
+  last-known-good pointer is untouched and keeps serving. Since step 7
+  was added (I-05), every CONTENT failure lands here, not in the
+  rollback path.
+* Any failure **at or after step 8** is rolled back by
   `rollbackClaimsStableReference`: the previous pointer's tag object is
   re-created and the ref moved back (or the first-publication ref is
   deleted), and the restoration is verified by read-back. An
   unverifiable restoration is reported as `unverified` — never silent.
+  Every outcome is OBSERVABLE AND AUDITABLE: the sequence throws a
+  `ClaimsRollbackOutcomeError` carrying `rollbackOutcome`
+  (`restored` | `first-publication-removed` |
+  `foreign-reference-untouched` | `unverified`) and `rollbackAudit` —
+  the ordered ref observations (ownership-gate reads, refusals,
+  ownership-verified writes, read-backs) that produced the outcome.
 
 ## Immutable identity and digest semantics
 
@@ -85,14 +94,18 @@ Failure semantics:
 
 ## Environment configuration (operator)
 
-The production workflow (modeled on `publish-console-snapshot.yml`)
-requires only GitHub's standard tokens — no new secrets:
+The production workflow (`publish-claims-artifact.yml`) requires:
 
-* `GITHUB_TOKEN` (workflow scope: `contents: read and write`) for
-  releases, tags, and refs.
-* The claims artifact bundle (artifact + manifest + checksum) is staged
-  by the D3 run; the publication job re-verifies the bundle before any
-  network write.
+* `GITHUB_TOKEN` (workflow scope: `contents: read and write`) for the
+  publication writes in THIS repository (releases, tags, refs).
+* `GY_CLAIMS_PRODUCER_TOKEN` (repository secret) — I-06 cross-repo
+  auth: a fine-grained token scoped to **actions:read on
+  `GraveYield/graveyield-protocol`, nothing more**. The automatic
+  `GITHUB_TOKEN` of grave-indexer CANNOT read another repository's
+  Actions runs or artifacts, so the handoff authenticates with this
+  dedicated secret (`GY_CLAIMS_PRODUCER_GITHUB_TOKEN` for the CLI). The
+  two tokens are never swapped: publication writes use `GITHUB_TOKEN`,
+  producer-run reads use `GY_CLAIMS_PRODUCER_TOKEN`.
 
 No artifact metadata, log line, pointer field, or test fixture may ever
 carry a credential. The pointer schema is pinned to a fixed key set
@@ -137,23 +150,53 @@ RUN.
 * The claims artifact is sealed by the Rust `grave-snapshotter-cli`
   (`snapshotter/src/bin/grave-snapshotter-cli.rs` in
   `GraveYield/graveyield-protocol`), which writes the deterministic
-  artifact JSON to an `--out` path.
+  artifact JSON to an `--out` path. Required inputs: `--url` (RPC),
+  `--pool`, `--amm`, `--lp-mint`, `--out`, `--commitment
+  <confirmed|finalized>` (required, never defaulted), `--lock-evidence
+  rpc` (REQUIRED — real UNCX Raydium AMM V4 locker evidence via
+  `getProgramAccounts`; an empty lock list is never substituted), and
+  `--sink-ledger <file>` (a governed `gy.sink-ledger.v1` ledger;
+  malformed/unsupported/mismatched input aborts the run).
 * The manifest and checksum are DERIVED by the publication sequence from
   the artifact bytes — the only producer-side deliverable is the single
   `claims-artifact.json`.
-* **Missing producer-side dependency (honest):** NO workflow in
-  `graveyield-protocol` currently runs `grave-snapshotter-cli` and
-  uploads `claims-artifact.json` as a named run artifact
-  (`ci.yml` runs `cargo test -p grave-snapshotter` only; `fork-harness.yml`
-  uploads only a failure log). Until such a producer workflow exists,
-  every publication dispatch fails CLOSED at the handoff step
-  ("missing artifact") — by design. No fixture simulates the handoff.
+* **Producer workflow (companion change):** the producer side is the
+  `claims-snapshot.yml` workflow (workflow `name:`
+  `grave-snapshotter-cli`) in `GraveYield/graveyield-protocol`. It is a
+  `workflow_dispatch`-only, read-only validation producer: it checks out
+  the exact dispatch commit, builds the pinned Rust toolchain (1.91.1,
+  per `rust-toolchain.toml`, `--locked`), requires pool/AMM/LP-mint +
+  commitment + a governed sink ledger as dispatch inputs, requires the
+  `SNAPSHOTTER_RPC_URL` secret (fails closed when unset — the RPC URL is
+  credential-bearing and never logged), runs the real
+  `grave-snapshotter-cli`, and uploads TWO Actions run artifacts:
+  `claims-artifact.json` (the exact sealed artifact — the name the
+  indexer handoff retrieves) and `claims-artifact-provenance` (sha256,
+  byte length, toolchain, producer commit SHA, run id, sink-ledger input
+  digest). It NEVER creates a release, NEVER moves a ref, NEVER signs or
+  submits a transaction, and its artifact is NEVER a production claims
+  release.
+* **Demonstration status (honest):** the producer workflow is
+  implemented and validated structurally (parsed + safety-pinned by
+  tests), and its fail-closed behavior was demonstrated against a real
+  controlled dispatch WITHOUT the RPC secret (the run aborts at the
+  secret gate before any RPC call). The POSITIVE path — a real run
+  against governed sink-ledger input + RPC-backed locker evidence,
+  followed by a genuine cross-repository artifact retrieval by the
+  indexer — has NOT been demonstrated yet (it requires the
+  `SNAPSHOTTER_RPC_URL` secret and real governed pool inputs, which are
+  outside this change's authority). Until that demonstration exists,
+  the producer workflow must be treated as prepared, not operational.
 
 ### Operator procedure
 
-1. Run the producer workflow in `GraveYield/graveyield-protocol` (once it
-   exists) with the correct commit; note its numeric run ID from the run
-   URL (`.../actions/runs/<id>`).
+1. Run the producer workflow (`grave-snapshotter-cli`) in
+   `GraveYield/graveyield-protocol` from the intended commit with the
+   governed inputs: `pool`, `amm`, `lp_mint` (base58 pubkeys),
+   `commitment` (`confirmed`/`finalized`), and `sink_ledger` (the full
+   `gy.sink-ledger.v1` document — a run with an empty or malformed
+   ledger fails closed). Note its numeric run ID from the run URL
+   (`.../actions/runs/<id>`) and its head commit (the dispatch ref).
 2. Dispatch `publish-claims-artifact` in `grave-indexer` with:
    `producer_run_id` (that run ID), `source_commit` (the 40-hex commit —
    it must equal the producer run's head commit), `producer_identity`
@@ -169,14 +212,16 @@ RUN.
    publication workflow's environment
    (`GY_CLAIMS_PRODUCER_WORKFLOW`, `GY_CLAIMS_ARTIFACT_NAME`) — never
    accepted as dispatch inputs, so an attacker cannot point the
-   provenance check at their own workflow. When the producer workflow
-   lands, set `GY_CLAIMS_PRODUCER_WORKFLOW` to its exact `name`.
+   provenance check at their own workflow. The pinned value
+   (`grave-snapshotter-cli`) is lock-step with the companion workflow's
+   `name:` and enforced by `test/claimsReview.test.ts`.
 5. Failures are reported in the step log and the job fails; no partial
    publication state can exist (the handoff performs zero writes).
 
 ### Rollback safety against foreign stable-reference updates (I-05)
 
-The stable-reference rollback is OWNERSHIP-CONDITIONAL:
+The stable-reference rollback is OWNERSHIP-CONDITIONAL and
+POST-WRITE-VERIFIED:
 
 * An ALREADY-ABSENT ref is verified by re-read and treated as absent —
   no DELETE request is issued (the GitHub refs API answers 404 for an
@@ -190,11 +235,30 @@ The stable-reference rollback is OWNERSHIP-CONDITIONAL:
   known) and failed read-backs are reported TERMINAL UNVERIFIED with zero
   destructive calls.
 * Ref moves and deletes verify the live sha against the caller's
-  expectation before writing. Honest: the GitHub refs API has no
-  conditional write — this is verify-then-write, NOT atomic
-  compare-and-swap. The workflow `concurrency` group serializes this
-  repo's publication runs; EXTERNAL writers are handled by the ownership
-  gate and refusal, never by trusting the concurrency group.
+  expectation before writing, and BOTH are verified AGAIN immediately
+  after the write (post-write read-back): a foreign write that lands
+  between the write and the read-back is DETECTED and reported, never
+  silently accepted. An absent ref is created with `POST /git/refs`,
+  which the real API refuses with HTTP 422 when the ref came into
+  existence concurrently — a natural insert-if-absent guard.
+* Honest residual boundary (recorded, not hidden): the GitHub REST API
+  has NO conditional write or conditional DELETE for refs. This is
+  verify-then-write, NOT atomic compare-and-swap. A foreign write that
+  lands in the probe→write window (between the ownership check and the
+  PATCH/DELETE) is overwritten — no REST call can prevent this. The
+  detection window (write→read-back) is the adapter's guarantee, not the
+  write window. Operational mitigations: the workflow `concurrency`
+  group serializes this repo's publication runs, and a GitHub TAG
+  PROTECTION RULE on `refs/tags/claims-artifact-prod` is the real
+  defense against external writers — configure it before the first
+  production publication. These regression bounds are pinned by
+  adapter-level tests (`test/claimsRollbackGitHubAdapter.test.ts`) that
+  reproduce each interleaving deterministically against a mock of the
+  documented REST semantics — including the test that PROVES the
+  probe→PATCH clobber cannot be prevented.
+* Every rollback outcome carries a structured audit trail
+  (`ClaimsRollbackOutcomeError.rollbackOutcome` + `rollbackAudit`) —
+  observable, machine-readable, and safe to log (never a secret).
 
 ## Honest limitation (recorded)
 

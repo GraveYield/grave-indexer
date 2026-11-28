@@ -27,6 +27,14 @@
 //
 // The GitHub token is read from GY_CLAIMS_GITHUB_TOKEN (or GITHUB_TOKEN)
 // and is NEVER printed, echoed, or included in error output.
+//
+// I-06 CROSS-REPO AUTH (explicit, documented): the producer run lives in
+// GraveYield/graveyield-protocol, and the automatic GITHUB_TOKEN of the
+// grave-indexer workflow CANNOT read another repository's Actions runs or
+// artifacts. The handoff therefore uses GY_CLAIMS_PRODUCER_GITHUB_TOKEN
+// (a fine-grained token scoped to actions:read on the producer repo),
+// falling back to the publication token only when the two coincide (e.g.
+// a same-repo rehearsal). The two concerns are never swapped silently:
 
 import { GitHubClaimsReleaseStore } from "./claimsGitHubStore.js";
 import { runClaimsPublicationSequence, ClaimsPublicationError } from "./claimsPublication.js";
@@ -109,13 +117,17 @@ function expectationsFromArgs(args: Args): ClaimsProducerExpectations {
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   const token = process.env["GY_CLAIMS_GITHUB_TOKEN"] ?? process.env["GITHUB_TOKEN"] ?? "";
+  // The PRODUCER-side token (Actions runs/artifacts of the producer repo).
+  // Falls back to the publication token only when no dedicated one is set
+  // (same-repo rehearsal); cross-repo retrieval REQUIRES the dedicated one.
+  const producerToken = process.env["GY_CLAIMS_PRODUCER_GITHUB_TOKEN"] ?? token;
   const expectations = expectationsFromArgs(args);
 
   if (args.handoffOnly) {
     // Pre-flight: READ-ONLY (GET requests only) — verifies the producer
     // run identity, provenance, and artifact bytes WITHOUT any
     // publication side effect. Result JSON carries no secret material.
-    const handoff = await fetchVerifiedClaimsArtifact({ token, expectations });
+    const handoff = await fetchVerifiedClaimsArtifact({ token: producerToken, expectations });
     process.stdout.write(
       `${JSON.stringify({
         ok: true,
@@ -133,7 +145,7 @@ async function main(): Promise<number> {
 
   const store = new GitHubClaimsReleaseStore({ repo: args.repo, token });
   const result = await publishVerifiedProducerArtifact({
-    token,
+    token: producerToken,
     expectations,
     publish: (artifactBytes) =>
       runClaimsPublicationSequence({

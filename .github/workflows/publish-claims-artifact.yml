@@ -15,9 +15,12 @@
 # artifact is retrieved from an explicit, validated PRODUCER RUN in the
 # producer repository (graveyield-protocol, where the Rust
 # grave-snapshotter-cli lives) via the authenticated Actions artifacts
-# API, then fully re-verified before any network write. See
-# docs/CLAIMS_PUBLICATION.md § "D3→D4 artifact handoff" for the operator
-# procedure and the currently-missing producer-side upload.
+# API, then fully re-verified before any network write. The producer
+# workflow is the COMPANION `claims-snapshot.yml` (name:
+# grave-snapshotter-cli) in GraveYield/graveyield-protocol — a
+# read-only, artifact-only validation producer that never creates a
+# release, never moves a ref, and never signs or submits transactions.
+# See docs/CLAIMS_PUBLICATION.md § "D3→D4 artifact handoff".
 name: publish-claims-artifact
 
 on:
@@ -56,12 +59,13 @@ env:
   # ── PINNED PRODUCER IDENTITY (I-06) ─────────────────────────────────
   # These expectations are pinned HERE, never passed as dispatch inputs —
   # an attacker must not be able to point the provenance check at their
-  # own workflow. GY_CLAIMS_PRODUCER_WORKFLOW must be set to the exact
-  # workflow `name` of the (future) producer workflow in
+  # own workflow. GY_CLAIMS_PRODUCER_WORKFLOW must equal the exact
+  # workflow `name` of the producer workflow in
   # GraveYield/graveyield-protocol that runs grave-snapshotter-cli and
-  # uploads `claims-artifact.json` as a run artifact. Until that producer
-  # workflow exists and uploads the artifact, every dispatch fails closed
-  # at the handoff step (missing artifact) — by design, honestly (I-06).
+  # uploads `claims-artifact.json` as a run artifact — the COMPANION
+  # `claims-snapshot.yml` pins `name: grave-snapshotter-cli`; the value
+  # below MUST stay in lock-step with it (enforced by
+  # test/claimsReview.test.ts).
   GY_CLAIMS_PRODUCER_REPO: GraveYield/graveyield-protocol
   GY_CLAIMS_PRODUCER_WORKFLOW: grave-snapshotter-cli
   GY_CLAIMS_ARTIFACT_NAME: claims-artifact.json
@@ -94,6 +98,16 @@ jobs:
       # length + CRC32, claims-grade integrity, pool identity. NO release,
       # tag, ref, or asset is touched in this step.
       #
+      # I-06 CROSS-REPO AUTH: the producer run lives in
+      # graveyield-protocol, and this repository's automatic GITHUB_TOKEN
+      # CANNOT read another repository's Actions runs or artifacts. The
+      # handoff therefore authenticates with GY_CLAIMS_PRODUCER_TOKEN —
+      # an operator-provided fine-grained token scoped to actions:read on
+      # GraveYield/graveyield-protocol, NOTHING more. The publication
+      # writes use the automatic GITHUB_TOKEN (contents: write on THIS
+      # repo); the two tokens are never swapped. The CLI wires the
+      # producer token to GY_CLAIMS_PRODUCER_GITHUB_TOKEN.
+      #
       # Round-2 finding 1: NO dispatch input is interpolated into a `run:`
       # script. Every input crosses into the shell ONLY as an environment
       # variable (GitHub expands `env:` values, never shell text) and is
@@ -101,6 +115,7 @@ jobs:
       # metacharacters stays data, never code.
       - name: Verify the producer-run artifact (READ-ONLY handoff pre-flight)
         env:
+          GY_CLAIMS_PRODUCER_GITHUB_TOKEN: ${{ secrets.GY_CLAIMS_PRODUCER_TOKEN }}
           GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CLAIMS_PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
           CLAIMS_SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -122,6 +137,7 @@ jobs:
 
       - name: Publish (draft-first, immutable, stable-pointer promotion)
         env:
+          GY_CLAIMS_PRODUCER_GITHUB_TOKEN: ${{ secrets.GY_CLAIMS_PRODUCER_TOKEN }}
           GY_CLAIMS_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CLAIMS_PRODUCER_RUN_ID: ${{ inputs.producer_run_id }}
           CLAIMS_SOURCE_COMMIT: ${{ inputs.source_commit }}

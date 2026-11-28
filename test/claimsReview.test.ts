@@ -190,7 +190,7 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
     const run = input(validArtifactText());
     await assert.rejects(
       runClaimsPublicationSequence({ store: failingStore(run.store, "updateStableRef"), input: run.input }),
-      /rollback (RESTORED|left the stable reference ABSENT)/,
+      /rollback (RESTORED the previous known-good pointer|removed THIS attempt's reference|left the stable reference ABSENT)/,
     );
     assert.equal(await run.store.stableRefSha(), null, "no half-activated pointer survives");
     assert.ok(run.store.hasRelease(claimsVersionedTag(1_800_000_000_000, "a".repeat(40))), "the versioned release (immutable identity) survives");
@@ -199,12 +199,21 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
   test("verify-stable-reference fault (asset mismatch): previous pointer restored and verified", async () => {
     let knownGoodTag: string | null = null;
     class TamperedServing extends InMemoryClaimsReleaseStore {
+      // Per-tag artifact-fetch counter: fetch #1 is the PRE-activation
+      // verify-versioned-release check, fetch #2 is the POST-activation
+      // verify-stable-reference check. The tamper fires on #2 so the
+      // failure happens AFTER activation and drives the rollback path.
+      private artifactFetches = new Map<string, number>();
       override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json" && knownGoodTag !== null && tag !== knownGoodTag) {
-          const flipped = Uint8Array.from(bytes);
-          flipped[0] = (flipped[0] ?? 0) ^ 0x01;
-          return flipped;
+          const n = (this.artifactFetches.get(tag) ?? 0) + 1;
+          this.artifactFetches.set(tag, n);
+          if (n === 2) {
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
         }
         return bytes;
       }
@@ -246,7 +255,7 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json") {
           this.verifyFetched += 1;
-          if (this.verifyFetched === 1) {
+          if (this.verifyFetched === 2) { // fetch #2 = the POST-activation stable verify
             const flipped = Uint8Array.from(bytes);
             flipped[0] = (flipped[0] ?? 0) ^ 0x01;
             return flipped;
@@ -283,7 +292,7 @@ describe("D4 review: automatic post-activation rollback (fault injection)", () =
     await assert.rejects(
       runClaimsPublicationSequence({ store: broken, input: run.input }),
       (e: ClaimsPublicationError) =>
-        e.message.includes("left the stable reference ABSENT") && !e.message.includes("TERMINAL UNVERIFIED"),
+        e.message.includes("the absence was verified by re-read") && !e.message.includes("TERMINAL UNVERIFIED"),
     );
     assert.equal(await run.store.stableRefSha(), null, "the ref is still absent");
   });
@@ -496,6 +505,13 @@ describe("Review round 2, finding 1: no workflow input reaches a run script", ()
       assert.match(yml, new RegExp(`^\\s+${required}:\\s+\\$\\{\\{ inputs\\.`, "m"), `env indirection missing: ${required}`);
     }
     assert.match(yml, /GY_CLAIMS_GITHUB_TOKEN: \$\{\{ secrets\.GITHUB_TOKEN \}\}/);
+    // I-06 cross-repo auth: the handoff authenticates to graveyield-protocol
+    // with the DEDICATED producer token (actions:read there, nothing more) —
+    // the automatic GITHUB_TOKEN cannot read another repository's Actions
+    // artifacts and must never be the only credential for the handoff.
+    assert.match(yml, /GY_CLAIMS_PRODUCER_GITHUB_TOKEN: \$\{\{ secrets\.GY_CLAIMS_PRODUCER_TOKEN \}\}/);
+    const handoffEnvCount = (yml.match(/GY_CLAIMS_PRODUCER_GITHUB_TOKEN: \$\{\{ secrets\.GY_CLAIMS_PRODUCER_TOKEN \}\}/g) ?? []).length;
+    assert.equal(handoffEnvCount, 2, "both the pre-flight and the publish step carry the producer token");
     // And the run scripts consume quoted env vars, not expressions.
     for (const quoted of ['"$CLAIMS_PRODUCER_RUN_ID"', '"$CLAIMS_SOURCE_COMMIT"', '"$CLAIMS_PRODUCER_IDENTITY"', '"$CLAIMS_PRODUCER_VERSION"', '"$CLAIMS_EXPECTED_POOL"']) {
       assert.ok(yml.includes(quoted), `run script must consume ${quoted}`);
@@ -507,6 +523,11 @@ describe("Review round 2, finding 1: no workflow input reaches a run script", ()
     assert.match(yml, /GY_CLAIMS_PRODUCER_REPO: GraveYield\/graveyield-protocol/);
     assert.match(yml, /GY_CLAIMS_PRODUCER_WORKFLOW: /);
     assert.match(yml, /GY_CLAIMS_ARTIFACT_NAME: claims-artifact\.json/);
+    // I-06: the pinned producer workflow identity is the companion
+    // claims-snapshot workflow in graveyield-protocol; the value must stay
+    // in lock-step with that workflow's `name`.
+    assert.match(yml, /GY_CLAIMS_PRODUCER_WORKFLOW: grave-snapshotter-cli\s*$/m);
+    assert.match(yml, /--producer-workflow "\$GY_CLAIMS_PRODUCER_WORKFLOW"/);
     assert.match(yml, /--producer-run-id "\$CLAIMS_PRODUCER_RUN_ID"/);
   });
 });
@@ -547,6 +568,7 @@ describe("Review round 2, finding 2: ownership-conditional rollback (concurrent 
     // someone else (concurrent move between activate and verify).
     class ConcurrentMove extends InMemoryClaimsReleaseStore {
       private moved = false;
+      private artifactFetches = 0;
       private foreignShaValue = foreignSha();
       override async stableRefSha(): Promise<string | null> {
         const sha = await super.stableRefSha();
@@ -559,10 +581,16 @@ describe("Review round 2, finding 2: ownership-conditional rollback (concurrent 
       override async fetchAssetByTag(tag: string, name: string): Promise<Uint8Array> {
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json" && !this.moved) {
-          this.moved = true;
-          const flipped = Uint8Array.from(bytes);
-          flipped[0] = (flipped[0] ?? 0) ^ 0x01;
-          return flipped;
+          // Artifact fetch #1 = pre-activation check (still owned);
+          // fetch #2 = the first POST-activation fetch, where the
+          // concurrent publisher wins the race.
+          this.artifactFetches += 1;
+          if (this.artifactFetches === 2) {
+            this.moved = true;
+            const flipped = Uint8Array.from(bytes);
+            flipped[0] = (flipped[0] ?? 0) ^ 0x01;
+            return flipped;
+          }
         }
         return bytes;
       }
@@ -586,7 +614,7 @@ describe("Review round 2, finding 2: ownership-conditional rollback (concurrent 
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json") {
           this.attempts++;
-          if (this.attempts === 2) {
+          if (this.attempts === 4) { // attempt 2, fetch #2 = the POST-activation stable verify
             const flipped = Uint8Array.from(bytes);
             flipped[0] = (flipped[0] ?? 0) ^ 0x01;
             return flipped;
@@ -837,7 +865,7 @@ describe("I-05: rollback safety against foreign stable-reference updates", () =>
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json") {
           this.verifyFetched += 1;
-          if (this.verifyFetched === 1) {
+          if (this.verifyFetched === 2) { // fetch #2 = the POST-activation stable verify
             const flipped = Uint8Array.from(bytes);
             flipped[0] = (flipped[0] ?? 0) ^ 0x01;
             return flipped;
@@ -850,7 +878,7 @@ describe("I-05: rollback safety against foreign stable-reference updates", () =>
     const { store: wrapped, calls } = counted(store);
     await assert.rejects(
       runClaimsPublicationSequence({ store: wrapped, input: run.input }),
-      /left the stable reference ABSENT/,
+      /removed THIS attempt's reference|left the stable reference ABSENT/,
     );
     assert.equal(calls.delete, 1, "exactly one conditional DELETE of the owned ref");
     assert.equal(await store.stableRefSha(), null, "the owned ref is gone");
@@ -916,9 +944,9 @@ describe("I-05: rollback safety against foreign stable-reference updates", () =>
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json") {
           this.verifyFetched += 1;
-          if (this.verifyFetched === 2) {
-            // attempt 2's stable verify: an external writer deletes the ref
-            // and the verification fails at the same moment.
+          if (this.verifyFetched === 4) {
+            // attempt 2's POST-activation stable verify: an external writer
+            // deletes the ref and the verification fails at the same moment.
             this.gone = true;
             const flipped = Uint8Array.from(bytes);
             flipped[0] = (flipped[0] ?? 0) ^ 0x01;
@@ -951,8 +979,8 @@ describe("I-05: rollback safety against foreign stable-reference updates", () =>
         const bytes = await super.fetchAssetByTag(tag, name);
         if (name === "claims-artifact.json") {
           this.verifyFetched += 1;
-          if (this.verifyFetched === 2) {
-            // attempt 2's verify: tamper → drives the rollback
+          if (this.verifyFetched === 4) {
+            // attempt 2's POST-activation verify: tamper → drives the rollback
             const flipped = Uint8Array.from(bytes);
             flipped[0] = (flipped[0] ?? 0) ^ 0x01;
             return flipped;

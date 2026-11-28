@@ -23,17 +23,25 @@
 //   6. publish-immutable-release   flip draft → published (--latest=false);
 //                                  the versioned identity is immutable from
 //                                  here (assets never re-uploaded)
-//   7. activate-stable-reference   pointer JSON into a NEW annotated tag
+//   7. verify-versioned-release    fetch the assets from the VERSIONED
+//                                  release and run the FULL pointer-identity
+//                                  verification BEFORE any stable-ref write
+//                                  (I-05 architecture: every content failure
+//                                  is caught while the stable pointer is
+//                                  still untouched, so destructive rollback
+//                                  is needed only for failures of the ref
+//                                  move itself or of the post-move read)
+//   8. activate-stable-reference   pointer JSON into a NEW annotated tag
 //                                  object, ONE ownership-checked ref update on
 //                                  `claims-artifact-prod` (previous
 //                                  last-known-good preserved on any
 //                                  earlier failure)
-//   8. verify-stable-reference     re-read the ref; pointer identity chain;
+//   9. verify-stable-reference     re-read the ref; pointer identity chain;
 //                                  fetch assets from the POINTER's versioned
 //                                  release; digest/length/checksum + claims
 //                                  verification again
 //
-// A failure BEFORE step 6 deletes ONLY this run's un-published draft and
+// A failure BEFORE step 8 deletes ONLY this run's un-published draft and
 // leaves the previous stable pointer serving. A failure AFTER activation
 // is rolled back by `rollbackStableReference` to the recorded previous
 // pointer (or first-publication ref deletion), verified by read-back.
@@ -70,6 +78,35 @@ export class ClaimsPublicationError extends Error {
   constructor(message: string) {
     super(`claims-publication: ${message}`);
     this.name = "ClaimsPublicationError";
+  }
+}
+
+/** One observation recorded during a rollback attempt (I-05 audit trail). */
+export interface RollbackAuditEvent {
+  /** The point in the rollback where the observation was made. */
+  at: string;
+  /** What was observed (ref state, action taken or refused). NEVER a secret. */
+  detail: string;
+}
+
+/**
+ * The structured rollback outcome (I-05: rollback outcomes are
+ * observable and auditable — never a bare string in a log line).
+ * Thrown (as part of the publication-failure error) for EVERY
+ * post-activation failure, carrying the outcome class and the full
+ * audit trail of ref observations and actions taken or refused.
+ */
+export class ClaimsRollbackOutcomeError extends ClaimsPublicationError {
+  /** "restored" | "first-publication-removed" | "foreign-reference-untouched" | "unverified". */
+  readonly rollbackOutcome: string;
+  /** Ordered observations of the ref state during the rollback. */
+  readonly rollbackAudit: RollbackAuditEvent[];
+
+  constructor(message: string, rollbackOutcome: string, rollbackAudit: RollbackAuditEvent[]) {
+    super(message);
+    this.name = "ClaimsRollbackOutcomeError";
+    this.rollbackOutcome = rollbackOutcome;
+    this.rollbackAudit = rollbackAudit;
   }
 }
 
@@ -434,6 +471,7 @@ export const CLAIMS_PUBLICATION_STEPS = [
   "upload-draft-assets",
   "verify-draft-readback",
   "publish-immutable-release",
+  "verify-versioned-release",
   "activate-stable-reference",
   "verify-stable-reference",
 ] as const;
@@ -472,13 +510,47 @@ export function claimsVersionedTag(publishedAtUnixMs: number, sourceCommit: stri
 }
 
 /**
+ * The FULL pointer-identity verification over assets fetched from a
+ * versioned release (I-05): digest + byte length per asset, checksum
+ * sidecar, claims-grade re-verification, and artifact identity vs the
+ * pointer. Used BOTH before the stable-ref move (verify-versioned-release —
+ * a content failure there costs ZERO destructive rollback, because the
+ * stable pointer has not been touched) and after it (verify-stable-
+ * reference — the final identity chain over the moved ref).
+ */
+async function verifyPointerAssetsAgainstRelease(
+  store: ClaimsReleaseStore,
+  pointer: ClaimsStablePointerV1,
+): Promise<void> {
+  const artifact = await store.fetchAssetByTag(pointer.versionedTag, CLAIMS_ARTIFACT_ASSET_NAME);
+  const manifest = await store.fetchAssetByTag(pointer.versionedTag, CLAIMS_MANIFEST_ASSET_NAME);
+  const checksum = await store.fetchAssetByTag(pointer.versionedTag, CLAIMS_CHECKSUM_ASSET_NAME);
+  verifyClaimsPointerMatchesBytes({
+    pointer,
+    artifactBytes: artifact,
+    manifestBytes: manifest,
+    checksumBytes: checksum,
+  });
+  verifyClaimsChecksumFile(artifact, checksum);
+  const v = verifyClaimsArtifactBytes(artifact);
+  if (
+    v.rootHex !== pointer.merkleRoot ||
+    v.artifact.pool_address !== pointer.pool ||
+    v.artifact.lp_mint !== pointer.lpMint ||
+    v.snapshotSlot !== pointer.snapshotSlot
+  ) {
+    throw new ClaimsPublicationError("the published artifact's identity does not match its pointer");
+  }
+}
+
+/**
  * The draft-first claims publication sequence, step for step as
  * documented at the top of this module. Failures propagate after
  * recording executed steps; cleanup of this run's draft happens for any
  * failure before the immutable flip. The stable reference moves ONLY at
- * `activate-stable-reference`, after the draft round-trip has fully
- * verified, so every earlier failure preserves the last-known-good
- * pointer exactly.
+ * `activate-stable-reference`, after the draft round-trip AND the
+ * versioned-release content have both fully verified, so every earlier
+ * failure preserves the last-known-good pointer exactly.
  */
 export async function runClaimsPublicationSequence(opts: {
   store: ClaimsReleaseStore;
@@ -545,6 +617,25 @@ export async function runClaimsPublicationSequence(opts: {
     "utf8",
   );
 
+  // The pointer is built ONCE from the verified bytes (deterministic) and
+  // is reused by the draft-readback check, the pre-activation versioned-
+  // release check, and the activated tag object itself.
+  const { pointer: claimsPointer, pointerJson: claimsPointerJson } = buildClaimsPointer({
+    versionedTag: tag,
+    sourceCommit: input.sourceCommit,
+    publishedAtUnixMs: input.publishedAtUnixMs,
+    artifactBytes,
+    manifestBytes,
+    checksumBytes,
+    artifactSchemaVersion: CLAIMS_ARTIFACT_FORMAT_VERSION,
+    pool: verified.artifact.pool_address,
+    lpMint: verified.artifact.lp_mint,
+    snapshotSlot: verified.snapshotSlot,
+    merkleRoot: verified.rootHex,
+    producer: input.producer,
+    previous: previous === null ? null : { versionedTag: previous.versionedTag, tagObjectSha: previous.tagObjectSha },
+  });
+
   try {
     // ── 3. create-draft-release (duplicate gate; never the stable ref) ──
     if (!(await store.listTags()).includes(tag)) {
@@ -576,21 +667,7 @@ export async function runClaimsPublicationSequence(opts: {
       throw new ClaimsPublicationError("draft readback re-verification changed the artifact root");
     }
     verifyClaimsPointerMatchesBytes({
-      pointer: buildClaimsPointer({
-        versionedTag: tag,
-        sourceCommit: input.sourceCommit,
-        publishedAtUnixMs: input.publishedAtUnixMs,
-        artifactBytes: rtArtifact,
-        manifestBytes: rtManifest,
-        checksumBytes: rtChecksum,
-        artifactSchemaVersion: CLAIMS_ARTIFACT_FORMAT_VERSION,
-        pool: reVerified.artifact.pool_address,
-        lpMint: reVerified.artifact.lp_mint,
-        snapshotSlot: reVerified.snapshotSlot,
-        merkleRoot: reVerified.rootHex,
-        producer: input.producer,
-        previous: previous === null ? null : { versionedTag: previous.versionedTag, tagObjectSha: previous.tagObjectSha },
-      }).pointer,
+      pointer: claimsPointer,
       artifactBytes: rtArtifact,
       manifestBytes: rtManifest,
       checksumBytes: rtChecksum,
@@ -601,6 +678,16 @@ export async function runClaimsPublicationSequence(opts: {
     await store.publishDraftRelease(tag);
     draftCreated = false;
     executed.push("publish-immutable-release");
+
+    // ── 7. verify-versioned-release (I-05) — the FULL pointer-identity
+    // verification over the PUBLISHED versioned release, BEFORE any
+    // stable-ref write. Every content failure is caught while the stable
+    // pointer is still untouched, so destructive rollback is needed ONLY
+    // for failures of the ref move itself or of the post-move read —
+    // the stable-pointer architecture deliberately minimizes the
+    // scenarios that require a destructive rollback.
+    await verifyPointerAssetsAgainstRelease(store, claimsPointer);
+    executed.push("verify-versioned-release");
   } catch (err) {
     // Cleanup: delete ONLY this run's un-published draft. The previous
     // stable pointer is untouched (it was never read from or written).
@@ -617,37 +704,23 @@ export async function runClaimsPublicationSequence(opts: {
     throw err;
   }
 
-  // ── 7. activate-stable-reference (ONE ownership-checked pointer move; verify-then-write — the GitHub refs API has no conditional write) ───
-  // D4 review: ANY failure at or after activation automatically restores
-  // the previous known-good reference — but ONLY if the stable ref still
-  // belongs to THIS attempt. If another publisher moved it concurrently,
-  // rollback leaves the ref untouched and reports TERMINAL UNVERIFIED
-  // (review finding 2). Ambiguous failures are handled conservatively and
-  // an unverifiable state is reported explicitly — never silently.
+  // ── 8. activate-stable-reference (ONE ownership-checked pointer move; verify-then-write with POST-WRITE READ-BACK — the GitHub refs API has no conditional write) ───
+  // I-05: ANY failure at or after activation automatically restores the
+  // previous known-good reference — but ONLY if the stable ref still
+  // belongs to THIS attempt (exact activated tag-object SHA). If another
+  // publisher moved it concurrently, rollback leaves the ref untouched
+  // and the run reports TERMINAL UNVERIFIED. Every outcome carries a
+  // structured audit trail (ClaimsRollbackOutcomeError.rollbackAudit),
+  // and ambiguous failures are reported explicitly — never silently.
   let activated = false;
   let activatedTagObjectSha: string | null = null;
   try {
-  const { pointer, pointerJson } = buildClaimsPointer({
-    versionedTag: tag,
-    sourceCommit: input.sourceCommit,
-    publishedAtUnixMs: input.publishedAtUnixMs,
-    artifactBytes,
-    manifestBytes,
-    checksumBytes,
-    artifactSchemaVersion: CLAIMS_ARTIFACT_FORMAT_VERSION,
-    pool: verified.artifact.pool_address,
-    lpMint: verified.artifact.lp_mint,
-    snapshotSlot: verified.snapshotSlot,
-    merkleRoot: verified.rootHex,
-    producer: input.producer,
-    previous: previous === null ? null : { versionedTag: previous.versionedTag, tagObjectSha: previous.tagObjectSha },
-  });
-  const newSha = await store.createTagObject({ message: pointerJson, commitSha: input.sourceCommit });
+  const newSha = await store.createTagObject({ message: claimsPointerJson, commitSha: input.sourceCommit });
   await store.updateStableRef(newSha, { expectCurrentSha: previous?.tagObjectSha ?? null });
   activatedTagObjectSha = newSha;
   executed.push("activate-stable-reference");
 
-  // ── 8. verify-stable-reference (identity chain over the moved ref) ──────
+  // ── 9. verify-stable-reference (identity chain over the moved ref) ──────
   const refSha = await store.stableRefSha();
   if (refSha !== newSha) {
     throw new ClaimsPublicationError(
@@ -659,58 +732,47 @@ export async function runClaimsPublicationSequence(opts: {
   if (activatedPointer.versionedTag !== tag) {
     throw new ClaimsPublicationError("the activated pointer does not name the activated versioned tag");
   }
-  const stableArtifact = await store.fetchAssetByTag(activatedPointer.versionedTag, CLAIMS_ARTIFACT_ASSET_NAME);
-  const stableManifest = await store.fetchAssetByTag(activatedPointer.versionedTag, CLAIMS_MANIFEST_ASSET_NAME);
-  const stableChecksum = await store.fetchAssetByTag(activatedPointer.versionedTag, CLAIMS_CHECKSUM_ASSET_NAME);
-  verifyClaimsPointerMatchesBytes({
-    pointer: activatedPointer,
-    artifactBytes: stableArtifact,
-    manifestBytes: stableManifest,
-    checksumBytes: stableChecksum,
-  });
-  verifyClaimsChecksumFile(stableArtifact, stableChecksum);
-  const stableVerified = verifyClaimsArtifactBytes(stableArtifact);
-  if (
-    stableVerified.rootHex !== activatedPointer.merkleRoot ||
-    stableVerified.artifact.pool_address !== activatedPointer.pool ||
-    stableVerified.artifact.lp_mint !== activatedPointer.lpMint ||
-    stableVerified.snapshotSlot !== activatedPointer.snapshotSlot
-  ) {
-    throw new ClaimsPublicationError("the stable artifact's identity does not match its pointer");
-  }
+  await verifyPointerAssetsAgainstRelease(store, activatedPointer);
   executed.push("verify-stable-reference");
   activated = true;
   } catch (activationErr) {
-    const outcome = await rollbackClaimsStableReference({
-      store,
-      previous,
-      activatedTag: tag,
-      activatedTagObjectSha: activatedTagObjectSha ?? "<never-activated>",
-    }).catch((rbErr: unknown) => {
+    const detail = activationErr instanceof Error ? activationErr.message : String(activationErr);
+    const audit: RollbackAuditEvent[] = [
+      { at: "post-activation-failure", detail },
+      { at: "attempt-identity", detail: `activatedTag=${tag} activatedTagObjectSha=${activatedTagObjectSha ?? "<never-activated>"} previous=${previous?.tagObjectSha ?? "<first-publication>"}` },
+    ];
+    try {
+      const outcome = await rollbackClaimsStableReference({
+        store,
+        previous,
+        activatedTag: tag,
+        activatedTagObjectSha: activatedTagObjectSha ?? "<never-activated>",
+        audit,
+      });
+      const report =
+        outcome === "restored"
+          ? "rollback RESTORED the previous known-good pointer and the restoration was verified by read-back"
+          : outcome === "first-publication-removed"
+            ? "first-publication rollback removed THIS attempt's reference after ownership verification; the absence was verified by re-read"
+            : outcome === "foreign-reference-untouched"
+              ? "the stable reference NO LONGER names this attempt's tag object — a concurrent publisher or external writer owns it now. Rollback left the reference UNTOUCHED to avoid clobbering the other writer's update — TERMINAL UNVERIFIED STATE: inspect the stable reference manually before any further publication"
+              : "rollback could NOT be verified — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication";
+      throw new ClaimsRollbackOutcomeError(
+        `publication failed after stable-reference activation (${detail}); ${report}`,
+        outcome,
+        audit,
+      );
+    } catch (rbErr) {
+      if (rbErr instanceof ClaimsRollbackOutcomeError) throw rbErr;
       // Ambiguous/failed rollback attempt itself: handled conservatively —
       // this is an explicit TERMINAL UNVERIFIED state.
-      throw new ClaimsPublicationError(
-        `publication failed after stable-reference activation (${activationErr instanceof Error ? activationErr.message : String(activationErr)}); rollback could NOT be attempted or completed (${rbErr instanceof Error ? rbErr.message : String(rbErr)}) — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
-      );
-    });
-    const detail = activationErr instanceof Error ? activationErr.message : String(activationErr);
-    if (outcome === "foreign-reference-untouched") {
-      throw new ClaimsPublicationError(
-        `publication failed after stable-reference activation (${detail}); the stable reference NO LONGER names this attempt's tag object — a concurrent publisher owns it now. Rollback left the reference UNTOUCHED to avoid clobbering the other publisher's update — TERMINAL UNVERIFIED STATE: inspect the stable reference manually before any further publication`,
+      audit.push({ at: "rollback-attempt-failed", detail: rbErr instanceof Error ? rbErr.message : String(rbErr) });
+      throw new ClaimsRollbackOutcomeError(
+        `publication failed after stable-reference activation (${detail}); rollback could NOT be attempted or completed (${rbErr instanceof Error ? rbErr.message : String(rbErr)}) — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
+        "unverified",
+        audit,
       );
     }
-    if (outcome === "unverified") {
-      throw new ClaimsPublicationError(
-        `publication failed after stable-reference activation (${detail}); rollback could NOT be verified — TERMINAL UNVERIFIED STATE: the stable reference must be inspected manually before any further publication`,
-      );
-    }
-    const rollbackReport =
-      outcome === "restored"
-        ? "rollback RESTORED the previous known-good pointer and the restoration was verified by read-back"
-        : "rollback left the stable reference ABSENT — the absence was verified by re-read and NO destructive write was issued";
-    throw new ClaimsPublicationError(
-      `publication failed after stable-reference activation (${detail}); ${rollbackReport}`,
-    );
   }
 
   return { executed, activatedTag: tag, previous, artifactSha256, artifactByteLength };
@@ -721,6 +783,11 @@ export async function runClaimsPublicationSequence(opts: {
  * pointer (create its tag object if needed, move the ref) — or delete the
  * first-publication ref — and VERIFY the restoration by read-back. An
  * unverifiable restoration is reported loudly, never silent.
+ *
+ * I-05: when `audit` is supplied, EVERY ref observation and every action
+ * taken or refused is appended to it as a `RollbackAuditEvent`, so the
+ * outcome is observable and auditable end-to-end (the caller attaches
+ * the trail to the thrown ClaimsRollbackOutcomeError).
  */
 export async function rollbackClaimsStableReference(opts: {
   store: ClaimsReleaseStore;
@@ -733,8 +800,13 @@ export async function rollbackClaimsStableReference(opts: {
    * moved by a concurrent publisher is left untouched (review finding 2).
    */
   activatedTagObjectSha: string;
+  /** Optional audit sink — observations are appended in execution order. */
+  audit?: RollbackAuditEvent[];
 }): Promise<"restored" | "first-publication-removed" | "foreign-reference-untouched" | "unverified"> {
-  const { store, previous, activatedTagObjectSha } = opts;
+  const { store, previous, activatedTagObjectSha, audit } = opts;
+  const note = (at: string, detail: string): void => {
+    audit?.push({ at, detail });
+  };
 
   // OWNERSHIP GATE (I-05): the ref may be restored or deleted ONLY while
   // its current target belongs to THIS failed attempt. Every branch below
@@ -742,6 +814,7 @@ export async function rollbackClaimsStableReference(opts: {
   // ownership NEVER triggers a destructive call — the caller reports
   // TERMINAL UNVERIFIED.
   const currentSha = await store.stableRefSha();
+  note("ownership-gate", `stable ref currently names ${currentSha ?? "<absent>"}`);
 
   if (previous === null) {
     // First publication. The ref is either absent (activation never
@@ -751,15 +824,29 @@ export async function rollbackClaimsStableReference(opts: {
       // I-05 (1): the ref is already absent — VERIFY the absence and
       // treat it as absent. NO DELETE request is issued for an absent
       // ref (the old code called deleteStableRef unconditionally).
-      if ((await store.stableRefSha()) !== null) return "unverified";
+      const recheck = await store.stableRefSha();
+      if (recheck !== null) {
+        // A writer created the ref between the two reads — ownership of
+        // the reference is now foreign/uncertain: no destructive action.
+        note("absence-recheck", `ref reappeared between reads as ${recheck} — no destructive action (UNVERIFIED)`);
+        return "unverified";
+      }
+      note("absence-recheck", "absence verified by re-read — no DELETE issued");
       return "first-publication-removed";
     }
     if (currentSha !== activatedTagObjectSha) {
       // A concurrent publisher owns the ref — never delete it.
+      note("ownership-gate-refusal", `ref names ${currentSha}, not this attempt's ${activatedTagObjectSha} — deletion refused (foreign reference untouched)`);
       return "foreign-reference-untouched";
     }
+    note("delete", `ref still names this attempt's activation (${currentSha}) — ownership-verified DELETE`);
     await store.deleteStableRef({ expectCurrentSha: activatedTagObjectSha });
-    if ((await store.stableRefSha()) !== null) return "unverified";
+    const after = await store.stableRefSha();
+    if (after !== null) {
+      note("delete-read-back", `ref exists again after deletion (${after}) — concurrent writer detected, outcome UNVERIFIED`);
+      return "unverified";
+    }
+    note("delete-read-back", "absence verified by re-read after deletion");
     return "first-publication-removed";
   }
 
@@ -767,6 +854,7 @@ export async function rollbackClaimsStableReference(opts: {
     // The stable ref is GONE while a previous pointer is known. Ownership
     // of the absence cannot be established (a concurrent publisher or
     // external writer may have deleted it) — leave everything untouched.
+    note("ownership-gate-refusal", "ref is absent while a previous pointer is known — ownership of the absence cannot be established, no destructive action (UNVERIFIED)");
     return "unverified";
   }
   if (currentSha === previous.tagObjectSha) {
@@ -775,24 +863,33 @@ export async function rollbackClaimsStableReference(opts: {
     // read-back and report success WITHOUT any write.
     const untouched = await store.fetchTagObject(currentSha);
     if (parseClaimsPointer(untouched.message).versionedTag !== previous.versionedTag) {
+      note("restore-read-back", `ref still names the previous tag object but its pointer names ${parseClaimsPointer(untouched.message).versionedTag}, not ${previous.versionedTag} — outcome UNVERIFIED`);
       return "unverified";
     }
+    note("restore-read-back", "ref already names the previous known-good pointer — verified by read-back, NO write issued");
     return "restored";
   }
   if (currentSha !== activatedTagObjectSha) {
     // A concurrent publisher moved the ref — never overwrite it.
+    note("ownership-gate-refusal", `ref names ${currentSha}, not this attempt's ${activatedTagObjectSha} — restore refused (foreign reference untouched)`);
     return "foreign-reference-untouched";
   }
 
   const object = await store.fetchTagObject(previous.tagObjectSha);
   const restoredPointer = parseClaimsPointer(object.message);
   if (restoredPointer.versionedTag !== previous.versionedTag) {
+    note("restore-source-check", `the previous tag object's pointer names ${restoredPointer.versionedTag}, not ${previous.versionedTag} — restore refused (UNVERIFIED)`);
     return "unverified";
   }
+  note("restore", `ref still names this attempt's activation (${currentSha}) — ownership-verified restore to the previous pointer`);
   const newSha = await store.createTagObject({ message: object.message, commitSha: object.commitSha });
   await store.updateStableRef(newSha, { expectCurrentSha: activatedTagObjectSha });
   const refSha = await store.stableRefSha();
   const readBack = refSha === null ? null : await store.fetchTagObject(refSha).then((o) => parseClaimsPointer(o.message));
-  if (readBack?.versionedTag !== previous.versionedTag) return "unverified";
+  if (readBack?.versionedTag !== previous.versionedTag) {
+    note("restore-read-back", `post-restore read-back names ${readBack?.versionedTag ?? "<absent>"}, not ${previous.versionedTag} — outcome UNVERIFIED`);
+    return "unverified";
+  }
+  note("restore-read-back", "restoration verified by read-back");
   return "restored";
 }

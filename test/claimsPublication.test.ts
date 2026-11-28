@@ -340,6 +340,7 @@ describe("claims publication sequence (draft-first, fixture store)", () => {
       "upload-draft-assets",
       "verify-draft-readback",
       "publish-immutable-release",
+      "verify-versioned-release",
       "activate-stable-reference",
       "verify-stable-reference",
     ]);

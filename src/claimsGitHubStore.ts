@@ -270,16 +270,32 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
 
   /**
    * PATCH (or POST when absent) /git/refs/tags/claims-artifact-prod — the
-   * ONE pointer move. Review finding 2: the move is OWNERSHIP-CHECKED.
+   * ONE pointer move. Review finding 2 / I-05: the move is
+   * OWNERSHIP-CHECKED and POST-WRITE-VERIFIED.
+   *
    * `expectCurrentSha` (the sha the caller saw — previous pointer, or null
    * for first publication) is verified against the live ref before the
    * write; a mismatch refuses the move instead of clobbering a concurrent
-   * publisher's update. Note honestly (I-05): the GitHub REST API has no
-   * conditional write for refs, so this is verify-then-write, NOT an
-   * atomic compare-and-swap; the workflow's `concurrency` group
-   * serializes THIS repo's publication runs, and the ownership check +
-   * refusal are the protection against EXTERNAL writers (a writer that
-   * wins the race is reported as TERMINAL UNVERIFIED, never clobbered).
+   * publisher's update. An absent ref is created with POST /git/refs,
+   * which the real API refuses with HTTP 422 when the ref came into
+   * existence concurrently — a natural insert-if-absent guard.
+   *
+   * RESIDUAL RACE, stated honestly (I-05): the GitHub REST API has NO
+   * conditional write for refs, so between the pre-write probe and the
+   * PATCH an external writer can still replace the ref — the forced PATCH
+   * would overwrite that write, and NO REST call can prevent it. This is
+   * verify-then-write, NOT an atomic compare-and-swap. What this adapter
+   * adds on top of the check is a POST-WRITE READ-BACK: the ref is re-read
+   * immediately after the write and must name the sha we wrote, so a
+   * foreign write that lands AFTER our PATCH (in the PATCH→read-back
+   * window) is detected and reported instead of being silently accepted.
+   * A foreign write landing in the probe→PATCH window is clobbered —
+   * detected only if the writer re-writes or via out-of-band auditing.
+   * Documented mitigations: the workflow `concurrency` group serializes
+   * THIS repo's publication runs; GitHub TAG PROTECTION RULES on
+   * `claims-artifact-prod` are the operational defense against external
+   * writers; a writer that wins either race is reported as TERMINAL
+   * UNVERIFIED, never silently accepted.
    */
   async updateStableRef(tagObjectSha: string, opts?: { expectCurrentSha?: string | null }): Promise<void> {
     const expect = opts?.expectCurrentSha;
@@ -288,10 +304,14 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
       if (expect != null) {
         throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", 404, `stable ref moved concurrently — expected ${expect}, found nothing; refusing non-atomic overwrite`);
       }
+      // POST /git/refs is the real API's insert-if-absent: a concurrent
+      // creator wins the race and this call answers 422 — refused, no
+      // overwrite is attempted.
       await this.expectStatus(`/repos/${this.repo}/git/refs`, {
         method: "POST",
         body: JSON.stringify({ ref: "refs/tags/claims-artifact-prod", sha: tagObjectSha }),
       }, [201]);
+      await this.verifyRefPostWrite(tagObjectSha, "create");
       return;
     }
     if (!probe.ok) throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", probe.status, `probe failed: ${probe.status}`);
@@ -304,9 +324,31 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
       method: "PATCH",
       body: JSON.stringify({ sha: tagObjectSha, force: true }),
     }, [200]);
+    await this.verifyRefPostWrite(tagObjectSha, "move");
   }
 
-  /** DELETE /git/refs/tags/claims-artifact-prod — first-publication rollback only. */
+  /**
+   * POST-WRITE READ-BACK (I-05): re-read the ref and require it to name
+   * the sha we just wrote. A ref that names anything else after a 2xx
+   * write means a foreign writer acted between the write and this read —
+   * the caller MUST treat the outcome as unverified, never as success.
+   */
+  private async verifyRefPostWrite(writtenSha: string, what: string): Promise<void> {
+    const path = "/repos/{repo}/git/ref/tags/claims-artifact-prod";
+    const res = await this.api(`/repos/${this.repo}/git/ref/tags/claims-artifact-prod`);
+    if (res.status === 404) {
+      throw new GitHubStoreError(path, 404, `post-${what} read-back: the ref is GONE immediately after a ${what} that answered 2xx — concurrent modification detected, outcome UNVERIFIED`);
+    }
+    if (!res.ok) {
+      throw new GitHubStoreError(path, res.status, `post-${what} read-back failed: expected 200 or 404, got ${res.status} — outcome UNVERIFIED`);
+    }
+    const live = JSON.parse(Buffer.from(await readCapped(res, MAX_API_JSON_BYTES, path)).toString("utf8")) as { object?: { sha?: unknown } };
+    const liveSha = typeof live.object?.sha === "string" ? live.object.sha : null;
+    if (liveSha !== writtenSha) {
+      throw new GitHubStoreError(path, res.status, `post-${what} read-back: the ref names ${liveSha ?? "unknown"}, not the sha this run wrote (${writtenSha}) — a concurrent writer acted between the write and the read-back, outcome UNVERIFIED`);
+    }
+  }
+
   /**
    * DELETE /git/refs/tags/claims-artifact-prod — ownership-conditional
    * (I-05). GitHub answers HTTP 404 for an ALREADY-ABSENT ref; that is a
@@ -314,11 +356,18 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
    * in-memory store — no DELETE request is issued for an absent ref).
    * A live ref whose sha differs from `expectCurrentSha` (the sha the
    * caller observed) is REFUSED — a concurrent publisher's pointer is
-   * never deleted. Note honestly: the GitHub REST API has no conditional
-   * DELETE for refs, so this is verify-then-write, NOT an atomic
-   * compare-and-swap; the residual window is covered by the workflow's
-   * concurrency group plus the ownership gate, and an external writer
-   * that wins the race is reported, never clobbered.
+   * never deleted.
+   *
+   * RESIDUAL RACE, stated honestly (I-05): the GitHub REST API has no
+   * conditional DELETE for refs, so this is verify-then-write, NOT an
+   * atomic compare-and-swap — an external writer that replaces the ref
+   * in the probe→DELETE window loses its write to the DELETE. What this
+   * adapter adds is a POST-WRITE READ-BACK: after a 204 the ref is
+   * re-read, and a ref that EXISTS again means a foreign writer acted in
+   * the DELETE→read-back window — reported UNVERIFIED, never treated as
+   * success. Mitigations: the workflow `concurrency` group serializes
+   * this repo's publication runs; GitHub TAG PROTECTION RULES are the
+   * operational defense against external writers.
    */
   async deleteStableRef(opts?: { expectCurrentSha?: string | null }): Promise<void> {
     const expect = opts?.expectCurrentSha;
@@ -331,6 +380,17 @@ export class GitHubClaimsReleaseStore implements ClaimsReleaseStore {
       throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", probe.status, `stable ref moved concurrently (expected ${expect ?? "<none>"}, found ${liveSha ?? "unknown"}) — deletion refused: this run does not own the reference`);
     }
     await this.expectStatus(`/repos/${this.repo}/git/refs/tags/claims-artifact-prod`, { method: "DELETE" }, [204]);
+    // POST-WRITE READ-BACK for a DELETE: 404 is the EXPECTED, verified
+    // outcome (the ref is gone); a live ref after a 204 means a foreign
+    // writer acted in the DELETE→read-back window — UNVERIFIED, never
+    // treated as success.
+    const post = await this.api(`/repos/${this.repo}/git/ref/tags/claims-artifact-prod`);
+    if (post.status === 404) return; // verified absence
+    if (!post.ok) {
+      throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", post.status, `post-delete read-back failed: expected 200 or 404, got ${post.status} — outcome UNVERIFIED`);
+    }
+    const postLive = JSON.parse(Buffer.from(await readCapped(post, MAX_API_JSON_BYTES, "/git/ref/…")).toString("utf8")) as { object?: { sha?: unknown } };
+    throw new GitHubStoreError("/git/ref/tags/claims-artifact-prod", post.status, `post-delete read-back: the ref EXISTS again (naming ${typeof postLive.object?.sha === "string" ? postLive.object.sha : "unknown"}) — a concurrent writer acted between the delete and the read-back, outcome UNVERIFIED`);
   }
 
   /** GET /git/tags/{sha}. */
