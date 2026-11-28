@@ -22,6 +22,12 @@
 //     [--expected-pool <pool>] [--expected-lp-mint <mint>] [--expected-amm-program-id <id>] \
 //     [--handoff-only]
 //
+// P125-01: --producer-repo and --producer-workflow are DECLARATIONS, not
+// trust inputs. The consumer enforces the trusted producer identity
+// itself (repository, branch, workflow path/id — see
+// TRUSTED_CLAIMS_PRODUCER_* in src/claimsProducerHandoff.ts) and rejects
+// any declaration that disagrees with it before any network call.
+//
 // `--handoff-only` runs the verification pipeline and exits WITHOUT any
 // publication side effect (used by the workflow's pre-flight step).
 //
@@ -42,6 +48,8 @@ import {
   CLAIMS_PRODUCER_ARTIFACT_NAME,
   DEFAULT_CLAIMS_PRODUCER_REPO,
   PINNED_CLAIMS_PRODUCER_IDENTITY,
+  TRUSTED_CLAIMS_PRODUCER_REPO,
+  TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME,
   fetchVerifiedClaimsArtifact,
   publishVerifiedProducerArtifact,
   type ClaimsProducerExpectations,
@@ -84,11 +92,24 @@ function parseArgs(argv: string[]): Args {
       `--producer-identity ${JSON.stringify(producerIdentity)} does not match the pinned producer identity ${JSON.stringify(PINNED_CLAIMS_PRODUCER_IDENTITY)}`,
     );
   }
+  const producerRepo = argOf("--producer-repo") ?? DEFAULT_CLAIMS_PRODUCER_REPO;
+  // P125-01: declarations only — the consumer enforces the trusted values.
+  if (producerRepo !== TRUSTED_CLAIMS_PRODUCER_REPO) {
+    throw new ClaimsPublicationError(
+      `--producer-repo ${JSON.stringify(producerRepo)} is not the trusted producer repository ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_REPO)}`,
+    );
+  }
+  const producerWorkflowName = argOf("--producer-workflow") ?? missing("--producer-workflow");
+  if (producerWorkflowName !== TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME) {
+    throw new ClaimsPublicationError(
+      `--producer-workflow ${JSON.stringify(producerWorkflowName)} is not the pinned producer workflow ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME)}`,
+    );
+  }
   return {
     repo: argOf("--repo") ?? missing("--repo"),
     producerRunId,
-    producerRepo: argOf("--producer-repo") ?? DEFAULT_CLAIMS_PRODUCER_REPO,
-    producerWorkflowName: argOf("--producer-workflow") ?? missing("--producer-workflow"),
+    producerRepo,
+    producerWorkflowName,
     artifactName: argOf("--artifact-name") ?? CLAIMS_PRODUCER_ARTIFACT_NAME,
     sourceCommit: argOf("--source-commit") ?? missing("--source-commit"),
     producerIdentity,
@@ -138,6 +159,7 @@ async function main(): Promise<number> {
         artifactName: handoff.artifactName,
         artifactSha256: handoff.artifactSha256Hex,
         runHeadSha: handoff.runHeadSha,
+        trustedProducer: handoff.trustedProducer,
       })}\n`,
     );
     return 0;

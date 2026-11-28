@@ -56,16 +56,26 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # ── PINNED PRODUCER IDENTITY (I-06) ─────────────────────────────────
-  # These expectations are pinned HERE, never passed as dispatch inputs —
-  # an attacker must not be able to point the provenance check at their
-  # own workflow. GY_CLAIMS_PRODUCER_WORKFLOW must equal the exact
+  # ── PINNED PRODUCER IDENTITY (I-06, P125-01) ─────────────────────────
+  # These values are DECLARATIONS for the CLI; the actual trust boundary
+  # is ENFORCED BY THE CONSUMER (src/claimsProducerHandoff.ts):
+  #   TRUSTED_CLAIMS_PRODUCER_REPO          = GraveYield/graveyield-protocol
+  #   TRUSTED_CLAIMS_PRODUCER_BRANCH        = main
+  #   TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH = .github/workflows/claims-snapshot.yml
+  #   TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME = grave-snapshotter-cli
+  # The handoff resolves the workflow by PATH in the trusted repository's
+  # registry, binds the run to its immutable numeric workflow id, and
+  # verifies the run's GitHub-authoritative head_branch / head_repository
+  # / repository against the trusted values. A dispatch input cannot
+  # point the check at another repository, branch, or workflow — a value
+  # here that disagrees with the consumer's pins fails closed before any
+  # network call. GY_CLAIMS_PRODUCER_WORKFLOW must equal the exact
   # workflow `name` of the producer workflow in
   # GraveYield/graveyield-protocol that runs grave-snapshotter-cli and
   # uploads `claims-artifact.json` as a run artifact — the COMPANION
   # `claims-snapshot.yml` pins `name: grave-snapshotter-cli`; the value
   # below MUST stay in lock-step with it (enforced by
-  # test/claimsReview.test.ts).
+  # test/claimsReview.test.ts and test/claimsProducerHandoff.test.ts).
   GY_CLAIMS_PRODUCER_REPO: GraveYield/graveyield-protocol
   GY_CLAIMS_PRODUCER_WORKFLOW: grave-snapshotter-cli
   GY_CLAIMS_ARTIFACT_NAME: claims-artifact.json

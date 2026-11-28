@@ -25,6 +25,13 @@ import {
 import { runClaimsPublicationSequence } from "../src/claimsPublication.js";
 import { GitHubClaimsReleaseStore, GitHubStoreError } from "../src/claimsGitHubStore.js";
 import { UNCX_RAYDIUM_AMM_V4_LOCKER_PROGRAM_ID } from "../src/claimsArtifact.js";
+import {
+  CLAIMS_PRODUCER_ARTIFACT_NAME,
+  TRUSTED_CLAIMS_PRODUCER_REPO,
+  TRUSTED_CLAIMS_PRODUCER_BRANCH,
+  TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH,
+  TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME,
+} from "../src/claimsProducerHandoff.js";
 
 // ── shared fixture helpers (self-contained) ──
 import { PublicKey } from "@solana/web3.js";
@@ -529,6 +536,26 @@ describe("Review round 2, finding 1: no workflow input reaches a run script", ()
     assert.match(yml, /GY_CLAIMS_PRODUCER_WORKFLOW: grave-snapshotter-cli\s*$/m);
     assert.match(yml, /--producer-workflow "\$GY_CLAIMS_PRODUCER_WORKFLOW"/);
     assert.match(yml, /--producer-run-id "\$CLAIMS_PRODUCER_RUN_ID"/);
+  });
+
+  test("P125-01: the workflow's producer declarations are in lock-step with the consumer's trusted pins", async () => {
+    const { readFileSync } = await import("node:fs");
+    const yml = readFileSync(new URL("../.github/workflows/publish-claims-artifact.yml", import.meta.url), "utf8");
+    // The env declarations in the workflow must equal the TRUSTED_* pins
+    // the handoff consumer enforces in code — a divergence fails here
+    // (CI) instead of failing closed at publication time.
+    assert.match(yml, new RegExp(`GY_CLAIMS_PRODUCER_REPO: ${TRUSTED_CLAIMS_PRODUCER_REPO.replace("/", "\\/")}\\s*$`, "m"));
+    assert.match(yml, new RegExp(`GY_CLAIMS_PRODUCER_WORKFLOW: ${TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME}\\s*$`, "m"));
+    assert.match(yml, new RegExp(`GY_CLAIMS_ARTIFACT_NAME: ${CLAIMS_PRODUCER_ARTIFACT_NAME.replace(".", "\\.")}\\s*$`, "m"));
+  });
+
+  test("P125-01: the consumer pins the trusted producer identity (repo/branch/workflow path)", () => {
+    // The trust boundary is enforced by the CONSUMER, not by workflow
+    // env vars or CLI flags — the pins live in code and are immutable.
+    assert.equal(TRUSTED_CLAIMS_PRODUCER_REPO, "GraveYield/graveyield-protocol");
+    assert.equal(TRUSTED_CLAIMS_PRODUCER_BRANCH, "main");
+    assert.equal(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH, ".github/workflows/claims-snapshot.yml");
+    assert.equal(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME, "grave-snapshotter-cli");
   });
 });
 
