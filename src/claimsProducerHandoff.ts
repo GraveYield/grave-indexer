@@ -1,37 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// D3→D4 claims-artifact handoff (review finding I-06).
+// D3→D4 claims-artifact handoff (review finding I-06) with the trusted
+// producer identity boundary (P125-01, consolidated remediation).
 //
 // A GitHub Actions dispatch starts a FRESH runner: a bare artifact_path
 // input cannot transfer the Rust producer's artifact to the publication
 // runner, and an arbitrary local path is never proof of producer origin.
 // This module implements the concrete, verifiable handoff:
 //
-//   1. resolve the PRODUCER RUN by explicit, validated run ID and check it
-//      against the EXPECTED PRODUCER WORKFLOW IDENTITY (pinned by the
-//      publication workflow, never taken from a dispatch input),
+//   1. resolve the PRODUCER RUN by explicit, validated run ID and bind it
+//      to the EXPECTED PRODUCER IDENTITY (P125-01): the run must belong to
+//      the PINNED producer repository (both `repository` and
+//      `head_repository` — a fork fails closed), the PINNED trusted branch
+//      (main), and the PINNED producer workflow — verified through the
+//      run's immutable numeric `workflow_id` resolved via the workflows
+//      API and the run's workflow `path` parsed STRICTLY as
+//      `<file>@<ref>` (the real API representation, e.g.
+//      `.github/workflows/claims-snapshot.yml@refs/heads/main`), never
+//      from the mutable display name alone,
 //   2. require the run to be completed+successful and its head_sha to
 //      equal the publication's source commit (provenance binding),
 //   3. retrieve the NAMED artifact from THAT EXACT run via the
 //      authenticated Actions artifacts API, rejecting missing, expired,
-//      or ambiguous artifacts,
-//   4. download the artifact zip, verify its byte length against the API
-//      record, unpack the exact `claims-artifact.json` entry, and verify
-//      its CRC32,
+//      ambiguous, OVERSIZED, or run-mismatched artifacts — the artifact
+//      record's GitHub-authoritative `workflow_run` binding must name the
+//      SAME run and the SAME head commit, and is required to EXIST
+//      (absent binding metadata fails closed),
+//   4. download the artifact zip (independently streamed under the size
+//      cap), verify its byte length against the API record, unpack the
+//      exact `claims-artifact.json` entry, and verify its CRC32,
 //   5. run the full claims-grade byte verification (strict schema,
 //      provenance digests, Merkle integrity, pool identity) BEFORE any
 //      publication side effect.
+//
+// P125-01 trust-boundary note: a run's head SHA proves WHAT was built,
+// not WHO built it — a fork or feature branch of the same commit is a
+// different trust context. Every identity check below therefore reads
+// GitHub-AUTHORITATIVE API response data only (never caller-supplied
+// metadata alone), and WHERE THE API DOES NOT EXPOSE SUFFICIENT
+// EVIDENCE the handoff FAILS CLOSED rather than assuming trust. Branch
+// protection / rulesets on the producer repository remain OWNER-configured
+// controls that code cannot enforce (see docs/CLAIMS_PUBLICATION.md).
 //
 // This module performs READ-ONLY GitHub API calls (GET only) and never
 // logs or returns the token. Publication side effects (draft release,
 // assets, tag objects, stable ref) happen ONLY after every check passes.
 //
 // Honest scope note (see docs/CLAIMS_PUBLICATION.md § D3→D4 handoff): the
-// producer side of this handoff — a graveyield-protocol workflow that
-// runs `grave-snapshotter-cli` and uploads `claims-artifact.json` as a
-// named run artifact — does NOT exist yet. Until it exists, every
-// dispatch fails closed at step 3 above. No simulated fixture substitutes
-// for that missing dependency.
+// producer side of this handoff — the graveyield-protocol
+// `claims-snapshot.yml` workflow added by protocol PR #125 — exists, but
+// as of this remediation it has NEVER been dispatched and no
+// claims-grade artifact exists yet. No simulated fixture substitutes for
+// that missing dependency.
 
 import { createHash } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
@@ -40,8 +60,49 @@ import { verifyClaimsArtifactBytes } from "./claimsArtifact.js";
 /** The single artifact file the Rust producer seals (claimed name). */
 export const CLAIMS_PRODUCER_ARTIFACT_NAME = "claims-artifact.json";
 
-/** The repository that owns the Rust claims producer (grave-snapshotter-cli). */
-export const DEFAULT_CLAIMS_PRODUCER_REPO = "GraveYield/graveyield-protocol";
+/**
+ * The TRUSTED PRODUCER REPOSITORY (P125-01). Enforced by the consumer:
+ * a caller-supplied repo argument that disagrees is rejected before any
+ * network call — the verifier never asks the caller which repo to trust.
+ */
+export const TRUSTED_CLAIMS_PRODUCER_REPO = "GraveYield/graveyield-protocol";
+
+/** Kept for backwards compatibility of the CLI default; identical value. */
+export const DEFAULT_CLAIMS_PRODUCER_REPO = TRUSTED_CLAIMS_PRODUCER_REPO;
+
+/**
+ * The TRUSTED PRODUCER BRANCH (P125-01). The producer run must have been
+ * executed against this branch — taken from the run's GitHub-authoritative
+ * `head_branch`, never from caller input.
+ */
+export const TRUSTED_CLAIMS_PRODUCER_BRANCH = "main";
+
+/**
+ * The TRUSTED PRODUCER WORKFLOW PATH (P125-01). Identity anchor: the run
+ * is bound to this exact workflow FILE through its immutable numeric
+ * `workflow_id` (resolved via the workflows API) and the file part of its
+ * `path` field. A workflow display name is NOT identity — two workflows
+ * can share one.
+ */
+export const TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH = ".github/workflows/claims-snapshot.yml";
+
+/**
+ * The display name the trusted workflow pins (`name:` in
+ * claims-snapshot.yml). Kept in lock-step with the producer workflow by
+ * tests on both sides; checked against the REGISTRY record's
+ * GitHub-authoritative `name`, never against the run's caller-pinned
+ * expectation alone.
+ */
+export const TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME = "grave-snapshotter-cli";
+
+/**
+ * The trusted workflow-run `path` REF representations (P125-01). GitHub
+ * records a run's workflow file as `<file>@<ref>`; the trusted branch is
+ * accepted ONLY in these exact ref forms — `refs/heads/main` (the
+ * canonical API representation) or its exact `main` shorthand. Any other
+ * ref (feature branch, tag, PR ref) fails closed.
+ */
+const TRUSTED_WORKFLOW_RUN_REFS = /* @__PURE__ */ new Set(["refs/heads/main", "main"]);
 
 /** The producer identity every claims artifact must be published under. */
 export const PINNED_CLAIMS_PRODUCER_IDENTITY = "grave-snapshotter-cli";
@@ -77,21 +138,43 @@ export function parseProducerRunId(text: string): number {
   return id;
 }
 
-function repoPatternOk(repo: string): boolean {
-  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo);
+/**
+ * STRICT parse of the workflow-run API's `path` field (P125-01). The real
+ * GitHub API represents it as `<file>@<ref>` — e.g.
+ * `.github/workflows/claims-snapshot.yml@refs/heads/main` or, for some
+ * event/record shapes, `...@main`. Parsing is exact: exactly one file
+ * part and one ref part, both non-empty; no substring or prefix
+ * matching, and a bare file path WITHOUT the `@ref` suffix is rejected
+ * (a fixture-shaped value without the ref must not pass — the ref IS part
+ * of the trust decision). Returns null for any malformed value.
+ */
+export function parseWorkflowRunPath(value: unknown): { file: string; ref: string } | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const at = value.indexOf("@");
+  if (at < 0 || at === 0 || at === value.length - 1) return null;
+  const file = value.slice(0, at);
+  const ref = value.slice(at + 1);
+  if (file.length === 0 || ref.length === 0 || file.includes("@") || ref.includes("@")) return null;
+  return { file, ref };
 }
 
 /** The operator-pinned expectations a producer run must satisfy. */
 export interface ClaimsProducerExpectations {
-  /** Repository owning the producer run, e.g. GraveYield/graveyield-protocol. */
+  /**
+   * Repository owning the producer run. NOT trusted as-is: the consumer
+   * enforces that this equals TRUSTED_CLAIMS_PRODUCER_REPO and rejects
+   * any other value before any network call (P125-01).
+   */
   producerRepo: string;
   /** The exact producer run ID (validated decimal, safe-integer subset). */
   producerRunId: number;
   /**
-   * The expected producer workflow identity (workflow `name`). PINNED by
-   * the publication workflow's environment — never accepted from an
-   * untrusted dispatch input, or an attacker could point the check at
-   * their own workflow.
+   * The expected producer workflow identity (workflow `name`). This is a
+   * DECLARATION only — it must equal the consumer's pinned
+   * TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME, and the ACTUAL identity check
+   * is performed against GitHub-authoritative registry data (immutable
+   * workflow ID + path), never against this string. A caller cannot
+   * point the check at a different workflow by changing it.
    */
   producerWorkflowName: string;
   /** The exact artifact name to retrieve (default CLAIMS_PRODUCER_ARTIFACT_NAME). */
@@ -112,6 +195,29 @@ export interface ClaimsProducerExpectations {
   expectedAmmProgramId?: string | undefined;
 }
 
+/**
+ * The GitHub-authoritative trusted-producer evidence the handoff
+ * validated before accepting the artifact (P125-01): every value below
+ * was read from GitHub API responses and bound to the pinned trust
+ * anchors — it is the audit trail of WHO produced the artifact.
+ */
+export interface TrustedProducerEvidence {
+  /** The pinned producer repository the run was bound to. */
+  repo: string;
+  /** The GitHub-authoritative head branch (=== the pinned trusted branch). */
+  branch: string;
+  /** The file part of the run's workflow path (=== the pinned path). */
+  workflowPath: string;
+  /** The validated ref part of the run's workflow path (main / refs/heads/main). */
+  workflowRef: string;
+  /** The immutable numeric workflow id (run.workflow_id === registry id). */
+  workflowId: number;
+  /** The producer run id the artifact was bound to. */
+  runId: number;
+  /** The validated run head commit (=== expectations.sourceCommit). */
+  sourceSha: string;
+}
+
 export interface ClaimsProducerHandoffResult {
   /** The verified artifact bytes (claims-grade, identity-checked). */
   bytes: Uint8Array;
@@ -121,8 +227,12 @@ export interface ClaimsProducerHandoffResult {
   artifactId: number;
   /** The artifact name (=== expectations.artifactName). */
   artifactName: string;
+  /** The ACTUAL downloaded zip byte length (=== the API-recorded size). */
+  artifactZipByteLength: number;
   /** sha256 of the verified bytes (hex). */
   artifactSha256Hex: string;
+  /** The trusted-producer identity evidence (P125-01) — see above. */
+  trustedProducer: TrustedProducerEvidence;
 }
 
 async function readCapped(res: Response, cap: number, what: string): Promise<Uint8Array> {
@@ -272,8 +382,28 @@ interface ActionsRun {
   status?: unknown;
   conclusion?: unknown;
   head_sha?: unknown;
+  /** GitHub-authoritative branch the run was executed against (P125-01). */
+  head_branch?: unknown;
+  /** Immutable numeric workflow identifier — binds the run to a definition. */
+  workflow_id?: unknown;
+  /**
+   * Workflow file path GitHub recorded for the run, in the real API
+   * representation `<file>@<ref>` (e.g.
+   * `.github/workflows/claims-snapshot.yml@refs/heads/main`).
+   */
+  path?: unknown;
+  /** The repo the run was built FROM (a fork here fails closed). */
   head_repository?: { full_name?: unknown } | null;
+  /** The repo the run LIVES IN (must be the pinned producer repo). */
   repository?: { full_name?: unknown } | null;
+}
+
+/** The authoritative workflow-registry record behind a run's workflow_id. */
+interface WorkflowRecord {
+  id?: unknown;
+  name?: unknown;
+  path?: unknown;
+  state?: unknown;
 }
 
 interface ActionsArtifact {
@@ -281,6 +411,12 @@ interface ActionsArtifact {
   name?: unknown;
   expired?: unknown;
   size_in_bytes?: unknown;
+  /**
+   * GitHub-authoritative run binding for the artifact. A real artifact
+   * record always carries it; its absence is treated as insufficient
+   * identity evidence and rejected (fail closed).
+   */
+  workflow_run?: { id?: unknown; head_sha?: unknown; head_branch?: unknown; workflow_id?: unknown } | null;
 }
 
 /**
@@ -304,11 +440,23 @@ export async function fetchVerifiedClaimsArtifact(opts: {
   if (!Number.isSafeInteger(e.producerRunId) || e.producerRunId < 1) {
     throw new ClaimsProducerHandoffError(`producer run id must be a positive safe integer (got ${String(e.producerRunId)})`);
   }
-  if (!repoPatternOk(e.producerRepo)) {
-    throw new ClaimsProducerHandoffError(`producer repo is not owner/name (got ${JSON.stringify(e.producerRepo)})`);
+  // P125-01: the trusted producer repository is enforced by the consumer.
+  // A caller-supplied repo that disagrees is rejected here — the verifier
+  // never asks the caller which repository to trust.
+  if (e.producerRepo !== TRUSTED_CLAIMS_PRODUCER_REPO) {
+    throw new ClaimsProducerHandoffError(
+      `producer repo ${JSON.stringify(e.producerRepo)} is not the trusted producer repository ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_REPO)} — refusing to verify a run outside the trusted producer (P125-01)`,
+    );
   }
   if (typeof e.producerWorkflowName !== "string" || e.producerWorkflowName.length === 0) {
     throw new ClaimsProducerHandoffError("the expected producer workflow identity must be pinned (non-empty)");
+  }
+  // P125-01: the caller-declared workflow name is only a lock-step
+  // declaration; it may not point the check at a different workflow.
+  if (e.producerWorkflowName !== TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME) {
+    throw new ClaimsProducerHandoffError(
+      `declared producer workflow name ${JSON.stringify(e.producerWorkflowName)} does not match the consumer's pinned producer workflow ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_NAME)} (P125-01)`,
+    );
   }
   if (typeof e.artifactName !== "string" || e.artifactName.length === 0) {
     throw new ClaimsProducerHandoffError("the expected artifact name must be non-empty");
@@ -327,15 +475,10 @@ export async function fetchVerifiedClaimsArtifact(opts: {
     );
   }
 
-  const base = `https://api.github.com/repos/${e.producerRepo}`;
+  const base = `https://api.github.com/repos/${TRUSTED_CLAIMS_PRODUCER_REPO}`;
 
-  // ── 1. resolve + validate the producer run ──
+  // ── 1. resolve + validate the producer run (P125-01 identity) ──
   const run = await fetchJson<ActionsRun>(fetchImpl, `${base}/actions/runs/${e.producerRunId}`, token, "producer run");
-  if (run.name !== e.producerWorkflowName) {
-    throw new ClaimsProducerHandoffError(
-      `producer run ${e.producerRunId} belongs to workflow ${JSON.stringify(String(run.name))}, not the expected producer workflow ${JSON.stringify(e.producerWorkflowName)} — WRONG WORKFLOW IDENTITY`,
-    );
-  }
   if (run.status !== "completed") {
     throw new ClaimsProducerHandoffError(`producer run ${e.producerRunId} is not completed (status ${JSON.stringify(String(run.status))})`);
   }
@@ -347,9 +490,114 @@ export async function fetchVerifiedClaimsArtifact(opts: {
       `producer run ${e.producerRunId} head commit ${JSON.stringify(String(run.head_sha))} does not match the publication source commit ${JSON.stringify(e.sourceCommit)} — provenance mismatch`,
     );
   }
-  const headRepo = typeof run.head_repository?.full_name === "string" ? run.head_repository.full_name : null;
-  if (headRepo !== null && headRepo !== e.producerRepo) {
-    throw new ClaimsProducerHandoffError(`producer run ${e.producerRunId} was built from a different repository (${headRepo})`);
+  // P125-01: bind the run to the pinned producer workflow — immutable
+  // numeric workflow ID first, then the workflow path GitHub recorded for
+  // the run (STRICTLY parsed as `<file>@<ref>`). A run that shares the
+  // display name but was produced by a different workflow file, a
+  // different ref, or a fixture-shaped path without a ref is rejected.
+  if (typeof run.workflow_id !== "number" || !Number.isSafeInteger(run.workflow_id) || run.workflow_id < 1) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} is missing its workflow_id — missing workflow identity metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  const runPath = parseWorkflowRunPath(run.path);
+  if (runPath === null) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} has NO usable workflow path — GitHub-authoritative path metadata (real API form <file>@<ref>) is required; refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (runPath.file !== TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} was executed from workflow path ${JSON.stringify(runPath.file)}, not the trusted ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH)} — WRONG WORKFLOW IDENTITY (P125-01)`,
+    );
+  }
+  if (!TRUSTED_WORKFLOW_RUN_REFS.has(runPath.ref)) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} was executed against workflow ref ${JSON.stringify(runPath.ref)}, not the trusted branch ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_BRANCH)} — UNTRUSTED WORKFLOW REF (P125-01)`,
+    );
+  }
+  // P125-01: the run must belong to the TRUSTED BRANCH — GitHub's
+  // authoritative head_branch, never a caller-supplied branch name.
+  // (Independent of the path ref above: defense in depth.)
+  if (typeof run.head_branch !== "string" || run.head_branch.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} is missing its head_branch — missing branch/ref metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (run.head_branch !== TRUSTED_CLAIMS_PRODUCER_BRANCH) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} was executed against branch ${JSON.stringify(run.head_branch)}, not the trusted producer branch ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_BRANCH)} — UNTRUSTED BRANCH (P125-01)`,
+    );
+  }
+  // P125-01: fork / untrusted-repository context. The run's own
+  // repository AND the commit's source repository must BOTH be the
+  // trusted producer repository; missing identity fails closed, a
+  // fork-run (head_repository = fork) or a run whose commit came from
+  // another repo is rejected.
+  if (typeof run.repository?.full_name !== "string" || run.repository.full_name.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} is missing its repository identity — missing repository metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (run.repository.full_name !== TRUSTED_CLAIMS_PRODUCER_REPO) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} belongs to repository ${JSON.stringify(String(run.repository.full_name))}, not the trusted producer repository ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_REPO)} (P125-01)`,
+    );
+  }
+  if (typeof run.head_repository?.full_name !== "string" || run.head_repository.full_name.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} is missing its head repository identity — missing repository metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (run.head_repository.full_name !== TRUSTED_CLAIMS_PRODUCER_REPO) {
+    throw new ClaimsProducerHandoffError(
+      `producer run ${e.producerRunId} was built from repository ${JSON.stringify(String(run.head_repository.full_name))}, not the trusted producer repository ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_REPO)} — FORK/UNTRUSTED CONTEXT (P125-01)`,
+    );
+  }
+
+  // ── 1b. resolve the workflow REGISTRY record by the run's validated
+  // NUMERIC workflow_id (P125-01; never by the `.github/workflows/...`
+  // path as the REST endpoint parameter) and require it to agree with
+  // the run — the registry record is GitHub-authoritative for what the
+  // workflow DEFINITION is.
+  const workflow = await fetchJson<WorkflowRecord>(
+    fetchImpl,
+    `${base}/actions/workflows/${run.workflow_id}`,
+    token,
+    "producer workflow registry record",
+  );
+  if (typeof workflow.id !== "number" || !Number.isSafeInteger(workflow.id) || workflow.id !== run.workflow_id) {
+    throw new ClaimsProducerHandoffError(
+      `the workflow registry record fetched for run ${e.producerRunId} (id ${JSON.stringify(String(workflow.id))}) does not match the run's immutable workflow_id ${run.workflow_id} — WORKFLOW IDENTITY MISMATCH, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (workflow.state !== "active") {
+    throw new ClaimsProducerHandoffError(
+      `the producer workflow of run ${e.producerRunId} is not active in the trusted repository (state ${JSON.stringify(String(workflow.state))}) — refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (typeof workflow.path !== "string" || workflow.path.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `the producer workflow registry record of run ${e.producerRunId} is missing its path — missing workflow identity metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (workflow.path !== TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH) {
+    throw new ClaimsProducerHandoffError(
+      `the producer workflow registry path ${JSON.stringify(workflow.path)} does not match the pinned workflow path ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH)} — WORKFLOW IDENTITY MISMATCH (P125-01)`,
+    );
+  }
+  // The caller-declared name must agree with the GitHub-authoritative
+  // registry name ("caller supplies expected workflow name but GitHub
+  // reports another workflow" → reject).
+  if (typeof workflow.name !== "string" || workflow.name.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `the producer workflow registry record of run ${e.producerRunId} is missing its name — missing workflow identity metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (workflow.name !== e.producerWorkflowName) {
+    throw new ClaimsProducerHandoffError(
+      `the producer workflow registry name ${JSON.stringify(workflow.name)} does not match the expected producer workflow ${JSON.stringify(e.producerWorkflowName)} — WRONG WORKFLOW IDENTITY (P125-01)`,
+    );
   }
 
   // ── 2. retrieve the NAMED artifact from THAT EXACT run ──
@@ -370,11 +618,7 @@ export async function fetchVerifiedClaimsArtifact(opts: {
     throw new ClaimsProducerHandoffError(`producer run ${e.producerRunId} has ${matching.length} artifacts named ${JSON.stringify(e.artifactName)} — AMBIGUOUS, refusing`);
   }
   const artifact: ActionsArtifact = matching[0] ?? {};
-  if (typeof artifact.id !== "number") {
-    // unreachable: matching.length >= 1 guarantees an element
-    throw new ClaimsProducerHandoffError("producer artifact record is missing");
-  }
-  const artifactId = typeof artifact.id === "number" && Number.isSafeInteger(artifact.id) ? artifact.id : null;
+  const artifactId = typeof artifact.id === "number" && Number.isSafeInteger(artifact.id) && artifact.id > 0 ? artifact.id : null;
   if (artifactId === null) {
     throw new ClaimsProducerHandoffError("producer artifact record has no usable numeric id");
   }
@@ -387,8 +631,51 @@ export async function fetchVerifiedClaimsArtifact(opts: {
   if (sizeInBytes === null || sizeInBytes <= 0) {
     throw new ClaimsProducerHandoffError(`producer artifact ${artifactId} has no usable size_in_bytes record`);
   }
+  // Configured size limit: refuse BEFORE any download work (P125-01).
+  if (sizeInBytes > MAX_HANDOFF_ZIP_BYTES) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} size ${sizeInBytes} exceeds the configured ${MAX_HANDOFF_ZIP_BYTES}-byte artifact size limit — refusing BEFORE download (P125-01)`,
+    );
+  }
+  // P125-01: the artifact must BELONG to the exact validated producer
+  // run. GitHub's artifact record carries the run binding (`workflow_run`)
+  // authoritatively; its absence is insufficient identity evidence and
+  // fails closed. The binding's head commit must equal the validated run
+  // head commit (= the requested source commit); its branch and workflow
+  // id must agree where the API exposes them.
+  if (typeof artifact.workflow_run?.id !== "number" || !Number.isSafeInteger(artifact.workflow_run.id)) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} record is missing its workflow_run run binding — missing artifact-to-run identity metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (artifact.workflow_run.id !== e.producerRunId) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} belongs to run ${artifact.workflow_run.id}, not the validated producer run ${e.producerRunId} — ARTIFACT/FROM-ANOTHER-RUN (P125-01)`,
+    );
+  }
+  if (typeof artifact.workflow_run.head_sha !== "string" || artifact.workflow_run.head_sha.length === 0) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} record is missing its workflow_run head commit — missing artifact-to-run identity metadata, refusing (fail closed) (P125-01)`,
+    );
+  }
+  if (artifact.workflow_run.head_sha !== run.head_sha) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} run binding head commit ${JSON.stringify(artifact.workflow_run.head_sha)} differs from the validated producer run head commit ${JSON.stringify(run.head_sha)} — ARTIFACT/FROM-ANOTHER-RUN (P125-01)`,
+    );
+  }
+  if (typeof artifact.workflow_run.head_branch === "string" && artifact.workflow_run.head_branch !== TRUSTED_CLAIMS_PRODUCER_BRANCH) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} run binding branch ${JSON.stringify(artifact.workflow_run.head_branch)} is not the trusted branch ${JSON.stringify(TRUSTED_CLAIMS_PRODUCER_BRANCH)} — ARTIFACT/FROM-ANOTHER-RUN (P125-01)`,
+    );
+  }
+  if (typeof artifact.workflow_run.workflow_id === "number" && artifact.workflow_run.workflow_id !== run.workflow_id) {
+    throw new ClaimsProducerHandoffError(
+      `producer artifact ${artifactId} run binding workflow id ${artifact.workflow_run.workflow_id} differs from the validated producer workflow id ${run.workflow_id} — ARTIFACT/FROM-ANOTHER-RUN (P125-01)`,
+    );
+  }
 
-  // ── 3. download the artifact zip (bounded; follows at most one redirect) ──
+  // ── 3. download the artifact zip (bounded; follows at most one redirect;
+  // the streamed read is capped INDEPENDENTLY of the API-recorded size) ──
   const zipUrl = `${base}/actions/runs/${e.producerRunId}/artifacts/${artifactId}/zip`;
   const zipRes = await fetchImpl(zipUrl, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json" },
@@ -431,7 +718,17 @@ export async function fetchVerifiedClaimsArtifact(opts: {
     runHeadSha: run.head_sha,
     artifactId,
     artifactName: e.artifactName,
+    artifactZipByteLength: zipBytes.byteLength,
     artifactSha256Hex: createHash("sha256").update(entry.bytes).digest("hex"),
+    trustedProducer: {
+      repo: TRUSTED_CLAIMS_PRODUCER_REPO,
+      branch: run.head_branch,
+      workflowPath: runPath.file,
+      workflowRef: runPath.ref,
+      workflowId: run.workflow_id,
+      runId: e.producerRunId,
+      sourceSha: run.head_sha,
+    },
   };
 }
 

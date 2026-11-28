@@ -188,6 +188,104 @@ RUN.
   outside this change's authority). Until that demonstration exists,
   the producer workflow must be treated as prepared, not operational.
 
+### Trusted producer identity (P125-01)
+
+The indexer consumer does NOT accept an artifact merely because it came
+from a successful Actions run carrying the expected workflow display
+name. Before any artifact is downloaded — before ANY network write — the
+handoff verifier (`src/claimsProducerHandoff.ts`) independently
+establishes, from GitHub-AUTHORITATIVE API responses only:
+
+* **Trusted repository.** `TRUSTED_CLAIMS_PRODUCER_REPO`
+  (`GraveYield/graveyield-protocol`) is pinned in consumer code. A
+  caller-supplied repo that disagrees is rejected before any network
+  call; the run's `repository.full_name` and `head_repository.full_name`
+  (the fork/source context) must BOTH equal the trusted repository.
+  Missing identity fields fail closed.
+* **Trusted branch.** `TRUSTED_CLAIMS_PRODUCER_BRANCH` (`main`) is pinned
+  in consumer code. The run's GitHub-authoritative `head_branch` must
+  equal it; a missing `head_branch` is rejected fail-closed. There is no
+  caller-supplied branch argument at all.
+* **Workflow identity — numeric id + strictly-parsed path, never a
+  display name.** The run's immutable numeric `workflow_id` resolves the
+  workflow REGISTRY record
+  (`GET /repos/{repo}/actions/workflows/{workflow_id}`) — the
+  `.github/workflows/...` path is NEVER used as the REST endpoint
+  parameter. The registry record must be `active`, its `id` must equal
+  the run's `workflow_id`, its `path` must equal the pinned
+  `TRUSTED_CLAIMS_PRODUCER_WORKFLOW_PATH`
+  (`.github/workflows/claims-snapshot.yml`), and its GitHub-authoritative
+  `name` must equal the pinned producer workflow name. The RUN's own
+  `path` field is parsed STRICTLY as the real API form `<file>@<ref>`
+  (e.g. `.github/workflows/claims-snapshot.yml@refs/heads/main`): the
+  file part must equal the pinned path and the ref part must be exactly
+  `refs/heads/main` (or its exact `main` shorthand). A no-suffix
+  fixture-shaped path, another workflow file, or any other ref fails
+  closed — no substring or prefix matching anywhere. Two workflows can
+  share a display name; they cannot share the numeric workflow id or the
+  registry path.
+* **Provenance binding.** The run must be `completed` with conclusion
+  `success`, and its `head_sha` must exactly equal the publication's
+  requested source commit.
+* **Artifact-to-run binding.** The artifact is retrieved ONLY from the
+  requested run's artifact listing (run-scoped API URL), the name must
+  match exactly, exactly one match may exist, it must not be expired and
+  must be within the configured size limit, AND the record's
+  GitHub-authoritative `workflow_run` binding must name the same run and
+  the same head commit (its branch and workflow id must also agree where
+  the API exposes them). Missing run-binding metadata is rejected
+  fail-closed. The artifact's REPOSITORY identity is established
+  transitively: the listing is fetched from the run-scoped endpoint of
+  the validated run in the validated repository, so the artifact cannot
+  come from anywhere else.
+* **Bytes.** The downloaded zip must match the API-recorded byte length,
+  pass ZIP central-directory + CRC32 integrity, and the extracted
+  `claims-artifact.json` must pass the full claims-grade verification
+  (schema, provenance digests, Merkle integrity, pool/AMM/mint identity
+  expectations). Oversized artifacts are refused BEFORE any download;
+  the streamed download retains an independent size cap.
+* **Evidence.** On success the handoff returns structured
+  `trustedProducer` evidence: the validated producer repository, branch,
+  workflow path + ref, immutable workflow id, run id, source SHA —
+  plus the artifact id/name, its actual zip byte length, and the
+  sha256 digest of the verified bytes.
+
+Caller-supplied values (`--producer-repo`, `--producer-workflow`,
+`producer_identity`) are DECLARATIONS, not trust inputs: each must equal
+the consumer's pinned constants or the handoff refuses before any
+network call.
+
+#### What code enforces vs. what GitHub repository controls must enforce
+
+Code-enforced (this repository): repository, branch, workflow path +
+immutable workflow id, run/completion state, head-SHA provenance,
+artifact name/uniqueness/expiry/size/run-binding, byte length, ZIP/CRC
+integrity, and the claims-grade content verification above.
+
+Owner-configured GitHub controls (NOT enforceable from code — they
+require branch protection / rulesets on `GraveYield/graveyield-protocol`):
+
+* `main` branch protection / ruleset requiring pull-request review for
+  workflow-file changes (`.github/workflows/claims-snapshot.yml`) —
+  this is the control that protects the workflow DEFINITION itself.
+* Restriction of `workflow_dispatch` on `main` to authorized actors.
+* Actions permissions on the producer repository (no arbitrary forks
+  running untrusted workflows with the trusted identity).
+
+**Honest trust-boundary note:** binding a run's `head_sha` does NOT by
+itself prove that the workflow file at that commit was unchanged or
+trusted — a commit that tampered with the workflow file would still
+carry its own SHA. The identity chain establishes (a) the run executed
+the workflow definition at path `.github/workflows/claims-snapshot.yml`
+(immutable id + strictly-parsed path/ref), (b) on the trusted branch,
+(c) in the trusted repository, and (d) for the exact requested commit;
+the integrity of the workflow FILE CONTENT at that commit is guaranteed
+by the repository's branch-protection and review controls listed above,
+not by this code. When GitHub's API response does not expose sufficient
+identity evidence (missing branch, missing workflow id/path, missing
+artifact run-binding, inactive workflow), the handoff FAILS CLOSED —
+trust is never inferred from a display name or from absence.
+
 ### Operator procedure
 
 1. Run the producer workflow (`grave-snapshotter-cli`) in
@@ -202,19 +300,25 @@ RUN.
    it must equal the producer run's head commit), `producer_identity`
    (must be the pinned `grave-snapshotter-cli`), `producer_version`, and
    `expected_pool` (the pool identity the artifact must carry).
-3. The workflow's pre-flight step resolves the run (READ-ONLY, GET-only)
-   and rejects: nonexistent run ID, wrong workflow identity, unfinished or
-   failed runs, head-commit mismatch, missing/expired/ambiguous artifacts,
-   zip byte-length mismatch, CRC32 corruption, invalid schema/provenance,
-   and pool/producer identity mismatch — all BEFORE any release, tag,
-   asset, or reference is touched.
-4. The producer workflow name and artifact name are PINNED in the
-   publication workflow's environment
-   (`GY_CLAIMS_PRODUCER_WORKFLOW`, `GY_CLAIMS_ARTIFACT_NAME`) — never
-   accepted as dispatch inputs, so an attacker cannot point the
-   provenance check at their own workflow. The pinned value
-   (`grave-snapshotter-cli`) is lock-step with the companion workflow's
-   `name:` and enforced by `test/claimsReview.test.ts`.
+3. The workflow's pre-flight resolves the run and its numeric workflow
+   registry record (READ-ONLY, GET-only), and rejects: a nonexistent or
+   inactive trusted workflow, a run executed from another repository,
+   branch (non-`main`), fork, or workflow definition (immutable workflow
+   id + strictly-parsed `<file>@<ref>` path — not the display name),
+   nonexistent run ID, unfinished or failed runs, head-commit mismatch,
+   missing/expired/ambiguous/oversized artifacts, artifact run-binding
+   mismatch, zip byte-length mismatch, CRC32 corruption, invalid
+   schema/provenance, and pool/producer identity mismatch — all BEFORE
+   any release, tag, asset, or reference is touched. See "Trusted
+   producer identity (P125-01)" above.
+4. The trusted producer repository, branch, workflow path, and workflow
+   name are PINNED IN THE CONSUMER (the `TRUSTED_CLAIMS_PRODUCER_*`
+   constants in `src/claimsProducerHandoff.ts`) — the workflow env vars
+   (`GY_CLAIMS_PRODUCER_REPO`, `GY_CLAIMS_PRODUCER_WORKFLOW`,
+   `GY_CLAIMS_ARTIFACT_NAME`) and CLI flags are declarations that must
+   match the pins, never trust inputs. The pinned values are lock-step
+   with the companion workflow's `name:` and enforced by
+   `test/claimsReview.test.ts` and `test/claimsProducerHandoff.test.ts`.
 5. Failures are reported in the step log and the job fails; no partial
    publication state can exist (the handoff performs zero writes).
 
