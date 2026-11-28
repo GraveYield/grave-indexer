@@ -2,7 +2,7 @@
   "name": "@graveyield/grave-indexer",
   "version": "0.1.0",
   "private": true,
-  "description": "Phase 2 — Raydium V4 pool discovery and evidence pipeline for GraveScanner: provenance-preserving discovery, duplicate/conflict/staleness handling, operational health, and oracle evidence-path verification against the on-chain GraveScanner attestation contract (ORACLE-002).",
+  "description": "Phase 2 \u2014 Raydium V4 pool discovery and evidence pipeline for GraveScanner: provenance-preserving discovery, duplicate/conflict/staleness handling, operational health, and oracle evidence-path verification against the on-chain GraveScanner attestation contract (ORACLE-002).",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -25,7 +25,8 @@
     "smoke:devnet": "node --test --import tsx/esm --test-reporter=spec --test-name-pattern='devnet' 'test/devnetSmoke.test.ts'",
     "collect": "tsx src/cli.ts collect",
     "verify-path": "tsx src/cli.ts verify-path",
-    "cli": "tsx src/cli.ts"
+    "cli": "tsx src/cli.ts",
+    "claims:publish": "tsx src/claimsPublishCli.ts"
   },
   "dependencies": {
     "@graveyield/sdk": "workspace:*",
